@@ -1,6 +1,8 @@
 // AXI4 (full) bus interface: adds ID, burst-length/size/burst-type, and
 // last-beat signals on top of the address/data/response channels so a
 // single transaction can move a whole cache line in one burst.
+`default_nettype none
+
 interface axi_if #(
     parameter int ADDR_WIDTH = 32,
     parameter int DATA_WIDTH = 32,
@@ -13,9 +15,8 @@ interface axi_if #(
     logic [ID_WIDTH-1:0]   awid;
     logic [ADDR_WIDTH-1:0] awaddr;
     logic [7:0]            awlen;    // burst length = awlen + 1 beats
-    logic [2:0]             awsize;   // bytes per beat = 2**awsize
-    logic [1:0]             awburst;  // 2'b01 = INCR
-    logic [2:0]             awprot;
+    logic [2:0]            awsize;   // bytes per beat = 2**awsize
+    logic [1:0]            awburst;  // 2'b01 = INCR
     logic                   awvalid;
     logic                   awready;
 
@@ -36,9 +37,8 @@ interface axi_if #(
     logic [ID_WIDTH-1:0]   arid;
     logic [ADDR_WIDTH-1:0] araddr;
     logic [7:0]            arlen;    // burst length = arlen + 1 beats
-    logic [2:0]             arsize;   // bytes per beat = 2**arsize
-    logic [1:0]             arburst;  // 2'b01 = INCR
-    logic [2:0]             arprot;
+    logic [2:0]            arsize;   // bytes per beat = 2**arsize
+    logic [1:0]            arburst;  // 2'b01 = INCR
     logic                   arvalid;
     logic                   arready;
 
@@ -54,13 +54,13 @@ interface axi_if #(
     // responses. Use on any module that initiates transactions (MSHR,
     // cache controller writeback path, etc).
     modport master (
-        output awid, awaddr, awlen, awsize, awburst, awprot, awvalid,
+        output awid, awaddr, awlen, awsize, awburst, awvalid,
         input  awready,
         output wdata, wstrb, wlast, wvalid,
         input  wready,
         input  bid, bresp, bvalid,
         output bready,
-        output arid, araddr, arlen, arsize, arburst, arprot, arvalid,
+        output arid, araddr, arlen, arsize, arburst, arvalid,
         input  arready,
         input  rid, rdata, rresp, rlast, rvalid,
         output rready
@@ -69,13 +69,13 @@ interface axi_if #(
     // Slave: samples requests, drives readys and responses. Use on the
     // memory/peripheral side of the bus.
     modport slave (
-        input  awid, awaddr, awlen, awsize, awburst, awprot, awvalid,
+        input  awid, awaddr, awlen, awsize, awburst, awvalid,
         output awready,
         input  wdata, wstrb, wlast, wvalid,
         output wready,
         output bid, bresp, bvalid,
         input  bready,
-        input  arid, araddr, arlen, arsize, arburst, arprot, arvalid,
+        input  arid, araddr, arlen, arsize, arburst, arvalid,
         output arready,
         output rid, rdata, rresp, rlast, rvalid,
         input  rready
@@ -84,11 +84,13 @@ interface axi_if #(
     // Monitor: read-only view of every signal, for testbenches, scoreboards,
     // or waveform probes that must not drive the bus.
     modport monitor (
-        input awid, awaddr, awlen, awsize, awburst, awprot, awvalid, awready,
+        input awid, awaddr, awlen, awsize, awburst, awvalid, awready,
         input wdata, wstrb, wlast, wvalid, wready,
         input bid, bresp, bvalid, bready,
-        input arid, araddr, arlen, arsize, arburst, arprot, arvalid, arready,
+        input arid, araddr, arlen, arsize, arburst, arvalid, arready,
         input rid, rdata, rresp, rlast, rvalid, rready
     );
 
 endinterface : axi_if
+
+`default_nettype wire
