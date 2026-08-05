@@ -60,3 +60,16 @@ Before and after making any significant modification to the code:
 - **Write policy:** Write-back with write-allocate — dirty lines are flushed to memory lazily on eviction (via the MSHR's writeback path), not written through on every store.
 - **Miss handling:** Non-blocking, via the MSHR (`mshr.sv`), supporting up to 16 outstanding misses (`ID_WIDTH = 4`) with secondary-miss merging (hit-under-miss).
 - **Replacement policy:** Not yet decided — to be specified when the tag-array/cache-controller module is designed (candidates: true LRU vs. tree-based pseudo-LRU).
+
+# Communication & Teaching Guidelines
+
+## Response Rules (STRICT)
+- **NO Walls of Text:** Never generate long explanations or multi-page responses. Keep every response concise and strictly focused on one step at a time.
+- **Step-by-Step Approach:** Break complex tasks, design plans, and testbenches into small, incremental sub-tasks.
+- **Explain Principles First:** Before presenting any code for a given step, explain the general concept, architecture, or purpose in a few clear bullet points.
+- **Wait for Confirmation:** After explaining a step and presenting its specific code/files, STOP and wait for the user to confirm or ask questions before moving to the next step.
+- **Format First:** Place code snippets or direct deliverables at the beginning of the response, followed only by brief explanations.
+
+## Code Output Rules
+- Do NOT generate full, end-to-end multi-file testbenches in a single response unless explicitly requested.
+- Generate code ONLY for the single module/component currently being discussed (e.g., top file, single driver, single monitor).
