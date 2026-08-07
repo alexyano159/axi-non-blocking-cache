@@ -350,6 +350,39 @@ module mshr_tb;
                 $display("[PASS] test 2: single read miss returned the correct line");
         end
 
+        // ---------------------------------------------------------------
+        // Test 3: single write miss -> fill.
+        // Same alloc -> AR/R -> fill data path as test 2, but with
+        // alloc_is_write=1. Write-allocate means a store miss still
+        // fetches the full line from memory (the store itself is merged
+        // in later by the controller, not the MSHR), so fill_data should
+        // be unaffected -- the one new thing being checked here is that
+        // fill_is_write correctly reports 1, proving the flag latched at
+        // allocation (mshr.sv fe_is_write) survives untouched through the
+        // fill engine.
+        // ---------------------------------------------------------------
+        begin
+            logic [ADDR_WIDTH-1:0] test_addr;
+            logic [LINE_WIDTH-1:0] test_line;
+            logic [ID_WIDTH-1:0]   got_id;
+            logic [LINE_WIDTH-1:0] got_data;
+            logic                  got_is_write;
+
+            test_addr = 32'h0000_2000;
+            test_line = {32'h55555555, 32'hAAAAAAAA, 32'h89AB_CDEF, 32'h0123_4567};
+
+            mem_write_line(test_addr, test_line);
+            send_miss(test_addr, 1'b1, got_id);
+            wait_for_fill(got_id, got_data, got_is_write);
+
+            if (got_data !== test_line)
+                $error("[FAIL] test 3: fill_data = %h, expected %h", got_data, test_line);
+            else if (got_is_write !== 1'b1)
+                $error("[FAIL] test 3: fill_is_write = %0d, expected 1 (this miss was a store)", got_is_write);
+            else
+                $display("[PASS] test 3: single write miss correctly flagged fill_is_write");
+        end
+
         $finish;
     end
 
