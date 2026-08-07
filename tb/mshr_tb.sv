@@ -383,6 +383,48 @@ module mshr_tb;
                 $display("[PASS] test 3: single write miss correctly flagged fill_is_write");
         end
 
+        // ---------------------------------------------------------------
+        // Test 4: hit-under-miss merge.
+        // A second miss to the same in-flight address must merge into the
+        // existing MSHR entry instead of opening a new one (mshr.sv
+        // fe_match_vec / fe_is_write OR-in). The primary access is a load
+        // and the merged access is a store, so a correct merge must also
+        // carry the store's dirty flag through to fill_is_write even
+        // though the entry itself was opened by a load.
+        //
+        // send_miss returns as soon as alloc_ready pulses for the first
+        // miss -- well before the AXI AR/R burst can possibly finish --
+        // so the second send_miss is guaranteed to see the entry still
+        // in flight (FE_REQ/FE_DATA), never FE_IDLE/FE_DONE.
+        // ---------------------------------------------------------------
+        begin
+            logic [ADDR_WIDTH-1:0] test_addr;
+            logic [LINE_WIDTH-1:0] test_line;
+            logic [ID_WIDTH-1:0]   id1, id2;
+            logic [LINE_WIDTH-1:0] got_data;
+            logic                  got_is_write;
+
+            test_addr = 32'h0000_3000;
+            test_line = {32'h11112222, 32'h33334444, 32'h5555_6666, 32'h7777_8888};
+
+            mem_write_line(test_addr, test_line);
+            send_miss(test_addr, 1'b0, id1);  // primary access: a load
+            send_miss(test_addr, 1'b1, id2);  // merged access: a store, same address, still in flight
+
+            if (id1 !== id2)
+                $error("[FAIL] test 4: second miss got id %0d, expected merge into id %0d", id2, id1);
+            else begin
+                wait_for_fill(id1, got_data, got_is_write);
+
+                if (got_data !== test_line)
+                    $error("[FAIL] test 4: fill_data = %h, expected %h", got_data, test_line);
+                else if (got_is_write !== 1'b1)
+                    $error("[FAIL] test 4: fill_is_write = %0d, expected 1 (merged store must dirty the line)", got_is_write);
+                else
+                    $display("[PASS] test 4: hit-under-miss merge preserved id and dirty flag");
+            end
+        end
+
         $finish;
     end
 
