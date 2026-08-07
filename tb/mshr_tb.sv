@@ -25,6 +25,7 @@ module mshr_tb;
     localparam int LINE_WORDS     = 4;
     localparam int LINE_WIDTH     = DATA_WIDTH * LINE_WORDS;
     localparam int WB_QUEUE_DEPTH = 4;
+    localparam int NUM_ENTRIES    = (1 << ID_WIDTH);      // one MSHR entry per AXI ID, matches the DUT's default
     localparam int BEAT_CNT_WIDTH = $clog2(LINE_WORDS);  // matches the DUT's internal beat counters
 
     localparam time CLK_PERIOD = 10ns;
@@ -491,6 +492,83 @@ module mshr_tb;
 
             if (!mismatch)
                 $display("[PASS] test 5: victim writeback landed correctly in memory with a clean wb_done pulse");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 6: MSHR full -> alloc_ready stall -> recovery.
+        // All NUM_ENTRIES entries are occupied by distinct addresses, so
+        // neither a free entry nor an address match exists; alloc_ready
+        // must deassert (mshr.sv fe_any_match | fe_any_free) until an
+        // entry is retired.
+        //
+        // fill_ready is deliberately forced low for the fill-up phase.
+        // Left at its usual permanently-high value, a fetch that finishes
+        // its AXI burst frees its entry on the very same cycle (FE_DONE
+        // -> FE_IDLE happens the instant fill_valid && fill_ready are
+        // both true) -- racing against the 16 cycles it takes just to
+        // issue all 16 allocations. Holding fill_ready low keeps every
+        // completed entry parked in FE_DONE (still occupied, not freed)
+        // so the "0 free entries" condition is guaranteed, not a race.
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [ADDR_WIDTH-1:0] BASE_ADDR = 32'h0000_6000;
+            localparam int LINE_BYTES = LINE_WORDS * (DATA_WIDTH / 8);
+
+            logic [ID_WIDTH-1:0] ids   [NUM_ENTRIES];
+            logic                seen  [NUM_ENTRIES];
+            logic [ID_WIDTH-1:0] extra_id;
+            logic                mismatch;
+
+            mismatch = 1'b0;
+            for (int i = 0; i < NUM_ENTRIES; i++) seen[i] = 1'b0;
+
+            // Fill every entry with a distinct address while fills can't
+            // drain, so the MSHR is genuinely, unambiguously full once
+            // the loop ends.
+            fill_ready = 1'b0;
+            for (int i = 0; i < NUM_ENTRIES; i++) begin
+                // Data content is irrelevant to this test (only alloc_ready/
+                // alloc_id behavior is checked) -- preloaded purely so the
+                // read-channel model isn't indexing unwritten mem entries.
+                mem_write_line(BASE_ADDR + i * LINE_BYTES, '0);
+                send_miss(BASE_ADDR + i * LINE_BYTES, 1'b0, ids[i]);
+                if (seen[ids[i]]) begin
+                    $error("[FAIL] test 6: id %0d handed out twice -- entries did not stay distinct", ids[i]);
+                    mismatch = 1'b1;
+                end
+                seen[ids[i]] = 1'b1;
+            end
+
+            // Probe a 17th, distinct-address miss directly (not through
+            // send_miss, which would just block silently through the
+            // stall): with zero free entries and zero address matches,
+            // alloc_ready must read 0 for as long as fill_ready stays low.
+            mem_write_line(BASE_ADDR + NUM_ENTRIES * LINE_BYTES, '0);
+            alloc_addr     = BASE_ADDR + NUM_ENTRIES * LINE_BYTES;
+            alloc_is_write = 1'b0;
+            alloc_valid    = 1'b1;
+
+            repeat (3) begin
+                @(posedge clk);
+                if (alloc_ready) begin
+                    $error("[FAIL] test 6: alloc_ready high while MSHR should be full");
+                    mismatch = 1'b1;
+                end
+            end
+
+            // Release the backlog: entries parked in FE_DONE can now be
+            // handed off and retired, freeing entries back up.
+            fill_ready = 1'b1;
+
+            // Same stall-recovery pattern as send_miss: keep alloc_valid
+            // asserted (a real controller would still be retrying the
+            // same request) until alloc_ready finally reasserts.
+            while (!alloc_ready) @(posedge clk);
+            extra_id    = alloc_id;
+            alloc_valid = 1'b0;
+
+            if (!mismatch)
+                $display("[PASS] test 6: MSHR correctly stalled alloc_ready when full and recovered once an entry freed (id %0d)", extra_id);
         end
 
         $finish;
