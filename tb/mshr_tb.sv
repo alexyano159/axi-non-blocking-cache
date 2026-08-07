@@ -281,6 +281,29 @@ module mshr_tb;
         is_write = fill_is_write;
     endtask
 
+    // Hands a dirty victim line to the MSHR's writeback queue and blocks
+    // until it's accepted. Mirrors send_miss's shape: if the queue is
+    // full, wb_ready simply stays low and the while loop waits, standing
+    // in for the not-yet-designed controller's reaction to that stall.
+    task automatic push_writeback(input logic [ADDR_WIDTH-1:0] addr,
+                                   input logic [LINE_WIDTH-1:0] data);
+        wb_addr  = addr;
+        wb_data  = data;
+        wb_valid = 1'b1;
+
+        @(posedge clk);
+        while (!wb_ready) @(posedge clk);
+
+        wb_valid = 1'b0;
+    endtask
+
+    // Blocks until the writeback engine confirms the head-of-queue victim
+    // was written back (its AXI B response arrived). wb_done is a single-
+    // cycle pulse, so the wait ends the instant it's seen.
+    task automatic wait_for_wb_done();
+        do @(posedge clk); while (!wb_done);
+    endtask
+
     // -------------------------------------------------------------------
     // Idle-value drive for controller-side inputs. Overridden by driver
     // tasks in later steps; keeping this here means the DUT always sees
@@ -423,6 +446,51 @@ module mshr_tb;
                 else
                     $display("[PASS] test 4: hit-under-miss merge preserved id and dirty flag");
             end
+        end
+
+        // ---------------------------------------------------------------
+        // Test 5: single victim writeback.
+        // Exercises the writeback engine end-to-end for the first time:
+        // wb_valid/wb_addr/wb_data -> queue accept -> AW/W/B drain ->
+        // wb_done. This TB plays the role of the (not-yet-designed) cache
+        // controller, handing the MSHR a made-up dirty line directly --
+        // the same simplification send_miss makes on the alloc side.
+        //
+        // The target address is preloaded with a sentinel value first, so
+        // a readback matching the sentinel (instead of the victim data)
+        // would reveal a writeback that never actually happened.
+        // ---------------------------------------------------------------
+        begin
+            logic [ADDR_WIDTH-1:0] test_addr;
+            logic [LINE_WIDTH-1:0] victim_line;
+            logic [LINE_WIDTH-1:0] sentinel_line;
+            logic                  mismatch;
+
+            test_addr     = 32'h0000_4000;
+            sentinel_line = {4{32'hBAAD_BAAD}};
+            victim_line   = {32'hFEED_0004, 32'hFEED_0003, 32'hFEED_0002, 32'hFEED_0001};
+
+            mem_write_line(test_addr, sentinel_line);
+            push_writeback(test_addr, victim_line);
+            wait_for_wb_done();
+
+            mismatch = 1'b0;
+            for (int i = 0; i < LINE_WORDS; i++) begin
+                if (mem[(test_addr >> 2) + i] !== victim_line[i*DATA_WIDTH +: DATA_WIDTH]) begin
+                    $error("[FAIL] test 5: mem word %0d = %h, expected %h",
+                           i, mem[(test_addr >> 2) + i], victim_line[i*DATA_WIDTH +: DATA_WIDTH]);
+                    mismatch = 1'b1;
+                end
+            end
+
+            @(posedge clk);
+            if (wb_done) begin
+                $error("[FAIL] test 5: wb_done stayed high past one cycle, expected a single pulse");
+                mismatch = 1'b1;
+            end
+
+            if (!mismatch)
+                $display("[PASS] test 5: victim writeback landed correctly in memory with a clean wb_done pulse");
         end
 
         $finish;
