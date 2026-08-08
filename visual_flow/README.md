@@ -4,6 +4,13 @@ A MATLAB GUI (`mshr_simulator.m`) that walks through the MSHR's data flow
 one step at a time, for building intuition before reading the RTL or the
 testbench signal-by-signal.
 
+`mshr_dataflow_diagram.html` is a static companion block diagram (open
+directly in a browser) — CPU → controller → MSHR (fill engine +
+writeback queue) → memory, with the fill engine's AR/R and the
+writeback queue's AW/W/B drawn as two independent, directly-wired
+channel groups rather than a shared port, plus a signal glossary and
+the read-miss step list for quick reference.
+
 **This is a conceptual teaching aid, not a functional or cycle-accurate
 model of `rtl/mshr.sv`.** It does not read the RTL, does not simulate
 logic, and is not a substitute for the testbench in `tb/`. It exists to
