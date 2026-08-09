@@ -11,8 +11,11 @@ The project repository on GitHub is named: **`axi-non-blocking-cache`**.
 
 ## 1. Safety & Git Workflow (Version Control)
 - **Checkpoints before major changes:** Before starting any major refactoring, architectural change, or heavy editing of critical RTL/Testbench files, **always** create a local git commit of the current working state as a safety checkpoint.
-- **Branching:** For new features or risky modifications, work on a dedicated feature branch.
-- **GitHub Backup:** Whenever a module or a Testbench (TB) is fully completed and verified, automatically push the changes to the remote GitHub repository (`axi-non-blocking-cache`) using `git push`.
+- **Branch scope:** For new features or risky modifications, work on a dedicated feature branch, scoped to one coherent unit of work (e.g. "add and verify this one test/module") — not an entire session's worth of unrelated changes.
+- **Commit granularity:** Commit at each meaningful checkpoint within that branch (a passing test, a working intermediate step), not only once at the very end. Keep unrelated changes (e.g. a doc reorganization vs. a new test) in separate commits even if done in the same session.
+- **Merge only when green:** Only merge a branch into `main` once it actually passes (compiles, sim runs clean). `main` should always represent known-good state.
+- **GitHub Backup:** Whenever a module or a Testbench (TB) is fully completed and verified, push the branch to the remote GitHub repository (`axi-non-blocking-cache`) using `git push`.
+- **Clean up after merging:** Once a branch is merged into `main`, delete it (locally and on the remote) — the commits live on in `main`'s history regardless.
 - **Rollback capability:** Ensure all changes can be easily rolled back using Git if simulations fail.
 
 ---
