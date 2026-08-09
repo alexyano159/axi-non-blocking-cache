@@ -41,13 +41,15 @@ interactive MATLAB teaching tool — conceptual, not cycle-accurate).
 | Module | RTL | Testbench |
 |---|---|---|
 | `axi_if.sv` — AXI4 interface | Done | — (exercised via `mshr_tb`) |
-| `mshr.sv` — miss handling + writeback | Done | 7 directed tests, all passing |
+| `mshr.sv` — miss handling + writeback | Done | 9 directed tests, all passing |
 | Tag array / cache controller | Not started | — |
 | Top-level cache | Not started | — |
 
 `mshr.sv` currently covers: single read/write miss fill, hit-under-miss
-merge, single victim writeback, MSHR-full stall and recovery, and
-round-robin fairness of the AXI read-address arbiter.
+merge, single victim writeback, MSHR-full stall and recovery,
+round-robin fairness of the AXI read-address arbiter, writeback-queue-full
+stall and recovery, and fixed-priority ordering of the fill-completion
+mux.
 
 ## Running the testbench
 
