@@ -692,6 +692,72 @@ module mshr_tb;
                 $display("[PASS] test 7: AR arbiter granted in round-robin order 1,2,0 -- not fixed low-index priority");
         end
 
+        // ---------------------------------------------------------------
+        // Test 8: writeback queue full -> wb_ready stall -> recovery.
+        // Mirrors test 6's alloc-side full/stall/recovery check, but for
+        // the independent victim writeback FIFO (WB_QUEUE_DEPTH entries)
+        // instead of the miss-tracking table. Pushing a victim takes one
+        // cycle; draining one takes several (address phase + LINE_WORDS
+        // data beats + response), so pushing WB_QUEUE_DEPTH victims
+        // back-to-back reliably outpaces the drain and leaves the queue
+        // genuinely full on its own -- no artificial channel-blocking
+        // trick needed here, unlike test 6.
+        //
+        // The probe push is driven directly (not through push_writeback,
+        // which would just block silently through the stall) so the
+        // stall itself is observable, mirroring test 6's direct
+        // 17th-alloc probe.
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [ADDR_WIDTH-1:0] BASE_ADDR  = 32'h0000_8000;
+            localparam int                    LINE_BYTES = LINE_WORDS * (DATA_WIDTH / 8);
+
+            logic mismatch;
+
+            mismatch = 1'b0;
+
+            // Fill the queue with WB_QUEUE_DEPTH victims. Each push
+            // completes in one cycle and the queue isn't full until the
+            // last of these, so every one of these succeeds immediately.
+            // Data content is irrelevant to this test (only wb_ready/
+            // wb_done stall-and-recovery behavior is checked) -- distinct
+            // addresses are used purely so each victim is individually
+            // identifiable if this ever needs debugging.
+            for (int i = 0; i < WB_QUEUE_DEPTH; i++)
+                push_writeback(BASE_ADDR + i * LINE_BYTES, LINE_WIDTH'(i));
+
+            // Probe one more, distinct-address victim directly: with the
+            // queue genuinely full, wb_ready must read 0 for as long as
+            // no drain has completed yet.
+            wb_addr  = BASE_ADDR + WB_QUEUE_DEPTH * LINE_BYTES;
+            wb_data  = LINE_WIDTH'(WB_QUEUE_DEPTH);
+            wb_valid = 1'b1;
+
+            repeat (3) begin
+                @(posedge clk);
+                if (wb_ready) begin
+                    $error("[FAIL] test 8: wb_ready high while writeback queue should be full");
+                    mismatch = 1'b1;
+                end
+            end
+
+            // Recovery is automatic here: once the head-of-queue victim's
+            // write is confirmed, wb_count drops below WB_QUEUE_DEPTH and
+            // wb_ready reasserts on its own -- no forcing anything,
+            // unlike test 6's fill_ready trick.
+            while (!wb_ready) @(posedge clk);
+            wb_valid = 1'b0;
+
+            // Confirm the backlog -- the three remaining originally-
+            // queued victims, plus the one that had been stalled -- all
+            // eventually drain, so the recovery didn't just re-open
+            // wb_ready without actually being able to finish the job.
+            for (int i = 0; i < WB_QUEUE_DEPTH; i++) wait_for_wb_done();
+
+            if (!mismatch)
+                $display("[PASS] test 8: writeback queue correctly stalled wb_ready when full and recovered once a victim drained");
+        end
+
         $finish;
     end
 
