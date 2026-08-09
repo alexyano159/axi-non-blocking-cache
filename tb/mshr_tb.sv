@@ -7,7 +7,7 @@
 //   3. Driver/helper tasks (alloc_miss, push_writeback, ...)
 //   4. Directed test sequences
 //
-// See private_notes/MSHR_README.md for the design rationale being
+// See docs/MSHR_README.md for the design rationale being
 // verified here (merge-over-new-alloc, round-robin AR arbitration,
 // serialized writeback).
 // -----------------------------------------------------------------------
@@ -147,7 +147,14 @@ module mshr_tb;
     logic [ADDR_WIDTH-1:0]     mr_addr;
     logic [BEAT_CNT_WIDTH-1:0] mr_beat_cnt;
 
-    assign axi.arready = (mr_state == MR_IDLE);
+    // Testbench-only override: when raised, forces the read-address
+    // channel to refuse every request regardless of the read model's own
+    // state. Not a real protocol condition -- used by test 7 to force
+    // several fill-engine entries to pile up as simultaneous requesters,
+    // which never happens if requests are served as fast as they arrive.
+    logic ar_block;
+
+    assign axi.arready = (mr_state == MR_IDLE) && !ar_block;
     assign axi.rvalid  = (mr_state == MR_DATA);
     assign axi.rid     = mr_id;
     assign axi.rresp   = 2'b00;   // OKAY -- no error injection yet
@@ -305,6 +312,16 @@ module mshr_tb;
         do @(posedge clk); while (!wb_done);
     endtask
 
+    // Blocks until the read-address channel completes a handshake --
+    // i.e. some fill-engine entry has just won AR arbitration -- then
+    // returns the winning entry's id. Watches the AXI interface directly
+    // rather than any DUT-internal arbiter state, so it observes exactly
+    // what a real memory would see.
+    task automatic wait_for_ar_grant(output logic [ID_WIDTH-1:0] granted_id);
+        do @(posedge clk); while (!(axi.arvalid && axi.arready));
+        granted_id = axi.arid;
+    endtask
+
     // -------------------------------------------------------------------
     // Idle-value drive for controller-side inputs. Overridden by driver
     // tasks in later steps; keeping this here means the DUT always sees
@@ -321,6 +338,10 @@ module mshr_tb;
         // has room to accept a completed fill, the same simplification
         // the DUT itself makes on the AXI side (axi.rready tied high).
         fill_ready     = 1'b1;
+        // Off by default -- only test 7 raises this to force simultaneous
+        // AR requesters; every other test sees the memory model's normal
+        // as-fast-as-possible accept behavior.
+        ar_block       = 1'b0;
     end
 
     // ===================================================================
@@ -569,6 +590,106 @@ module mshr_tb;
 
             if (!mismatch)
                 $display("[PASS] test 6: MSHR correctly stalled alloc_ready when full and recovered once an entry freed (id %0d)", extra_id);
+        end
+
+        // ---------------------------------------------------------------
+        // Test 7: round-robin AR arbitration.
+        // Verifies the AR arbiter's fairness rule (mshr.sv ar_last_grant /
+        // ar_hi_mask): among several entries simultaneously requesting the
+        // read-address channel, the next grant goes to the lowest-indexed
+        // requester *above* whoever was granted last, wrapping around
+        // only once none qualify. A fixed low-index-first arbiter would
+        // produce a different order in the scenario below (it would grant
+        // id 0 first), which is what makes this scenario a meaningful
+        // test rather than a coincidence check.
+        //
+        // Test 6 leaves the MSHR mid-drain (it only guarantees one entry
+        // freed, not all sixteen), so this test opens with a generous
+        // fixed settle window -- long enough for everything left in
+        // flight from test 6 to fully retire -- before relying on entries
+        // 0/1/2 being free and on the arbiter's last-granted pointer
+        // being back at its reset value (0).
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [ADDR_WIDTH-1:0] BASE_ADDR  = 32'h0000_7000;
+            localparam int                    LINE_BYTES = LINE_WORDS * (DATA_WIDTH / 8);
+
+            logic [ID_WIDTH-1:0] id0, id1, id2;
+            logic [ID_WIDTH-1:0] grant_order    [3];
+            logic [ID_WIDTH-1:0] expected_order [3];
+            logic                mismatch;
+            logic                all_idle;
+            int                  watchdog;
+
+            expected_order[0] = 4'd1;
+            expected_order[1] = 4'd2;
+            expected_order[2] = 4'd0;
+            mismatch = 1'b0;
+
+            // Let every entry left in flight from test 6 fully retire so
+            // the MSHR starts this test genuinely idle. Checked directly
+            // against each entry's own state rather than by counting
+            // retirement pulses: a pulse can land on a clock edge that
+            // test 6's own polling loop consumes before this one starts
+            // watching, so a pulse count taken across that boundary can
+            // silently undercount. Reading the state array sidesteps
+            // that -- it reflects reality at the instant it's read, with
+            // nothing to miss.
+            watchdog = 0;
+            do begin
+                @(posedge clk);
+                all_idle = 1'b1;
+                for (int i = 0; i < NUM_ENTRIES; i++)
+                    if (dut.fe_state[i] != 0) all_idle = 1'b0;  // 0 == FE_IDLE
+                watchdog++;
+            end while (!all_idle && watchdog < 500);
+
+            if (!all_idle) begin
+                $error("[FAIL] test 7: MSHR still not idle after %0d cycles -- some entry from test 6 never retired",
+                       watchdog);
+                mismatch = 1'b1;
+                $display("[DIAG] test 7: ar_last_grant = %0d", dut.ar_last_grant);
+                for (int i = 0; i < NUM_ENTRIES; i++) begin
+                    if (dut.fe_state[i] != 0)
+                        $display("[DIAG] test 7: entry %0d state=%0d addr=%h",
+                                 i, dut.fe_state[i], dut.fe_addr[i]);
+                end
+            end
+
+            mem_write_line(BASE_ADDR + 0 * LINE_BYTES, '0);
+            mem_write_line(BASE_ADDR + 1 * LINE_BYTES, '0);
+            mem_write_line(BASE_ADDR + 2 * LINE_BYTES, '0);
+
+            // Close the read-address channel so all three misses pile up
+            // as simultaneous requesters instead of being granted one at
+            // a time as they arrive.
+            ar_block = 1'b1;
+            send_miss(BASE_ADDR + 0 * LINE_BYTES, 1'b0, id0);
+            send_miss(BASE_ADDR + 1 * LINE_BYTES, 1'b0, id1);
+            send_miss(BASE_ADDR + 2 * LINE_BYTES, 1'b0, id2);
+
+            if (id0 !== 4'd0 || id1 !== 4'd1 || id2 !== 4'd2) begin
+                $error("[FAIL] test 7: expected ids 0,1,2, got %0d,%0d,%0d -- MSHR was not cleanly idle before the test",
+                       id0, id1, id2);
+                mismatch = 1'b1;
+            end
+
+            // Reopen the channel: all three entries now compete for the
+            // same grant at once.
+            ar_block = 1'b0;
+
+            for (int i = 0; i < 3; i++) wait_for_ar_grant(grant_order[i]);
+
+            for (int i = 0; i < 3; i++) begin
+                if (grant_order[i] !== expected_order[i]) begin
+                    $error("[FAIL] test 7: grant %0d = id %0d, expected id %0d",
+                           i, grant_order[i], expected_order[i]);
+                    mismatch = 1'b1;
+                end
+            end
+
+            if (!mismatch)
+                $display("[PASS] test 7: AR arbiter granted in round-robin order 1,2,0 -- not fixed low-index priority");
         end
 
         $finish;

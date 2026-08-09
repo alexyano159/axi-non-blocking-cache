@@ -43,6 +43,10 @@ Before and after making any significant modification to the code:
   - **Edge Cases:** Which edge cases, corner cases, or error conditions were tested, and why they are critical for this design.
   - **Verification Goals:** How you ensure the design meets its specifications.
 
+- **Individual Test Protocol (2-Step Explanation):** Before writing the code for ANY specific test case/scenario in a testbench, you must explain it in two explicit steps:
+  1. **High-Level Logic:** Explain the underlying test concept and what scenario is being verified conceptually—strictly **without** referencing signal names, pins, or low-level protocol details.
+  2. **Code Implementation Strategy:** Explain how this concept will be implemented in SystemVerilog (e.g., driver sequence structure, expected monitor checks, timing/delays).
+  *Write the code for that test only after presenting these two steps.*
 ---
 
 ## 5. Code Style & Standards (SystemVerilog / RTL)
