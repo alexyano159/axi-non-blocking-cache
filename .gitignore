@@ -15,3 +15,8 @@ modelsim.ini
 # Personal scratch notes (e.g. interview prep) -- kept local only, never
 # pushed to the public repo. Module design docs live in docs/ instead.
 private_notes/
+
+# MATLAB step-through prototype -- kept for personal inspection only;
+# the static mshr_dataflow_diagram.html covers the same ground and is
+# the one actually meant for public/reviewer consumption.
+visual_flow/mshr_simulator.m
