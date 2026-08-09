@@ -322,6 +322,16 @@ module mshr_tb;
         granted_id = axi.arid;
     endtask
 
+    // Blocks until the fill-completion mux presents and hands off some
+    // entry (fill_valid && fill_ready), then returns which entry it was.
+    // Mirrors wait_for_ar_grant's shape one stage further down the
+    // pipeline: that task reports which entry won the AR arbiter, this
+    // one reports which entry won the fill-handoff mux.
+    task automatic wait_for_fill_grant(output logic [ID_WIDTH-1:0] granted_id);
+        do @(posedge clk); while (!(fill_valid && fill_ready));
+        granted_id = fill_id;
+    endtask
+
     // -------------------------------------------------------------------
     // Idle-value drive for controller-side inputs. Overridden by driver
     // tasks in later steps; keeping this here means the DUT always sees
@@ -756,6 +766,120 @@ module mshr_tb;
 
             if (!mismatch)
                 $display("[PASS] test 8: writeback queue correctly stalled wb_ready when full and recovered once a victim drained");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 9: fill-completion mux ordering.
+        // Verifies the fill-completion mux (mshr.sv fe_done_sel) always
+        // hands off the lowest-indexed completed entry first, regardless
+        // of which order the entries actually finished fetching in. A
+        // "first-completed-first-served" mux would produce a different
+        // order in the scenario below, which is what makes it a
+        // meaningful test rather than a coincidence check.
+        //
+        // Reuses test 7's ar_block technique to force ids 0/1/2 to
+        // request the AR channel simultaneously, so round-robin
+        // arbitration -- not arrival order -- decides which finishes
+        // fetching first. ar_last_grant is left at 0 by test 7 (its last
+        // grant went to id 0), so the same round-robin order (1, 2, 0)
+        // applies here: entry 0 is guaranteed to finish LAST even though
+        // it must be presented FIRST once every entry is done.
+        // fill_ready is held low throughout the fetch phase so all three
+        // pile up in FE_DONE together, the same technique test 6 uses to
+        // guarantee zero free entries rather than racing a timing guess.
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [ADDR_WIDTH-1:0] BASE_ADDR  = 32'h0000_9000;
+            localparam int                    LINE_BYTES = LINE_WORDS * (DATA_WIDTH / 8);
+
+            logic [ID_WIDTH-1:0] id0, id1, id2;
+            logic [ID_WIDTH-1:0] fill_order     [3];
+            logic [ID_WIDTH-1:0] expected_order [3];
+            logic                mismatch;
+            logic                all_idle, all_done;
+            int                  watchdog;
+
+            expected_order[0] = 4'd0;
+            expected_order[1] = 4'd1;
+            expected_order[2] = 4'd2;
+            mismatch = 1'b0;
+
+            // Let every entry left in flight from test 7 fully retire so
+            // the MSHR starts this test genuinely idle -- same rationale
+            // and technique as test 7's own opening wait.
+            watchdog = 0;
+            do begin
+                @(posedge clk);
+                all_idle = 1'b1;
+                for (int i = 0; i < NUM_ENTRIES; i++)
+                    if (dut.fe_state[i] != 0) all_idle = 1'b0;  // 0 == FE_IDLE
+                watchdog++;
+            end while (!all_idle && watchdog < 500);
+
+            if (!all_idle) begin
+                $error("[FAIL] test 9: MSHR still not idle after %0d cycles -- some entry from test 7 never retired",
+                       watchdog);
+                mismatch = 1'b1;
+            end
+
+            // Block retirement so all three entries accumulate in
+            // FE_DONE instead of draining as soon as each one finishes.
+            fill_ready = 1'b0;
+
+            mem_write_line(BASE_ADDR + 0 * LINE_BYTES, {4{32'hA0A0_0000}});
+            mem_write_line(BASE_ADDR + 1 * LINE_BYTES, {4{32'hB1B1_0001}});
+            mem_write_line(BASE_ADDR + 2 * LINE_BYTES, {4{32'hC2C2_0002}});
+
+            // Close the read-address channel so all three misses pile up
+            // as simultaneous requesters instead of being fetched one at
+            // a time as they arrive.
+            ar_block = 1'b1;
+            send_miss(BASE_ADDR + 0 * LINE_BYTES, 1'b0, id0);
+            send_miss(BASE_ADDR + 1 * LINE_BYTES, 1'b0, id1);
+            send_miss(BASE_ADDR + 2 * LINE_BYTES, 1'b0, id2);
+
+            if (id0 !== 4'd0 || id1 !== 4'd1 || id2 !== 4'd2) begin
+                $error("[FAIL] test 9: expected ids 0,1,2, got %0d,%0d,%0d -- MSHR was not cleanly idle before the test",
+                       id0, id1, id2);
+                mismatch = 1'b1;
+            end
+
+            // Reopen the channel: round-robin arbitration now decides
+            // fetch order, independent of allocation order.
+            ar_block = 1'b0;
+
+            // Wait for all three to finish fetching and land in FE_DONE.
+            // fill_ready is still low, so none of them can retire yet --
+            // this is what lets an out-of-completion-order handoff be
+            // observed once the gate opens below.
+            watchdog = 0;
+            do begin
+                @(posedge clk);
+                all_done = (dut.fe_state[id0] == 3) && (dut.fe_state[id1] == 3) && (dut.fe_state[id2] == 3);  // 3 == FE_DONE
+                watchdog++;
+            end while (!all_done && watchdog < 200);
+
+            if (!all_done) begin
+                $error("[FAIL] test 9: not all three entries reached FE_DONE within %0d cycles", watchdog);
+                mismatch = 1'b1;
+            end
+
+            // Open the gate: the mux must hand off id 0 first, even
+            // though (round-robin order 1,2,0, same as test 7) it was
+            // the last of the three to actually finish fetching.
+            fill_ready = 1'b1;
+            for (int i = 0; i < 3; i++) wait_for_fill_grant(fill_order[i]);
+
+            for (int i = 0; i < 3; i++) begin
+                if (fill_order[i] !== expected_order[i]) begin
+                    $error("[FAIL] test 9: handoff %0d = id %0d, expected id %0d",
+                           i, fill_order[i], expected_order[i]);
+                    mismatch = 1'b1;
+                end
+            end
+
+            if (!mismatch)
+                $display("[PASS] test 9: fill-completion mux handed off in ascending-id order 0,1,2 -- not completion order");
         end
 
         $finish;
