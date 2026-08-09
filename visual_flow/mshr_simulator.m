@@ -5,7 +5,7 @@ function mshr_simulator()
 %
 %   This is a *conceptual* teaching aid, not a cycle-accurate simulation
 %   of rtl/mshr.sv -- it illustrates the three data-flow scenarios
-%   described in private_notes/MSHR_README.md:
+%   described in docs/MSHR_README.md:
 %
 %     1. Read Miss        -- a load misses, MSHR fetches the line over AXI.
 %     2. Write Miss        -- a store misses; identical AXI fetch, but the

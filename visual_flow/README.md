@@ -47,5 +47,5 @@ flows memory → MSHR on `R`, so a status code can ride along with it; a
 write's data channel (`W`) only flows the other way, so `B` is the only
 wire carrying an acknowledgement back.
 
-See `private_notes/MSHR_README.md` for the full design rationale these
+See `docs/MSHR_README.md` for the full design rationale these
 scenarios are based on.

@@ -27,7 +27,7 @@
 //
 // Full design rationale (why round-robin arbitration, why the writeback
 // path is serialized rather than pipelined) is in
-// private_notes/MSHR_README.md.
+// docs/MSHR_README.md.
 // -----------------------------------------------------------------------
 `default_nettype none
 
@@ -262,7 +262,7 @@ module mshr #(
     // are off the latency-critical path (the cache slot is already free
     // once the controller hands the victim over) and AXI4's write-data
     // channel carries no ID, so concurrent writes could not interleave
-    // their data beats anyway. See private_notes/MSHR_README.md for the
+    // their data beats anyway. See docs/MSHR_README.md for the
     // full comparison against a pipelined design.
     // ===================================================================
     typedef enum logic [1:0] {

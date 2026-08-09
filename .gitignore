@@ -11,3 +11,7 @@ vsim.wlf
 modelsim.ini
 *.mpf
 *.mpf.bak
+
+# Personal scratch notes (e.g. interview prep) -- kept local only, never
+# pushed to the public repo. Module design docs live in docs/ instead.
+private_notes/
