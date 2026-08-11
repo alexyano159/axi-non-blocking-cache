@@ -882,6 +882,95 @@ module mshr_tb;
                 $display("[PASS] test 9: fill-completion mux handed off in ascending-id order 0,1,2 -- not completion order");
         end
 
+        // ---------------------------------------------------------------
+        // Test 10: concurrent fill + writeback traffic.
+        // The fill engine (AR/R) and the writeback engine (AW/W/B) are
+        // meant to be two independent engines that merely share one AXI
+        // port. If some accidental coupling in the shared control logic
+        // actually serialized them, starting a writeback and a read miss
+        // together would show one engine stalled until the other
+        // finished. This test starts both close together and checks that
+        // both still produce correct data, and that a read-data beat and
+        // a write-data beat are observed landing in the very same
+        // cycle -- direct evidence the two channel pairs genuinely run in
+        // parallel, not just eventually-both-finished.
+        //
+        // A background "forever" process (fork/join_none) samples both
+        // data-beat handshakes on every clock edge for as long as the
+        // test runs, since the exact overlapping cycle isn't known ahead
+        // of time and isn't something a completion-only wait could catch.
+        //
+        // wait_for_fill and wait_for_wb_done are launched together inside
+        // a blocking fork/join rather than called one after another:
+        // each engine's completion (fill_valid for this id; wb_done) is
+        // only a single-cycle pulse, and test 9's timing shows both
+        // bursts start in near lockstep, so their completions can land on
+        // the same cycle. Waiting on them sequentially would risk the
+        // first wait's multi-cycle block silently swallowing the other
+        // pulse before its own wait task ever starts polling for it.
+        // ---------------------------------------------------------------
+        begin
+            logic [ADDR_WIDTH-1:0] miss_addr, victim_addr;
+            logic [LINE_WIDTH-1:0] miss_line, victim_line;
+            logic [ID_WIDTH-1:0]   got_id;
+            logic [LINE_WIDTH-1:0] got_data;
+            logic                  got_is_write;
+            logic                  overlap_seen;
+            logic                  mismatch;
+
+            miss_addr    = 32'h0000_A000;
+            victim_addr  = 32'h0000_B000;
+            miss_line    = {32'h0A0A_0004, 32'h0A0A_0003, 32'h0A0A_0002, 32'h0A0A_0001};
+            victim_line  = {32'h0B0B_0004, 32'h0B0B_0003, 32'h0B0B_0002, 32'h0B0B_0001};
+            overlap_seen = 1'b0;
+            mismatch     = 1'b0;
+
+            mem_write_line(miss_addr, miss_line);
+
+            fork : overlap_monitor
+                forever begin
+                    @(posedge clk);
+                    if ((axi.rvalid && axi.rready) && (axi.wvalid && axi.wready))
+                        overlap_seen = 1'b1;
+                end
+            join_none
+
+            // Start the writeback first, then the read miss right after --
+            // close enough together that, since each engine drives a fixed
+            // LINE_WORDS-beat burst once granted, their data phases are
+            // guaranteed to overlap for at least a couple of cycles.
+            push_writeback(victim_addr, victim_line);
+            send_miss(miss_addr, 1'b0, got_id);
+
+            fork
+                wait_for_fill(got_id, got_data, got_is_write);
+                wait_for_wb_done();
+            join
+
+            disable overlap_monitor;
+
+            if (got_data !== miss_line) begin
+                $error("[FAIL] test 10: fill_data = %h, expected %h", got_data, miss_line);
+                mismatch = 1'b1;
+            end
+
+            for (int i = 0; i < LINE_WORDS; i++) begin
+                if (mem[(victim_addr >> 2) + i] !== victim_line[i*DATA_WIDTH +: DATA_WIDTH]) begin
+                    $error("[FAIL] test 10: mem word %0d = %h, expected %h",
+                           i, mem[(victim_addr >> 2) + i], victim_line[i*DATA_WIDTH +: DATA_WIDTH]);
+                    mismatch = 1'b1;
+                end
+            end
+
+            if (!overlap_seen) begin
+                $error("[FAIL] test 10: never observed a read-data beat and a write-data beat in the same cycle -- engines appear serialized");
+                mismatch = 1'b1;
+            end
+
+            if (!mismatch)
+                $display("[PASS] test 10: fill and writeback engines made simultaneous progress on independent AXI channels");
+        end
+
         $finish;
     end
 
