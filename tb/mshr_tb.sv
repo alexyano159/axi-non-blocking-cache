@@ -1029,6 +1029,81 @@ module mshr_tb;
                 $display("[PASS] test 11: four-way merge (load/store/load/load) preserved one entry id and the mid-sequence dirty flag");
         end
 
+        // ---------------------------------------------------------------
+        // Test 12: entry reuse does not leak a stale dirty flag.
+        // Once an entry that was dirtied by a store finishes and is
+        // handed back to the controller, its slot becomes available
+        // again. The free-entry picker (mshr.sv fe_free_idx = pick_lowest
+        // (fe_free_vec)) always chooses the lowest-indexed free entry, so
+        // driving one miss to completion and then driving a second,
+        // unrelated miss -- starting from an all-idle MSHR, guaranteed by
+        // every prior test fully draining what it used -- naturally
+        // reuses the exact same slot: nothing lower than entry 0 exists,
+        // so whichever miss goes first claims it, and it claims it again
+        // once free. No artificial "fill every other entry" trick is
+        // needed to force the reuse.
+        //
+        // The reused slot's new occupant is a plain load to a completely
+        // different address. If the RTL ever failed to explicitly reset
+        // the dirty flag for a freshly-opened entry, this clean load
+        // could incorrectly inherit dirty status left over from the
+        // previous, already-retired store -- the same class of bug test
+        // 11 targeted, mirrored in the opposite direction (overwrite is
+        // correct here; carrying the old value forward would be the bug).
+        // ---------------------------------------------------------------
+        begin
+            logic [ADDR_WIDTH-1:0] dirty_addr, clean_addr;
+            logic [LINE_WIDTH-1:0] dirty_line, clean_line;
+            logic [ID_WIDTH-1:0]   id_dirty, id_clean;
+            logic [LINE_WIDTH-1:0] got_data;
+            logic                  got_is_write;
+            logic                  mismatch;
+
+            dirty_addr = 32'h0000_D000;
+            clean_addr = 32'h0000_E000;
+            dirty_line = {32'h7A7A_0004, 32'h7A7A_0003, 32'h7A7A_0002, 32'h7A7A_0001};
+            clean_line = {32'h7C7C_0004, 32'h7C7C_0003, 32'h7C7C_0002, 32'h7C7C_0001};
+            mismatch   = 1'b0;
+
+            mem_write_line(dirty_addr, dirty_line);
+            mem_write_line(clean_addr, clean_line);
+
+            // First occupant: a store, must retire fully dirty before its
+            // slot can be reused.
+            send_miss(dirty_addr, 1'b1, id_dirty);
+            wait_for_fill(id_dirty, got_data, got_is_write);
+
+            if (got_is_write !== 1'b1) begin
+                $error("[FAIL] test 12: fill_is_write = %0d for the first (store) miss, expected 1", got_is_write);
+                mismatch = 1'b1;
+            end
+
+            // Second occupant: an unrelated load, expected to reuse the
+            // exact same slot now that it has retired.
+            send_miss(clean_addr, 1'b0, id_clean);
+
+            if (id_clean !== id_dirty) begin
+                $error("[FAIL] test 12: second miss got id %0d, expected it to reuse id %0d -- test setup assumption broken",
+                       id_clean, id_dirty);
+                mismatch = 1'b1;
+            end else begin
+                wait_for_fill(id_clean, got_data, got_is_write);
+
+                if (got_data !== clean_line) begin
+                    $error("[FAIL] test 12: fill_data = %h, expected %h", got_data, clean_line);
+                    mismatch = 1'b1;
+                end
+                if (got_is_write !== 1'b0) begin
+                    $error("[FAIL] test 12: fill_is_write = %0d, expected 0 -- reused slot leaked the previous occupant's dirty flag",
+                           got_is_write);
+                    mismatch = 1'b1;
+                end
+            end
+
+            if (!mismatch)
+                $display("[PASS] test 12: reused entry slot correctly reset the dirty flag for its new, unrelated occupant");
+        end
+
         $finish;
     end
 
