@@ -1104,6 +1104,91 @@ module mshr_tb;
                 $display("[PASS] test 12: reused entry slot correctly reset the dirty flag for its new, unrelated occupant");
         end
 
+        // ---------------------------------------------------------------
+        // Test 13: reset mid-fetch does not leave a stale merge target.
+        // Every test so far only ever sees reset once, at the very
+        // start, with nothing in flight. This test asserts it again --
+        // deliberately while a read miss is only partway through its
+        // AXI burst -- and checks the interrupted entry is not just
+        // superficially idle, but genuinely available: a fresh miss to
+        // that exact same address afterward must be treated as a
+        // brand-new allocation (a real AR request re-issued on the bus),
+        // not silently absorbed as a "merge" into the leftover,
+        // address-matching entry left over from before the reset.
+        //
+        // The returned id alone can't distinguish those two outcomes --
+        // with every entry free after reset, the lowest-free-index rule
+        // would likely hand out the same id either way. The real tell is
+        // whether a genuine AR handshake happens at all: the merge path
+        // only updates a dirty flag and never touches the AXI bus, so if
+        // fe_state ever failed to actually reset, the interrupted entry
+        // would silently swallow the new miss and never issue a new
+        // fetch -- hanging forever rather than failing loudly. The wait
+        // below is watchdog-bounded for exactly that reason, mirroring
+        // tests 7/9's pattern, and wait_for_fill is only reached once the
+        // AR handshake is confirmed, so a genuine hang can't happen here.
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [ADDR_WIDTH-1:0] TEST_ADDR = 32'h0000_F000;
+
+            logic [LINE_WIDTH-1:0] test_line;
+            logic [ID_WIDTH-1:0]   id_before, id_after;
+            logic [LINE_WIDTH-1:0] got_data;
+            logic                  got_is_write;
+            logic                  mismatch;
+            int                    watchdog;
+
+            test_line = {32'h5E5E_0004, 32'h5E5E_0003, 32'h5E5E_0002, 32'h5E5E_0001};
+            mismatch  = 1'b0;
+
+            mem_write_line(TEST_ADDR, test_line);
+
+            // Start a miss, let it win AR arbitration, then let a couple
+            // of R beats land -- partway through the burst, not
+            // finished -- before interrupting it.
+            send_miss(TEST_ADDR, 1'b0, id_before);
+            begin
+                logic [ID_WIDTH-1:0] granted_id;
+                wait_for_ar_grant(granted_id);
+            end
+            repeat (2) @(posedge clk);
+
+            // Reset mid-burst: the same shape as the top-level reset
+            // generation block, just triggered later instead of only at
+            // time 0.
+            rst_n = 1'b0;
+            repeat (3) @(posedge clk);
+            rst_n = 1'b1;
+
+            // A fresh miss to the exact same address the interrupted
+            // entry was still holding. If that entry is genuinely idle,
+            // this looks identical to any other first-time miss: it must
+            // win AR arbitration again and fetch a real burst.
+            send_miss(TEST_ADDR, 1'b0, id_after);
+
+            watchdog = 0;
+            while (!(axi.arvalid && axi.arready) && watchdog < 200) begin
+                @(posedge clk);
+                watchdog++;
+            end
+
+            if (watchdog >= 200) begin
+                $error("[FAIL] test 13: no new AR request seen within %0d cycles after reset -- the interrupted entry appears to have silently absorbed the new miss instead of re-fetching",
+                       watchdog);
+                mismatch = 1'b1;
+            end else begin
+                wait_for_fill(id_after, got_data, got_is_write);
+
+                if (got_data !== test_line) begin
+                    $error("[FAIL] test 13: fill_data = %h, expected %h", got_data, test_line);
+                    mismatch = 1'b1;
+                end
+            end
+
+            if (!mismatch)
+                $display("[PASS] test 13: reset mid-fetch left no stale merge target -- a fresh miss to the same address re-issued a real AXI burst");
+        end
+
         $finish;
     end
 
