@@ -971,6 +971,64 @@ module mshr_tb;
                 $display("[PASS] test 10: fill and writeback engines made simultaneous progress on independent AXI channels");
         end
 
+        // ---------------------------------------------------------------
+        // Test 11: multi-way merge with an out-of-order dirty flag.
+        // Test 4 proved a *second* access merges into an in-flight miss.
+        // This test raises that to four total accesses -- one primary
+        // plus three merges -- to the same still-outstanding address, in
+        // the order load, store, load, load. The store is deliberately
+        // sandwiched in the middle rather than placed last: an
+        // implementation that (incorrectly) just remembers the most
+        // recently merged access's dirty flag, instead of OR-ing every
+        // merge together (mshr.sv fe_is_write <= fe_is_write |
+        // alloc_is_write), would let the two trailing loads erase the
+        // store's dirty marking. Checking that fill_is_write still comes
+        // back 1 is what catches that specific bug -- a design that only
+        // ever correctly handles exactly one merge (test 4's scenario)
+        // would still pass this test's id checks but not its dirty-flag
+        // check if it had that flaw.
+        // ---------------------------------------------------------------
+        begin
+            logic [ADDR_WIDTH-1:0] test_addr;
+            logic [LINE_WIDTH-1:0] test_line;
+            logic [ID_WIDTH-1:0]   id0, id1, id2, id3;
+            logic [LINE_WIDTH-1:0] got_data;
+            logic                  got_is_write;
+            logic                  mismatch;
+
+            test_addr = 32'h0000_C000;
+            test_line = {32'h9999_0004, 32'h9999_0003, 32'h9999_0002, 32'h9999_0001};
+            mismatch  = 1'b0;
+
+            mem_write_line(test_addr, test_line);
+
+            send_miss(test_addr, 1'b0, id0);  // primary access: a load
+            send_miss(test_addr, 1'b1, id1);  // merge 1: a store -- must dirty the line
+            send_miss(test_addr, 1'b0, id2);  // merge 2: a load -- must NOT clear the dirty flag
+            send_miss(test_addr, 1'b0, id3);  // merge 3: a load -- same, must NOT clear it
+
+            if (id0 !== id1 || id0 !== id2 || id0 !== id3) begin
+                $error("[FAIL] test 11: ids %0d,%0d,%0d,%0d -- all four accesses should have merged into one entry",
+                       id0, id1, id2, id3);
+                mismatch = 1'b1;
+            end else begin
+                wait_for_fill(id0, got_data, got_is_write);
+
+                if (got_data !== test_line) begin
+                    $error("[FAIL] test 11: fill_data = %h, expected %h", got_data, test_line);
+                    mismatch = 1'b1;
+                end
+                if (got_is_write !== 1'b1) begin
+                    $error("[FAIL] test 11: fill_is_write = %0d, expected 1 -- the middle merge's dirty flag must survive later clean merges",
+                           got_is_write);
+                    mismatch = 1'b1;
+                end
+            end
+
+            if (!mismatch)
+                $display("[PASS] test 11: four-way merge (load/store/load/load) preserved one entry id and the mid-sequence dirty flag");
+        end
+
         $finish;
     end
 
