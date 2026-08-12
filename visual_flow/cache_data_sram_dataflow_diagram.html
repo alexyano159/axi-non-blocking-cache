@@ -1,0 +1,253 @@
+<title>Cache Data SRAM I/O Sketch</title>
+<style>
+  :root{
+    --bg:       #0E2A45;
+    --panel:    #12345;
+    --line:     #BFE3F2;
+    --line-dim: #6D93A8;
+    --text:     #E8F3F8;
+    --text-dim: #9FC1D1;
+    --accent:   #F0A63A;
+    --font-display: "Bahnschrift", "Barlow Semi Condensed", "Segoe UI Semibold", sans-serif;
+    --font-body: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace;
+  }
+
+  *{ box-sizing:border-box; }
+
+  body{
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    margin: 0;
+    padding: 32px 20px 60px;
+    display: flex;
+    justify-content: center;
+  }
+
+  .sheet{
+    width: 100%;
+    max-width: 1000px;
+    border: 1px solid var(--line-dim);
+    border-radius: 2px;
+    background-image:
+      repeating-linear-gradient(0deg, rgba(191,227,242,0.055) 0 1px, transparent 1px 40px),
+      repeating-linear-gradient(90deg, rgba(191,227,242,0.055) 0 1px, transparent 1px 40px);
+    padding: 28px clamp(16px, 4vw, 44px) 36px;
+  }
+
+  header.sheet-head{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    border-bottom: 1px solid var(--line-dim);
+    padding-bottom: 14px;
+    margin-bottom: 22px;
+    flex-wrap: wrap;
+  }
+
+  header.sheet-head h1{
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(20px, 3vw, 26px);
+    letter-spacing: 0.02em;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  header.sheet-head .meta{
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    text-align: right;
+    line-height: 1.5;
+  }
+
+  figure{
+    margin: 0 0 8px;
+  }
+
+  svg{
+    width: 100%;
+    height: auto;
+    display: block;
+    color: var(--line);
+  }
+
+  figcaption{
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-top: 10px;
+    max-width: 72ch;
+    line-height: 1.55;
+  }
+
+  .boxtitle{
+    font-family: var(--font-display);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    fill: var(--text);
+  }
+  .boxsub{
+    font-family: var(--font-body);
+    font-size: 10.5px;
+    fill: var(--text-dim);
+  }
+  .wire-label{
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    fill: var(--text-dim);
+  }
+  .wire-label.accent{ fill: var(--accent); }
+  .group-label{
+    font-family: var(--font-display);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    fill: var(--line);
+  }
+  .group-note{
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--line-dim);
+  }
+
+  table.glossary{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+    margin-top: 22px;
+  }
+  table.glossary caption{
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--line-dim);
+    margin-bottom: 8px;
+  }
+  table.glossary th{
+    text-align: left;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--line-dim);
+    padding: 6px 10px 6px 0;
+  }
+  table.glossary td{
+    padding: 7px 10px 7px 0;
+    border-bottom: 1px solid rgba(109,147,168,0.35);
+    vertical-align: top;
+  }
+  table.glossary td.sig{
+    font-family: var(--font-mono);
+    color: var(--text-dim);
+  }
+  .tablewrap{ overflow-x: auto; }
+
+  footer.title-block{
+    margin-top: 30px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line-dim);
+    display: flex;
+    justify-content: flex-end;
+    gap: 24px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--line-dim);
+  }
+</style>
+
+<div class="sheet">
+  <header class="sheet-head">
+    <h1>AXI Non-Blocking Cache — Data SRAM I/O</h1>
+    <div class="meta">SHEET 1 · controller &lt;-&gt; data SRAM<br>REV: io-defined, logic TBD</div>
+  </header>
+
+  <figure>
+    <svg viewBox="0 0 960 500" role="img" aria-label="Block diagram: the cache controller drives two inputs into the data SRAM -- a read set index broadcast to all four ways, and a single shared write port (write enable, set index, way select, per-word write-enable mask, write data) gated internally to whichever way is selected. The SRAM contains four independent way memories, each 64 sets of 128-bit lines, and returns four separate 128-bit read buses back to the controller every cycle, one per way, not multiplexed.">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path>
+        </marker>
+      </defs>
+
+      <!-- Cache Controller -->
+      <rect x="40" y="40" width="220" height="420" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="6 4"></rect>
+      <text x="150" y="245" text-anchor="middle" class="boxtitle">CACHE CONTROLLER</text>
+      <text x="150" y="263" text-anchor="middle" class="boxsub">tag compare · way select</text>
+      <text x="150" y="277" text-anchor="middle" class="boxsub" font-style="italic">(not yet designed)</text>
+
+      <!-- Data SRAM outer container -->
+      <rect x="620" y="40" width="300" height="420" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="6 4"></rect>
+      <text x="635" y="63" class="group-label">DATA SRAM</text>
+      <text x="750" y="63" class="group-note">(cache_data_sram.sv — io defined)</text>
+
+      <!-- Way sub-blocks -->
+      <rect x="650" y="80" width="240" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+      <text x="770" y="110" text-anchor="middle" class="boxtitle">WAY 0</text>
+      <text x="770" y="126" text-anchor="middle" class="boxsub">64 sets x 128b</text>
+
+      <rect x="650" y="170" width="240" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+      <text x="770" y="200" text-anchor="middle" class="boxtitle">WAY 1</text>
+      <text x="770" y="216" text-anchor="middle" class="boxsub">64 sets x 128b</text>
+
+      <rect x="650" y="260" width="240" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+      <text x="770" y="290" text-anchor="middle" class="boxtitle">WAY 2</text>
+      <text x="770" y="306" text-anchor="middle" class="boxsub">64 sets x 128b</text>
+
+      <rect x="650" y="350" width="240" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
+      <text x="770" y="380" text-anchor="middle" class="boxtitle">WAY 3</text>
+      <text x="770" y="396" text-anchor="middle" class="boxsub">64 sets x 128b</text>
+
+      <!-- Input: rd_set_idx, broadcast to all 4 ways -->
+      <line x1="260" y1="95" x2="620" y2="95" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"></line>
+      <text x="440" y="83" text-anchor="middle" class="wire-label">rd_set_idx[5:0]</text>
+      <text x="440" y="107" text-anchor="middle" class="wire-label" font-style="italic">(broadcast to all 4 ways)</text>
+
+      <!-- Input: shared write port -->
+      <line x1="260" y1="430" x2="620" y2="430" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"></line>
+      <text x="440" y="418" text-anchor="middle" class="wire-label accent">wr_en · wr_set_idx · wr_way_sel</text>
+      <text x="440" y="443" text-anchor="middle" class="wire-label accent">wr_word_en[3:0] · wr_data[127:0]</text>
+
+      <!-- Outputs: one bus per way, back to controller -->
+      <line x1="650" y1="115" x2="260" y2="115" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"></line>
+      <text x="455" y="145" text-anchor="middle" class="wire-label">rd_line[0][127:0]</text>
+
+      <line x1="650" y1="205" x2="260" y2="205" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"></line>
+      <text x="455" y="192" text-anchor="middle" class="wire-label">rd_line[1][127:0]</text>
+
+      <line x1="650" y1="295" x2="260" y2="295" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"></line>
+      <text x="455" y="282" text-anchor="middle" class="wire-label">rd_line[2][127:0]</text>
+
+      <line x1="650" y1="385" x2="260" y2="385" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"></line>
+      <text x="455" y="372" text-anchor="middle" class="wire-label">rd_line[3][127:0]</text>
+    </svg>
+    <figcaption>
+      The SRAM is really four independent way memories side by side. One <span style="font-family:var(--font-mono)">rd_set_idx</span> broadcasts to all four in parallel every cycle, and all four answer back on <strong style="color:var(--accent); font-weight:600;">four separate 128-bit buses</strong> — not one bus carrying four values in turn. The controller (with the tag array, elsewhere) decides which one is the actual hit and picks that bus's data; the other three are simply unused that cycle. The single write port is shared by both write sources (store-hit word write and miss-fill line write) — <span style="font-family:var(--font-mono)">wr_way_sel</span> picks the one way that's actually written; <span style="font-family:var(--font-mono)">wr_word_en</span> picks which word(s) of that way's line.
+    </figcaption>
+  </figure>
+
+  <div class="tablewrap">
+    <table class="glossary">
+      <caption>Signal glossary — exact port names per arrow</caption>
+      <thead>
+        <tr><th>Arrow</th><th>Direction</th><th>Signals</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Read address</td><td>Controller → SRAM</td><td class="sig">rd_set_idx[5:0]</td></tr>
+        <tr><td>Read data</td><td>SRAM → Controller</td><td class="sig">rd_line[0..3][127:0] — one per way, every cycle</td></tr>
+        <tr><td>Write port</td><td>Controller → SRAM</td><td class="sig">wr_en, wr_set_idx[5:0], wr_way_sel[1:0], wr_word_en[3:0], wr_data[127:0]</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <footer class="title-block">
+    <span>PROJECT: axi-non-blocking-cache</span>
+    <span>MODULE: cache_data_sram.sv</span>
+    <span>DRAWN FOR: interview prep sketch</span>
+  </footer>
+</div>
