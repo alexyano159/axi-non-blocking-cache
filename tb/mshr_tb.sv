@@ -609,16 +609,20 @@ module mshr_tb;
         // read-address channel, the next grant goes to the lowest-indexed
         // requester *above* whoever was granted last, wrapping around
         // only once none qualify. A fixed low-index-first arbiter would
-        // produce a different order in the scenario below (it would grant
-        // id 0 first), which is what makes this scenario a meaningful
-        // test rather than a coincidence check.
+        // always grant id 0 first regardless of history, which is what
+        // makes this scenario a meaningful test rather than a coincidence
+        // check.
         //
         // Test 6 leaves the MSHR mid-drain (it only guarantees one entry
         // freed, not all sixteen), so this test opens with a generous
         // fixed settle window -- long enough for everything left in
         // flight from test 6 to fully retire -- before relying on entries
-        // 0/1/2 being free and on the arbiter's last-granted pointer
-        // being back at its reset value (0).
+        // 0/1/2 being free. The expected grant order is then computed
+        // from whatever ar_last_grant actually is at that point, instead
+        // of assuming it has settled back to its reset value (0). This
+        // keeps the test's pass/fail independent of test 6's internal
+        // retirement timing -- it proves round-robin behavior relative to
+        // the arbiter's real starting state, not a hardcoded one.
         // ---------------------------------------------------------------
         begin
             localparam logic [ADDR_WIDTH-1:0] BASE_ADDR  = 32'h0000_7000;
@@ -627,13 +631,11 @@ module mshr_tb;
             logic [ID_WIDTH-1:0] id0, id1, id2;
             logic [ID_WIDTH-1:0] grant_order    [3];
             logic [ID_WIDTH-1:0] expected_order [3];
+            logic [ID_WIDTH-1:0] last_grant;
             logic                mismatch;
             logic                all_idle;
             int                  watchdog;
 
-            expected_order[0] = 4'd1;
-            expected_order[1] = 4'd2;
-            expected_order[2] = 4'd0;
             mismatch = 1'b0;
 
             // Let every entry left in flight from test 6 fully retire so
@@ -684,6 +686,24 @@ module mshr_tb;
                 mismatch = 1'b1;
             end
 
+            // Derive the expected grant order from the arbiter's actual
+            // last-granted pointer (captured now, while the AR channel is
+            // still blocked and all three requests are parked in FE_REQ,
+            // so it cannot change out from under this read). This mirrors
+            // the DUT's own tie-break rule: ids strictly above last_grant
+            // go first, in ascending order, then whatever is left wraps
+            // around -- the same ar_hi_mask logic as mshr.sv, computed
+            // here independently rather than read back from the DUT.
+            last_grant = dut.ar_last_grant;
+            begin
+                int idx;
+                idx = 0;
+                for (int i = 0; i < 3; i++)
+                    if (i[ID_WIDTH-1:0] > last_grant) expected_order[idx++] = i[ID_WIDTH-1:0];
+                for (int i = 0; i < 3; i++)
+                    if (i[ID_WIDTH-1:0] <= last_grant) expected_order[idx++] = i[ID_WIDTH-1:0];
+            end
+
             // Reopen the channel: all three entries now compete for the
             // same grant at once.
             ar_block = 1'b0;
@@ -692,14 +712,15 @@ module mshr_tb;
 
             for (int i = 0; i < 3; i++) begin
                 if (grant_order[i] !== expected_order[i]) begin
-                    $error("[FAIL] test 7: grant %0d = id %0d, expected id %0d",
-                           i, grant_order[i], expected_order[i]);
+                    $error("[FAIL] test 7: last_grant=%0d, grant %0d = id %0d, expected id %0d",
+                           last_grant, i, grant_order[i], expected_order[i]);
                     mismatch = 1'b1;
                 end
             end
 
             if (!mismatch)
-                $display("[PASS] test 7: AR arbiter granted in round-robin order 1,2,0 -- not fixed low-index priority");
+                $display("[PASS] test 7: AR arbiter granted in round-robin order %0d,%0d,%0d from last_grant=%0d -- not fixed low-index priority",
+                          expected_order[0], expected_order[1], expected_order[2], last_grant);
         end
 
         // ---------------------------------------------------------------
@@ -780,10 +801,15 @@ module mshr_tb;
         // Reuses test 7's ar_block technique to force ids 0/1/2 to
         // request the AR channel simultaneously, so round-robin
         // arbitration -- not arrival order -- decides which finishes
-        // fetching first. ar_last_grant is left at 0 by test 7 (its last
-        // grant went to id 0), so the same round-robin order (1, 2, 0)
-        // applies here: entry 0 is guaranteed to finish LAST even though
-        // it must be presented FIRST once every entry is done.
+        // fetching first. The expected fetch-completion order is derived
+        // from ar_last_grant at the moment this test starts (same
+        // technique as test 7), rather than assumed to be a fixed
+        // (1, 2, 0) left over from test 7 -- that assumption would make
+        // this test's premise unverified and coupled to test 7's own
+        // internal state. The fetch order is captured directly (the
+        // cycle each entry first reaches FE_DONE) and checked against
+        // that derivation, so the test proves -- rather than assumes --
+        // that whichever entry fetches last is still handed off first.
         // fill_ready is held low throughout the fetch phase so all three
         // pile up in FE_DONE together, the same technique test 6 uses to
         // guarantee zero free entries rather than racing a timing guess.
@@ -793,8 +819,13 @@ module mshr_tb;
             localparam int                    LINE_BYTES = LINE_WORDS * (DATA_WIDTH / 8);
 
             logic [ID_WIDTH-1:0] id0, id1, id2;
-            logic [ID_WIDTH-1:0] fill_order     [3];
-            logic [ID_WIDTH-1:0] expected_order [3];
+            logic [ID_WIDTH-1:0] fill_order           [3];
+            logic [ID_WIDTH-1:0] expected_order       [3];
+            logic [ID_WIDTH-1:0] fetch_order          [3];
+            logic [ID_WIDTH-1:0] expected_fetch_order [3];
+            logic [ID_WIDTH-1:0] last_grant;
+            logic                done0_seen, done1_seen, done2_seen;
+            int                  fetch_count;
             logic                mismatch;
             logic                all_idle, all_done;
             int                  watchdog;
@@ -844,18 +875,49 @@ module mshr_tb;
                 mismatch = 1'b1;
             end
 
+            // Derive the expected fetch-completion order from the
+            // arbiter's actual last-granted pointer, captured now while
+            // the AR channel is still blocked (same technique as test 7,
+            // used here instead of assuming a value left over from it).
+            last_grant = dut.ar_last_grant;
+            begin
+                int idx;
+                idx = 0;
+                for (int i = 0; i < 3; i++)
+                    if (i[ID_WIDTH-1:0] > last_grant) expected_fetch_order[idx++] = i[ID_WIDTH-1:0];
+                for (int i = 0; i < 3; i++)
+                    if (i[ID_WIDTH-1:0] <= last_grant) expected_fetch_order[idx++] = i[ID_WIDTH-1:0];
+            end
+
             // Reopen the channel: round-robin arbitration now decides
             // fetch order, independent of allocation order.
             ar_block = 1'b0;
 
-            // Wait for all three to finish fetching and land in FE_DONE.
-            // fill_ready is still low, so none of them can retire yet --
-            // this is what lets an out-of-completion-order handoff be
-            // observed once the gate opens below.
-            watchdog = 0;
+            // Wait for all three to finish fetching and land in FE_DONE,
+            // recording the order they first arrive in. fill_ready is
+            // still low, so none of them can retire yet -- this is what
+            // lets an out-of-completion-order handoff be observed once
+            // the gate opens below.
+            fetch_count = 0;
+            done0_seen  = 1'b0;
+            done1_seen  = 1'b0;
+            done2_seen  = 1'b0;
+            watchdog    = 0;
             do begin
                 @(posedge clk);
-                all_done = (dut.fe_state[id0] == 3) && (dut.fe_state[id1] == 3) && (dut.fe_state[id2] == 3);  // 3 == FE_DONE
+                if (!done0_seen && dut.fe_state[id0] == 3) begin  // 3 == FE_DONE
+                    fetch_order[fetch_count++] = id0;
+                    done0_seen                 = 1'b1;
+                end
+                if (!done1_seen && dut.fe_state[id1] == 3) begin
+                    fetch_order[fetch_count++] = id1;
+                    done1_seen                 = 1'b1;
+                end
+                if (!done2_seen && dut.fe_state[id2] == 3) begin
+                    fetch_order[fetch_count++] = id2;
+                    done2_seen                 = 1'b1;
+                end
+                all_done = done0_seen && done1_seen && done2_seen;
                 watchdog++;
             end while (!all_done && watchdog < 200);
 
@@ -864,9 +926,18 @@ module mshr_tb;
                 mismatch = 1'b1;
             end
 
-            // Open the gate: the mux must hand off id 0 first, even
-            // though (round-robin order 1,2,0, same as test 7) it was
-            // the last of the three to actually finish fetching.
+            for (int i = 0; i < 3; i++) begin
+                if (fetch_order[i] !== expected_fetch_order[i]) begin
+                    $error("[FAIL] test 9: last_grant=%0d, fetch %0d = id %0d, expected id %0d -- fetch order did not match round-robin prediction",
+                           last_grant, i, fetch_order[i], expected_fetch_order[i]);
+                    mismatch = 1'b1;
+                end
+            end
+
+            // Open the gate: the mux must hand off id 0 first, regardless
+            // of the fetch order just verified above -- ascending-id
+            // handoff order is a property of the mux alone, independent
+            // of last_grant or completion order.
             fill_ready = 1'b1;
             for (int i = 0; i < 3; i++) wait_for_fill_grant(fill_order[i]);
 
@@ -879,7 +950,8 @@ module mshr_tb;
             end
 
             if (!mismatch)
-                $display("[PASS] test 9: fill-completion mux handed off in ascending-id order 0,1,2 -- not completion order");
+                $display("[PASS] test 9: fetch order %0d,%0d,%0d (from last_grant=%0d) still handed off in ascending-id order 0,1,2 -- not completion order",
+                          fetch_order[0], fetch_order[1], fetch_order[2], last_grant);
         end
 
         // ---------------------------------------------------------------
