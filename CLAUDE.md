@@ -68,6 +68,13 @@ Before and after making any significant modification to the code:
 - **Miss handling:** Non-blocking, via the MSHR (`mshr.sv`), supporting up to 16 outstanding misses (`ID_WIDTH = 4`) with secondary-miss merging (hit-under-miss).
 - **Replacement policy:** Not yet decided — to be specified when the tag-array/cache-controller module is designed (candidates: true LRU vs. tree-based pseudo-LRU).
 
+---
+
+## 7. Design Decision Logging
+- **When it applies:** Any time we settle a genuine architectural trade-off — e.g. splitting the data SRAM from the tag/valid arrays, registered vs. combinational read, round-robin vs. fixed-priority arbitration — not routine implementation details.
+- **What to record:** The moment such a decision is settled, add an entry to `private_notes/DESIGN_DECISIONS.txt` stating what was chosen, why it was chosen, and why it's better than the alternative(s) that were considered.
+- **Format:** Brief — a few one-line-rationale bullets per decision, matching the existing entries in that file. Write it in English.
+
 # Communication & Teaching Guidelines
 
 ## Response Rules (STRICT)
