@@ -158,6 +158,253 @@ module cache_data_sram_tb;
                 $display("[PASS] test 1: single-word hit-write read back correctly");
         end
 
+        // ---------------------------------------------------------------
+        // Test 2: read/write collision, same (set, way, word) on the
+        // same edge. A read issued on the same cycle as a write to the
+        // identical location must return the pre-write ("old") value,
+        // matching a single-port synchronous SRAM's collision behavior.
+        // A follow-up read (no collision) must then show the new value,
+        // confirming the write itself was not lost -- only not forwarded.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [DATA_WIDTH-1:0]    old_word;
+            logic [DATA_WIDTH-1:0]    new_word;
+            logic [LINE_WIDTH-1:0]    old_line_buf;
+            logic [LINE_WIDTH-1:0]    new_line_buf;
+            logic [LINE_WIDTH-1:0]    got_line [NUM_WAYS];
+
+            test_set = 6'd10;
+            test_way = 2'd2;
+            old_word = 32'hDEAD_0001;
+            new_word = 32'hBEEF_0002;
+
+            old_line_buf = '0;
+            old_line_buf[0*DATA_WIDTH +: DATA_WIDTH] = old_word; // word offset 0
+
+            new_line_buf = '0;
+            new_line_buf[0*DATA_WIDTH +: DATA_WIDTH] = new_word; // word offset 0
+
+            // Preload the location with the "old" value.
+            sram_write(test_set, test_way, 4'b0001, old_line_buf);
+
+            // Drive a write of the "new" value and a read of the same
+            // set on the identical edge.
+            rd_set_idx = test_set;
+            wr_set_idx = test_set;
+            wr_way_sel = test_way;
+            wr_word_en = 4'b0001;
+            wr_data    = new_line_buf;
+            wr_en      = 1'b1;
+            @(posedge clk);
+            wr_en = 1'b0;
+            #1;
+            got_line = rd_line;
+
+            if (got_line[test_way][0*DATA_WIDTH +: DATA_WIDTH] !== old_word)
+                $error("[FAIL] test 2: collision read = %h, expected old value %h", got_line[test_way][0*DATA_WIDTH +: DATA_WIDTH], old_word);
+            else
+                $display("[PASS] test 2: collision read returned pre-write (old) data");
+
+            // Follow-up read, no collision this time: the write must
+            // have actually completed.
+            sram_read(test_set, got_line);
+
+            if (got_line[test_way][0*DATA_WIDTH +: DATA_WIDTH] !== new_word)
+                $error("[FAIL] test 2: post-collision read = %h, expected new value %h", got_line[test_way][0*DATA_WIDTH +: DATA_WIDTH], new_word);
+            else
+                $display("[PASS] test 2: write completed correctly despite not being forwarded");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 3: fill-write, all four words in one cycle.
+        // Plants a stale value in one word first, then fill-writes the
+        // whole line (word_en = all-ones) with four distinct patterns
+        // and checks the entire line reads back exactly as written --
+        // proving the fill path truly overwrites every word, including
+        // one that already held stale data, not just the empty ones.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [LINE_WIDTH-1:0]    stale_line_buf;
+            logic [LINE_WIDTH-1:0]    fill_line_buf;
+            logic [LINE_WIDTH-1:0]    got_line [NUM_WAYS];
+
+            test_set = 6'd20;
+            test_way = 2'd3;
+
+            stale_line_buf = '0;
+            stale_line_buf[1*DATA_WIDTH +: DATA_WIDTH] = 32'hFFFF_FFFF; // stale word at offset 1
+
+            fill_line_buf = '0;
+            for (int i = 0; i < WORDS_PER_LINE; i++) begin
+                fill_line_buf[i*DATA_WIDTH +: DATA_WIDTH] = 32'hC0DE_0000 + i;
+            end
+
+            // Plant stale data in one word first.
+            sram_write(test_set, test_way, 4'b0010, stale_line_buf);
+
+            // Fill-write the entire line.
+            sram_write(test_set, test_way, 4'b1111, fill_line_buf);
+            sram_read(test_set, got_line);
+
+            if (got_line[test_way] !== fill_line_buf)
+                $error("[FAIL] test 3: fill read = %h, expected %h", got_line[test_way], fill_line_buf);
+            else
+                $display("[PASS] test 3: fill-write overwrote all four words correctly");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 4: way isolation. Preloads all four ways of one set with
+        // four distinct lines, then overwrites only one way. Confirms
+        // the write landed exclusively in the targeted way -- the other
+        // three ways, modeled as independent banks, must be completely
+        // unaffected by a write to a different way of the same set.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     target_way;
+            logic [LINE_WIDTH-1:0]    expected_line [NUM_WAYS];
+            logic [LINE_WIDTH-1:0]    new_line_buf;
+            logic [LINE_WIDTH-1:0]    got_line [NUM_WAYS];
+            logic                     way_ok;
+
+            test_set   = 6'd30;
+            target_way = 2'd1;
+
+            // Preload each way with its own distinct, way-indexed line.
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                for (int i = 0; i < WORDS_PER_LINE; i++) begin
+                    expected_line[w][i*DATA_WIDTH +: DATA_WIDTH] = 32'h1000_0000 * (w + 1) + i;
+                end
+                sram_write(test_set, w, 4'b1111, expected_line[w]);
+            end
+
+            // Overwrite only the target way with a new, unrelated pattern.
+            new_line_buf = '0;
+            for (int i = 0; i < WORDS_PER_LINE; i++) begin
+                new_line_buf[i*DATA_WIDTH +: DATA_WIDTH] = 32'hF00D_0000 + i;
+            end
+            sram_write(test_set, target_way, 4'b1111, new_line_buf);
+            expected_line[target_way] = new_line_buf; // update the expectation for the targeted way
+
+            sram_read(test_set, got_line);
+
+            way_ok = 1'b1;
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                if (got_line[w] !== expected_line[w]) begin
+                    way_ok = 1'b0;
+                    $error("[FAIL] test 4: way %0d = %h, expected %h", w, got_line[w], expected_line[w]);
+                end
+            end
+
+            if (way_ok)
+                $display("[PASS] test 4: write to one way left the other three ways untouched");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 5: wr_en gating. Presents a complete, otherwise-valid
+        // write request (address, way, word mask, data) with wr_en held
+        // low, and confirms the location is unchanged. Every earlier
+        // test always asserted wr_en alongside a write, so none of them
+        // would catch a bug that removed or broke this gate -- this
+        // test exists purely to close that coverage hole.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [DATA_WIDTH-1:0]    original_word;
+            logic [DATA_WIDTH-1:0]    attempted_word;
+            logic [LINE_WIDTH-1:0]    original_line_buf;
+            logic [LINE_WIDTH-1:0]    attempted_line_buf;
+            logic [LINE_WIDTH-1:0]    got_line [NUM_WAYS];
+
+            test_set       = 6'd40;
+            test_way       = 2'd0;
+            original_word  = 32'h1111_2222;
+            attempted_word = 32'h9999_8888;
+
+            original_line_buf = '0;
+            original_line_buf[0*DATA_WIDTH +: DATA_WIDTH] = original_word;
+
+            attempted_line_buf = '0;
+            attempted_line_buf[0*DATA_WIDTH +: DATA_WIDTH] = attempted_word;
+
+            // Preload the location with the original value.
+            sram_write(test_set, test_way, 4'b0001, original_line_buf);
+
+            // Present a complete write request, but hold wr_en low.
+            wr_set_idx = test_set;
+            wr_way_sel = test_way;
+            wr_word_en = 4'b0001;
+            wr_data    = attempted_line_buf;
+            wr_en      = 1'b0;
+            @(posedge clk);
+
+            sram_read(test_set, got_line);
+
+            if (got_line[test_way][0*DATA_WIDTH +: DATA_WIDTH] !== original_word)
+                $error("[FAIL] test 5: read = %h, expected unchanged original value %h", got_line[test_way][0*DATA_WIDTH +: DATA_WIDTH], original_word);
+            else
+                $display("[PASS] test 5: write request with wr_en low did not modify memory");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 6: set isolation. Preloads several sets (including both
+        // edges of the address range) in one way with distinct lines,
+        // then overwrites only one set. Confirms the write landed
+        // exclusively in the targeted set -- mem[] is indexed
+        // [way][set], so a wiring bug on wr_set_idx (off-by-one, wrong
+        // width) could corrupt a different set without any earlier
+        // test noticing, since tests 1/2/3/5 each only ever touch one
+        // set at a time.
+        // ---------------------------------------------------------------
+        begin
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [SET_IDX_WIDTH-1:0] test_sets     [3];
+            logic [LINE_WIDTH-1:0]    expected_line [3];
+            logic [LINE_WIDTH-1:0]    new_line_buf;
+            logic [LINE_WIDTH-1:0]    got_line [NUM_WAYS];
+            int                       target_idx;
+            logic                     set_ok;
+
+            test_way     = 2'd2;
+            test_sets[0] = '0;             // low edge of the address range
+            test_sets[1] = NUM_SETS / 2;   // an interior set
+            test_sets[2] = NUM_SETS - 1;   // high edge of the address range
+            target_idx   = 1;              // overwrite the interior set only
+
+            // Preload each set with its own distinct, index-tagged line.
+            for (int s = 0; s < 3; s++) begin
+                for (int i = 0; i < WORDS_PER_LINE; i++) begin
+                    expected_line[s][i*DATA_WIDTH +: DATA_WIDTH] = 32'h2000_0000 + s*32'h0000_1000 + i;
+                end
+                sram_write(test_sets[s], test_way, 4'b1111, expected_line[s]);
+            end
+
+            // Overwrite only the target set with a new, unrelated pattern.
+            new_line_buf = '0;
+            for (int i = 0; i < WORDS_PER_LINE; i++) begin
+                new_line_buf[i*DATA_WIDTH +: DATA_WIDTH] = 32'hBAAD_0000 + i;
+            end
+            sram_write(test_sets[target_idx], test_way, 4'b1111, new_line_buf);
+            expected_line[target_idx] = new_line_buf;
+
+            set_ok = 1'b1;
+            for (int s = 0; s < 3; s++) begin
+                sram_read(test_sets[s], got_line);
+                if (got_line[test_way] !== expected_line[s]) begin
+                    set_ok = 1'b0;
+                    $error("[FAIL] test 6: set %0d = %h, expected %h", test_sets[s], got_line[test_way], expected_line[s]);
+                end
+            end
+
+            if (set_ok)
+                $display("[PASS] test 6: write to one set left the other sets untouched");
+        end
+
         $finish;
     end
 
