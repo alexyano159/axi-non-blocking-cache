@@ -328,6 +328,208 @@ module cache_tag_array_tb;
                 $display("[PASS] test 4: hit-write updated dirty only, tag left untouched");
         end
 
+        // ---------------------------------------------------------------
+        // Test 5: wr_dirty_en=0 leaves dirty untouched, independent of
+        // wr_tag_en. The reverse of test 4 -- a tag-only write (a
+        // fill-write with the dirty update deliberately disabled) must
+        // update the tag but leave dirty exactly as it was. As in test
+        // 4, a deliberately mismatched ("poisoned") dirty value is
+        // driven on the write bus so a broken wr_dirty_en gate that let
+        // it through anyway would be caught.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [TAG_WIDTH-1:0]     old_tag;
+            logic [TAG_WIDTH-1:0]     new_tag;
+            logic                    original_dirty;
+            logic                    poisoned_dirty;
+            logic [NUM_WAYS-1:0]     got_match;
+            logic [NUM_WAYS-1:0]     got_dirty;
+
+            test_set       = 6'd50;
+            test_way       = 2'd1;
+            old_tag        = 22'h0_4444;
+            new_tag        = 22'h0_5555;
+            original_dirty = 1'b1;
+            poisoned_dirty = 1'b0; // must never actually be written, since wr_dirty_en=0
+
+            // Fill-write: establish the baseline, dirty=1.
+            tag_write(test_set, test_way, old_tag, 1'b1, original_dirty, 1'b1);
+
+            // Tag-only write: tag_en=1 (new tag), dirty_en=0 (poisoned_dirty must be ignored).
+            tag_write(test_set, test_way, new_tag, 1'b1, poisoned_dirty, 1'b0);
+
+            tag_lookup(test_set, new_tag, got_match, got_dirty);
+
+            if (got_match[test_way] !== 1'b1)
+                $error("[FAIL] test 5: tag_match[%0d] = %b, expected 1 (tag updated)", test_way, got_match[test_way]);
+            else if (got_dirty[test_way] !== original_dirty)
+                $error("[FAIL] test 5: dirty_out[%0d] = %b, expected %b (dirty untouched by tag-only write)", test_way, got_dirty[test_way], original_dirty);
+            else
+                $display("[PASS] test 5: tag-only write updated tag, dirty left untouched");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 6: way isolation. Preloads all four ways of one set with
+        // distinct tags and an alternating dirty pattern, then
+        // overwrites only one way. Confirms the write landed
+        // exclusively in the targeted way -- the other three ways,
+        // modeled as independent banks, must be completely unaffected.
+        // Checking each way's own tag reports a one-hot tag_match also
+        // proves the compare is a genuine 4-way parallel operation, not
+        // one that could accidentally cross-match a neighboring way.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     target_way;
+            logic [TAG_WIDTH-1:0]     way_tag   [NUM_WAYS];
+            logic                    way_dirty [NUM_WAYS];
+            logic [NUM_WAYS-1:0]     got_match;
+            logic [NUM_WAYS-1:0]     got_dirty;
+            logic [NUM_WAYS-1:0]     expected_match;
+            logic                     way_ok;
+
+            test_set   = 6'd55;
+            target_way = 2'd2;
+
+            // Preload each way with its own distinct tag and dirty bit.
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                way_tag[w]   = 22'h0_1000 * (w + 1); // 1000, 2000, 3000, 4000
+                way_dirty[w] = w[0];                 // alternating 0, 1, 0, 1
+                tag_write(test_set, w[WAY_WIDTH-1:0], way_tag[w], 1'b1, way_dirty[w], 1'b1);
+            end
+
+            // Overwrite only the target way with a new, unrelated tag/dirty.
+            way_tag[target_way]   = 22'h0_9999;
+            way_dirty[target_way] = ~way_dirty[target_way];
+            tag_write(test_set, target_way, way_tag[target_way], 1'b1, way_dirty[target_way], 1'b1);
+
+            way_ok = 1'b1;
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                tag_lookup(test_set, way_tag[w], got_match, got_dirty);
+
+                expected_match = '0;
+                expected_match[w] = 1'b1;
+
+                if (got_match !== expected_match) begin
+                    way_ok = 1'b0;
+                    $error("[FAIL] test 6: lookup for way %0d's tag -> tag_match = %b, expected one-hot at bit %0d", w, got_match, w);
+                end else if (got_dirty[w] !== way_dirty[w]) begin
+                    way_ok = 1'b0;
+                    $error("[FAIL] test 6: way %0d dirty_out = %b, expected %b", w, got_dirty[w], way_dirty[w]);
+                end
+            end
+
+            if (way_ok)
+                $display("[PASS] test 6: write to one way left the other ways untouched (one-hot compare verified)");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 7: set isolation. Preloads three sets (both edges of the
+        // address range, plus an interior set) in one way with distinct
+        // tags, then overwrites only the interior set. Confirms the
+        // write landed exclusively in the targeted set -- mem is
+        // indexed [way][set], so a wiring bug on wr_set_idx (off-by-one,
+        // wrong width) could corrupt a different set without any
+        // earlier test noticing, since every prior test only ever
+        // touches one set at a time.
+        // ---------------------------------------------------------------
+        begin
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [SET_IDX_WIDTH-1:0] test_sets [3];
+            logic [TAG_WIDTH-1:0]     set_tag   [3];
+            logic                    set_dirty [3];
+            logic [NUM_WAYS-1:0]     got_match;
+            logic [NUM_WAYS-1:0]     got_dirty;
+            int                       target_idx;
+            logic                     set_ok;
+
+            test_way     = 2'd1;
+            test_sets[0] = '0;             // low edge of the address range
+            test_sets[1] = NUM_SETS / 2;   // an interior set
+            test_sets[2] = NUM_SETS - 1;   // high edge of the address range
+            target_idx   = 1;              // overwrite the interior set only
+
+            // Preload each set with its own distinct tag/dirty.
+            for (int s = 0; s < 3; s++) begin
+                set_tag[s]   = 22'h0_6000 + (s * 22'h0_0100);
+                set_dirty[s] = s[0]; // alternating 0, 1, 0
+                tag_write(test_sets[s], test_way, set_tag[s], 1'b1, set_dirty[s], 1'b1);
+            end
+
+            // Overwrite only the target set with a new, unrelated tag/dirty.
+            set_tag[target_idx]   = 22'h0_7777;
+            set_dirty[target_idx] = ~set_dirty[target_idx];
+            tag_write(test_sets[target_idx], test_way, set_tag[target_idx], 1'b1, set_dirty[target_idx], 1'b1);
+
+            set_ok = 1'b1;
+            for (int s = 0; s < 3; s++) begin
+                tag_lookup(test_sets[s], set_tag[s], got_match, got_dirty);
+
+                if (got_match[test_way] !== 1'b1) begin
+                    set_ok = 1'b0;
+                    $error("[FAIL] test 7: set %0d tag_match[%0d] = %b, expected 1", test_sets[s], test_way, got_match[test_way]);
+                end else if (got_dirty[test_way] !== set_dirty[s]) begin
+                    set_ok = 1'b0;
+                    $error("[FAIL] test 7: set %0d dirty_out[%0d] = %b, expected %b", test_sets[s], test_way, got_dirty[test_way], set_dirty[s]);
+                end
+            end
+
+            if (set_ok)
+                $display("[PASS] test 7: write to one set left the other sets untouched");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 8: wr_en gating. Presents a complete, otherwise-valid
+        // write request (address, way, tag, tag_en, dirty, dirty_en)
+        // with wr_en held low, and confirms the location is unchanged.
+        // Every earlier test always asserted wr_en alongside a write,
+        // so none of them would catch a bug that removed or broke this
+        // master gate -- this test exists purely to close that
+        // coverage hole.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [TAG_WIDTH-1:0]     original_tag;
+            logic                    original_dirty;
+            logic [TAG_WIDTH-1:0]     attempted_tag;
+            logic [NUM_WAYS-1:0]     got_match;
+            logic [NUM_WAYS-1:0]     got_dirty;
+
+            test_set       = 6'd60;
+            test_way       = 2'd3;
+            original_tag   = 22'h0_8888;
+            original_dirty = 1'b0;
+            attempted_tag  = 22'h0_1234;
+
+            // Preload the location with the original value.
+            tag_write(test_set, test_way, original_tag, 1'b1, original_dirty, 1'b1);
+
+            // Present a complete write request, but hold wr_en low.
+            wr_set_idx  = test_set;
+            wr_way_sel  = test_way;
+            wr_tag      = attempted_tag;
+            wr_tag_en   = 1'b1;
+            wr_dirty    = 1'b1;
+            wr_dirty_en = 1'b1;
+            wr_en       = 1'b0;
+            @(posedge clk);
+            #1;
+            wr_tag_en   = 1'b0;
+            wr_dirty_en = 1'b0;
+
+            tag_lookup(test_set, original_tag, got_match, got_dirty);
+
+            if (got_match[test_way] !== 1'b1)
+                $error("[FAIL] test 8: tag_match[%0d] = %b, expected 1 (write with wr_en=0 must not change tag)", test_way, got_match[test_way]);
+            else if (got_dirty[test_way] !== original_dirty)
+                $error("[FAIL] test 8: dirty_out[%0d] = %b, expected %b (write with wr_en=0 must not change dirty)", test_way, got_dirty[test_way], original_dirty);
+            else
+                $display("[PASS] test 8: write request with wr_en low did not modify memory");
+        end
+
         $finish;
     end
 
