@@ -223,6 +223,111 @@ module cache_tag_array_tb;
                 $display("[PASS] test 2: non-matching tag correctly reports no hit");
         end
 
+        // ---------------------------------------------------------------
+        // Test 3: read/compare-write collision, same (set, way) on the
+        // same edge. A lookup issued on the same cycle as a write to
+        // the identical location must compare against the pre-write
+        // ("old") tag/dirty, matching a single-port synchronous SRAM's
+        // collision behavior. A follow-up lookup (no collision) must
+        // then show the new tag/dirty, confirming the write itself was
+        // not lost -- only not forwarded.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [TAG_WIDTH-1:0]     old_tag;
+            logic                    old_dirty;
+            logic [TAG_WIDTH-1:0]     new_tag;
+            logic                    new_dirty;
+            logic [NUM_WAYS-1:0]     got_match;
+            logic [NUM_WAYS-1:0]     got_dirty;
+
+            test_set  = 6'd25;
+            test_way  = 2'd3;
+            old_tag   = 22'h0_1111;
+            old_dirty = 1'b0;
+            new_tag   = 22'h0_2222;
+            new_dirty = 1'b1;
+
+            // Preload the location with the "old" value.
+            tag_write(test_set, test_way, old_tag, 1'b1, old_dirty, 1'b1);
+
+            // Drive a write of the "new" value and a lookup of the same
+            // (set, way) on the identical edge.
+            rd_set_idx  = test_set;
+            lookup_tag  = old_tag;
+            wr_set_idx  = test_set;
+            wr_way_sel  = test_way;
+            wr_tag      = new_tag;
+            wr_tag_en   = 1'b1;
+            wr_dirty    = new_dirty;
+            wr_dirty_en = 1'b1;
+            wr_en       = 1'b1;
+            @(posedge clk);
+            #1;
+            got_match   = tag_match;
+            got_dirty   = dirty_out;
+            wr_en       = 1'b0;
+            wr_tag_en   = 1'b0;
+            wr_dirty_en = 1'b0;
+
+            if (got_match[test_way] !== 1'b1)
+                $error("[FAIL] test 3: collision tag_match[%0d] = %b, expected 1 (old tag)", test_way, got_match[test_way]);
+            else if (got_dirty[test_way] !== old_dirty)
+                $error("[FAIL] test 3: collision dirty_out[%0d] = %b, expected old value %b", test_way, got_dirty[test_way], old_dirty);
+            else
+                $display("[PASS] test 3: collision lookup returned pre-write (old) tag/dirty");
+
+            // Follow-up lookup, no collision this time: the write must
+            // have actually completed.
+            tag_lookup(test_set, new_tag, got_match, got_dirty);
+
+            if (got_match[test_way] !== 1'b1)
+                $error("[FAIL] test 3: post-collision tag_match[%0d] = %b, expected 1 (new tag)", test_way, got_match[test_way]);
+            else if (got_dirty[test_way] !== new_dirty)
+                $error("[FAIL] test 3: post-collision dirty_out[%0d] = %b, expected new value %b", test_way, got_dirty[test_way], new_dirty);
+            else
+                $display("[PASS] test 3: write completed correctly despite not being forwarded");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 4: hit-write (wr_tag_en=0) touches only the dirty bit.
+        // Fill-writes a way with a known tag, then hit-writes the same
+        // location with wr_tag_en=0 -- but with a deliberately
+        // different, "poisoned" tag value on the write bus, so that a
+        // broken wr_tag_en gate (one that lets the tag through anyway)
+        // would be caught. A lookup with the *original* tag must still
+        // match, and dirty_out must reflect the hit-write's update.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [TAG_WIDTH-1:0]     original_tag;
+            logic [TAG_WIDTH-1:0]     poisoned_tag;
+            logic [NUM_WAYS-1:0]     got_match;
+            logic [NUM_WAYS-1:0]     got_dirty;
+
+            test_set     = 6'd45;
+            test_way     = 2'd0;
+            original_tag = 22'h0_3333;
+            poisoned_tag = 22'h0_FFFF; // must never actually be written, since wr_tag_en=0
+
+            // Fill-write: establish the baseline, dirty=0.
+            tag_write(test_set, test_way, original_tag, 1'b1, 1'b0, 1'b1);
+
+            // Hit-write: tag_en=0 (poisoned_tag must be ignored), dirty_en=1, dirty=1.
+            tag_write(test_set, test_way, poisoned_tag, 1'b0, 1'b1, 1'b1);
+
+            tag_lookup(test_set, original_tag, got_match, got_dirty);
+
+            if (got_match[test_way] !== 1'b1)
+                $error("[FAIL] test 4: tag_match[%0d] = %b, expected 1 (tag unchanged by hit-write)", test_way, got_match[test_way]);
+            else if (got_dirty[test_way] !== 1'b1)
+                $error("[FAIL] test 4: dirty_out[%0d] = %b, expected 1 (hit-write updated dirty)", test_way, got_dirty[test_way]);
+            else
+                $display("[PASS] test 4: hit-write updated dirty only, tag left untouched");
+        end
+
         $finish;
     end
 
