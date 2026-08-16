@@ -75,6 +75,14 @@ Before and after making any significant modification to the code:
 - **What to record:** The moment such a decision is settled, add an entry to `private_notes/DESIGN_DECISIONS.txt` stating what was chosen, why it was chosen, and why it's better than the alternative(s) that were considered.
 - **Format:** Brief — a few one-line-rationale bullets per decision, matching the existing entries in that file. Write it in English.
 
+---
+
+## 8. Verification Problem Logging
+- **When it applies:** Any time a test fails unexpectedly, a simulation misbehaves (stalls, wrong values, races), or debugging a TB/RTL interaction reveals something non-obvious — not simple typos caught and fixed on the spot.
+- **What to record:** What broke and where, the root cause, how the source of the problem was actually found (the diagnostic approach — not just the fix), and the fix itself — matching the existing entries in `private_notes/VERIFICATION_PROBLEMS.txt`.
+- **Always, without asking first:** unlike `DESIGN_DECISIONS.txt` (rule 7 — the user maintains that one and prefers to be asked), verification problems should always be appended to `private_notes/VERIFICATION_PROBLEMS.txt` directly, the moment the problem is understood and fixed.
+- **Format:** Brief and structured like the existing entries (Problem / Where / What happened / Why / How I found the problem / Fix / Lesson).
+
 # Communication & Teaching Guidelines
 
 ## Response Rules (STRICT)
