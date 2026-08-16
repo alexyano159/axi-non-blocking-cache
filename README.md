@@ -39,8 +39,8 @@ rationale: [`docs/MSHR_README.md`](docs/MSHR_README.md),
 [`docs/CACHE_DATA_SRAM_README.md`](docs/CACHE_DATA_SRAM_README.md).
 
 For a step-by-step visual walkthrough before reading the RTL, see
-[`visual_flow/`](visual_flow/) (a static block diagram plus an
-interactive MATLAB teaching tool — conceptual, not cycle-accurate).
+[`visual_flow/`](visual_flow/) (static dataflow diagrams for the MSHR
+and the data SRAM — conceptual, not cycle-accurate).
 
 ## Status
 
