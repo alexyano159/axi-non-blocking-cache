@@ -196,6 +196,7 @@ module cache_valid_array_tb;
             logic [SET_IDX_WIDTH-1:0] test_set;
             logic [WAY_WIDTH-1:0]     test_way;
             logic [NUM_WAYS-1:0]      got_valid;
+            logic [NUM_WAYS-1:0]      expected_valid;
 
             test_set = 6'd5;
             test_way = 2'd1;
@@ -203,10 +204,144 @@ module cache_valid_array_tb;
             valid_write(test_set, test_way, 1'b1);
             valid_lookup(test_set, got_valid);
 
-            if (got_valid[test_way] !== 1'b1)
-                $error("[FAIL] test 2: valid_out[%0d] = %b, expected 1", test_way, got_valid[test_way]);
+            expected_valid = '0;
+            expected_valid[test_way] = 1'b1;
+
+            if (got_valid !== expected_valid)
+                $error("[FAIL] test 2: valid_out = %b, expected one-hot at bit %0d (all-0 elsewhere)", got_valid, test_way);
             else
-                $display("[PASS] test 2: fill-write, matching lookup reports valid");
+                $display("[PASS] test 2: fill-write, matching lookup reports valid with all other ways still reset");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 3: explicit invalidate.
+        // Marks one (way, set) valid, confirms it, then explicitly
+        // writes it invalid and confirms the array now reports it
+        // absent. Proves the write port can represent both states --
+        // not just "write once and it's permanently valid" -- since
+        // test 2 alone couldn't distinguish a real valid bit from one
+        // that's stuck at 1 after any write.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [NUM_WAYS-1:0]      got_valid;
+
+            test_set = 6'd20;
+            test_way = 2'd3;
+
+            valid_write(test_set, test_way, 1'b1);
+            valid_lookup(test_set, got_valid);
+
+            if (got_valid[test_way] !== 1'b1) begin
+                $error("[FAIL] test 3: valid_out[%0d] = %b before invalidate, expected 1 (precondition)", test_way, got_valid[test_way]);
+            end else begin
+                valid_write(test_set, test_way, 1'b0);
+                valid_lookup(test_set, got_valid);
+
+                if (got_valid !== '0)
+                    $error("[FAIL] test 3: valid_out = %b after invalidate, expected all-0", got_valid);
+                else
+                    $display("[PASS] test 3: explicit invalidate correctly clears a previously-valid way");
+            end
+        end
+
+        // ---------------------------------------------------------------
+        // Test 4: read/write collision, same (way, set) on the same
+        // edge. A lookup issued on the same cycle as a write to the
+        // identical location must see the pre-write ("old") value,
+        // matching a single-port synchronous SRAM's collision behavior.
+        // A follow-up lookup (no collision) must then show the new
+        // value, confirming the write itself was not lost -- only not
+        // forwarded.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic                     old_valid;
+            logic                     new_valid;
+            logic [NUM_WAYS-1:0]      got_valid;
+            logic [NUM_WAYS-1:0]      expected_valid;
+
+            test_set  = 6'd25;
+            test_way  = 2'd0;
+            old_valid = 1'b1;
+            new_valid = 1'b0;
+
+            // Preload the location with the "old" value.
+            valid_write(test_set, test_way, old_valid);
+
+            // Drive a write of the "new" value and a lookup of the same
+            // (way, set) on the identical edge.
+            rd_set_idx = test_set;
+            wr_set_idx = test_set;
+            wr_way_sel = test_way;
+            wr_valid   = new_valid;
+            wr_en      = 1'b1;
+            @(posedge clk);
+            #1;
+            got_valid = valid_out;
+            wr_en      = 1'b0;
+
+            expected_valid = '0;
+            expected_valid[test_way] = old_valid;
+
+            if (got_valid !== expected_valid)
+                $error("[FAIL] test 4: collision valid_out = %b, expected %b (old value)", got_valid, expected_valid);
+            else
+                $display("[PASS] test 4: collision lookup returned pre-write (old) value");
+
+            // Follow-up lookup, no collision this time: the write must
+            // have actually completed.
+            valid_lookup(test_set, got_valid);
+
+            expected_valid = '0;
+            expected_valid[test_way] = new_valid;
+
+            if (got_valid !== expected_valid)
+                $error("[FAIL] test 4: post-collision valid_out = %b, expected %b (new value)", got_valid, expected_valid);
+            else
+                $display("[PASS] test 4: write completed correctly despite not being forwarded");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 5: way isolation. Preloads all four ways of one set with
+        // an alternating valid pattern, then overwrites only one way.
+        // Confirms the write landed exclusively in the targeted way --
+        // the other three ways, modeled as independent banks, must be
+        // completely unaffected.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     target_way;
+            logic                     way_valid [NUM_WAYS];
+            logic [NUM_WAYS-1:0]      got_valid;
+            logic [NUM_WAYS-1:0]      expected_valid;
+
+            test_set   = 6'd30;
+            target_way = 2'd2;
+
+            // Preload each way with an alternating pattern: 0, 1, 0, 1.
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                way_valid[w] = w[0];
+                valid_write(test_set, w[WAY_WIDTH-1:0], way_valid[w]);
+            end
+
+            // Overwrite only the target way with the inverted value.
+            way_valid[target_way] = ~way_valid[target_way];
+            valid_write(test_set, target_way, way_valid[target_way]);
+
+            valid_lookup(test_set, got_valid);
+
+            expected_valid = '0;
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                expected_valid[w] = way_valid[w];
+            end
+
+            if (got_valid !== expected_valid)
+                $error("[FAIL] test 5: valid_out = %b, expected %b (only way %0d changed)", got_valid, expected_valid, target_way);
+            else
+                $display("[PASS] test 5: write to one way left the other ways untouched");
         end
 
         $finish;
