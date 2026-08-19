@@ -94,4 +94,42 @@ every entry in a single cycle is realistic to synthesize.
 
 ## Verification
 
-Not yet written -- see `tb/cache_valid_array_tb.sv` once it exists.
+See `tb/cache_valid_array_tb.sv` -- 8 directed tests, verified with
+`iverilog`:
+
+1. **Reset behavior** -- at time 0, before any clock edge, `valid_out`
+   is unknown (`X`), since this is a synchronous reset and the register
+   hasn't sampled `rst_n` yet. After exactly one clock edge it becomes a
+   defined all-`0`. Reset is then shown to erase a location that was
+   demonstrably written valid moments earlier -- proving the clear is a
+   real effect of reset, not a coincidence of an already-blank starting
+   state.
+2. **Fill-write, matching lookup** -- the basic contract: a way written
+   valid reports valid on a lookup, checked as a full one-hot vector so
+   a write that incorrectly sets every way (not just the targeted one)
+   would be caught.
+3. **Explicit invalidate** -- a way marked valid, then explicitly
+   written invalid, reports absent on a follow-up lookup. Proves the
+   write port can represent both states, not just "write once and it's
+   permanently valid."
+4. **Read/write collision** -- a lookup issued on the same edge as a
+   write to the identical `(way, set)` sees the pre-write (old) value;
+   a follow-up lookup confirms the write completed, just wasn't
+   forwarded.
+5. **Way isolation** -- all four ways of a set are preloaded with an
+   alternating valid pattern, only one is overwritten, and a single
+   lookup of the whole set confirms the other three ways are untouched.
+6. **Set isolation** -- three sets (both edges of the address range,
+   plus an interior set) are preloaded in one way, only the interior
+   one is overwritten, confirming the edges are unaffected -- targeting
+   off-by-one bugs, which concentrate at address-range boundaries.
+7. **`wr_en` gating** -- a fully-formed write request held with
+   `wr_en=0` leaves the target location completely unchanged, closing
+   the coverage hole every other test leaves open by always asserting
+   `wr_en` when writing.
+8. **Reset clears `valid_out` directly, without a lookup** -- with
+   `valid_out` left showing a non-zero value, asserting reset for a
+   single clock edge (no lookup performed) already reads back all-`0`.
+   This isolates the *other* reset mechanism from test 1: the output
+   register is forced to `0` the instant reset is asserted, not only
+   once a subsequent read happens to return a cleared entry.

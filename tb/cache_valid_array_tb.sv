@@ -344,6 +344,139 @@ module cache_valid_array_tb;
                 $display("[PASS] test 5: write to one way left the other ways untouched");
         end
 
+        // ---------------------------------------------------------------
+        // Test 6: set isolation. Preloads three sets (both edges of the
+        // address range, plus an interior set) in one way with distinct
+        // values, then overwrites only the interior set. Confirms the
+        // write landed exclusively in the targeted set -- testing the
+        // edges specifically targets off-by-one bugs, which concentrate
+        // at the boundaries of an address range.
+        // ---------------------------------------------------------------
+        begin
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [SET_IDX_WIDTH-1:0] test_sets [3];
+            logic                     set_valid  [3];
+            logic [NUM_WAYS-1:0]      got_valid;
+            logic [NUM_WAYS-1:0]      expected_valid;
+            int                       target_idx;
+            logic                     set_ok;
+
+            test_way     = 2'd1;
+            test_sets[0] = '0;             // low edge of the address range
+            test_sets[1] = NUM_SETS / 2;   // an interior set
+            test_sets[2] = NUM_SETS - 1;   // high edge of the address range
+            target_idx   = 1;              // overwrite the interior set only
+
+            // Preload each set with an alternating pattern: 0, 1, 0.
+            for (int s = 0; s < 3; s++) begin
+                set_valid[s] = s[0];
+                valid_write(test_sets[s], test_way, set_valid[s]);
+            end
+
+            // Overwrite only the target set with the inverted value.
+            set_valid[target_idx] = ~set_valid[target_idx];
+            valid_write(test_sets[target_idx], test_way, set_valid[target_idx]);
+
+            set_ok = 1'b1;
+            for (int s = 0; s < 3; s++) begin
+                valid_lookup(test_sets[s], got_valid);
+
+                expected_valid = '0;
+                expected_valid[test_way] = set_valid[s];
+
+                if (got_valid !== expected_valid) begin
+                    set_ok = 1'b0;
+                    $error("[FAIL] test 6: set %0d valid_out = %b, expected %b", test_sets[s], got_valid, expected_valid);
+                end
+            end
+
+            if (set_ok)
+                $display("[PASS] test 6: write to one set left the other sets untouched");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 7: wr_en gating. Presents a complete, otherwise-valid
+        // write request (set, way, new value) with wr_en held low, and
+        // confirms the location is unchanged. Every earlier test always
+        // asserted wr_en alongside a write, so none of them would catch
+        // a bug that removed or broke this master gate.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic                     original_valid;
+            logic                     attempted_valid;
+            logic [NUM_WAYS-1:0]      got_valid;
+            logic [NUM_WAYS-1:0]      expected_valid;
+
+            test_set        = 6'd40;
+            test_way        = 2'd2;
+            original_valid  = 1'b1;
+            attempted_valid = 1'b0;
+
+            // Preload the location with the original value.
+            valid_write(test_set, test_way, original_valid);
+
+            // Present a complete write request, but hold wr_en low.
+            wr_set_idx = test_set;
+            wr_way_sel = test_way;
+            wr_valid   = attempted_valid;
+            wr_en      = 1'b0;
+            @(posedge clk);
+            #1;
+
+            valid_lookup(test_set, got_valid);
+
+            expected_valid = '0;
+            expected_valid[test_way] = original_valid;
+
+            if (got_valid !== expected_valid)
+                $error("[FAIL] test 7: valid_out = %b, expected %b (write with wr_en=0 must not change memory)", got_valid, expected_valid);
+            else
+                $display("[PASS] test 7: write request with wr_en low did not modify memory");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 8: reset clears valid_out directly, without needing a
+        // fresh lookup. Test 1 already proved reset clears the
+        // underlying storage (observable via a lookup performed after
+        // reset). This test isolates the other reset mechanism: the
+        // output register itself is forced to 0 the instant reset is
+        // asserted, even with no lookup performed at all -- so a stale,
+        // non-zero valid_out left over from before reset can never be
+        // observed, even for one cycle.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_set;
+            logic [WAY_WIDTH-1:0]     test_way;
+            logic [NUM_WAYS-1:0]      got_valid;
+
+            test_set = 6'd45;
+            test_way = 2'd3;
+
+            // Leave valid_out showing a non-zero (one-hot) value.
+            valid_write(test_set, test_way, 1'b1);
+            valid_lookup(test_set, got_valid);
+
+            if (got_valid[test_way] !== 1'b1) begin
+                $error("[FAIL] test 8: valid_out[%0d] = %b before reset, expected 1 (precondition)", test_way, got_valid[test_way]);
+            end else begin
+                // Assert reset for exactly one edge -- no valid_lookup
+                // call here, so this samples the output register
+                // directly rather than going through another read.
+                rst_n = 1'b0;
+                @(posedge clk);
+                #1;
+
+                if (valid_out !== '0)
+                    $error("[FAIL] test 8: valid_out = %b one cycle into reset, expected all-0 with no lookup performed", valid_out);
+                else
+                    $display("[PASS] test 8: reset drove valid_out to 0 directly, without a lookup");
+
+                rst_n = 1'b1;
+            end
+        end
+
         $finish;
     end
 
