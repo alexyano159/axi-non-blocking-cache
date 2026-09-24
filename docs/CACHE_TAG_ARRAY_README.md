@@ -4,8 +4,8 @@
 
 4-way set-associative. Holds **only** the tag and dirty bit of every
 cache line -- no valid bits, and no line data. Line data lives in the
-separate `cache_data_sram`; valid bits live in a separate valid-bit
-array (not yet built).
+separate `cache_data_sram`; valid bits live in the separate
+`cache_valid_array`.
 
 ```
 tag_mem[NUM_WAYS][NUM_SETS]     -- one TAG_WIDTH-bit tag per (way, set)

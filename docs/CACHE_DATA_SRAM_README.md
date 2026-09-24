@@ -3,8 +3,9 @@
 ## What it stores
 
 4-way set-associative, 4 KB total capacity. Holds **only** line data --
-no tags, valid bits, or dirty bits. Those live in a separate tag array
-(not yet built), which is read in parallel with matching latency.
+no tags, valid bits, or dirty bits. Tag and dirty bits live in the
+separate `cache_tag_array`, and valid bits in the separate
+`cache_valid_array`; both are read in parallel with matching latency.
 
 ```
 mem[NUM_WAYS][NUM_SETS]   -- one 128-bit line per (way, set) pair

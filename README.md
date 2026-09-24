@@ -29,13 +29,17 @@ CPU  <->  Cache Controller  <->  MSHR  <->  Main Memory (AXI4)
 The MSHR is the only block that ever touches the AXI bus. The cache
 controller hands it complete misses and dirty victims; the MSHR turns
 those into AXI bursts and hands back completed lines. On the cache side,
-the tag array and data SRAM are two separate, identically-indexed
-arrays — the controller ANDs the tag array's raw compare against the
-(not yet built) valid array to get a real hit, then reads the matching
-way out of the data SRAM in the same cycle. Full protocol and
-rationale: [`docs/MSHR_README.md`](docs/MSHR_README.md),
+the tag array, valid array, and data SRAM are three separate,
+identically-indexed arrays — the controller ANDs the tag array's raw
+compare against the valid array's per-way valid bits to get a real hit,
+then reads the matching way out of the data SRAM in the same cycle.
+Only the valid array has a reset; the tag and data arrays are modeled
+as reset-less SRAM macros whose contents are ignored until a way is
+marked valid. Full protocol and rationale:
+[`docs/MSHR_README.md`](docs/MSHR_README.md),
 [`docs/AXI_IF_README.md`](docs/AXI_IF_README.md),
 [`docs/CACHE_TAG_ARRAY_README.md`](docs/CACHE_TAG_ARRAY_README.md),
+[`docs/CACHE_VALID_ARRAY_README.md`](docs/CACHE_VALID_ARRAY_README.md),
 [`docs/CACHE_DATA_SRAM_README.md`](docs/CACHE_DATA_SRAM_README.md).
 
 For a step-by-step visual walkthrough before reading the RTL, see
@@ -49,9 +53,9 @@ and the data SRAM — conceptual, not cycle-accurate).
 | `axi_if.sv` — AXI4 interface | Done | — (exercised via `mshr_tb`) |
 | `mshr.sv` — miss handling + writeback | Done | 13 directed tests, all passing |
 | `cache_tag_array.sv` — tag + dirty bit, 4-way | Done | 8 directed tests, all passing |
+| `cache_valid_array.sv` — valid bit, 4-way, sync reset | Done | 8 directed tests, all passing |
 | `cache_data_sram.sv` — line data, 4-way | Done | 6 directed tests, all passing |
-| Valid-bit array | Not started (next up) | — |
-| Cache controller | Not started | — |
+| Cache controller | Not started (next up) | — |
 | Top-level cache integration | Not started | — |
 
 `mshr.sv` currently covers: single read/write miss fill, hit-under-miss
@@ -69,6 +73,13 @@ of the tag vs. dirty write-enables (each checked with a deliberately
 mismatched value on the other field, to catch a broken gate), way
 isolation, set isolation, and `wr_en` gating.
 
+`cache_valid_array.sv` currently covers: reset clearing a previously
+written entry (with the output shown as `X` before the first clocked
+reset edge), fill-write with a matching lookup, explicit invalidate, a
+same-cycle read/write collision returning the pre-write value, way
+isolation, set isolation, `wr_en` gating, and reset clearing the output
+register directly without a lookup.
+
 `cache_data_sram.sv` currently covers: single-word hit-write readback,
 a same-cycle read/write collision, a fill-write overwriting stale data
 across all four words, way isolation, `wr_en` gating, and set isolation.
@@ -85,11 +96,12 @@ Compiles `rtl/axi_if.sv`, `rtl/mshr.sv`, and `tb/mshr_tb.sv` into
 `tools/sim/work/`, then runs all directed tests to completion, printing
 a `[PASS]`/`[FAIL]` line per test.
 
-**`cache_tag_array_tb`** — verified with `iverilog`/`vvp` (Icarus
-Verilog):
+**`cache_tag_array_tb`** and **`cache_valid_array_tb`** — verified
+with `iverilog`/`vvp` (Icarus Verilog):
 
 ```bash
 iverilog -g2012 -o tag_tb.vvp rtl/cache_tag_array.sv tb/cache_tag_array_tb.sv && vvp tag_tb.vvp
+iverilog -g2012 -o valid_tb.vvp rtl/cache_valid_array.sv tb/cache_valid_array_tb.sv && vvp valid_tb.vvp
 ```
 
 **`cache_data_sram_tb`** — requires Questa; its unpacked-array task
