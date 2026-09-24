@@ -54,7 +54,7 @@ module cache_tag_array #(
     parameter int TAG_WIDTH      = ADDR_WIDTH - SET_IDX_WIDTH
                                     - WORD_OFF_WIDTH - BYTE_OFF_WIDTH // 22
 ) (
-    input  logic clk,
+    input  wire logic clk,
 
     // -----------------------------------------------------------------
     // Read / compare port (cache controller -> tag array)
@@ -64,10 +64,10 @@ module cache_tag_array #(
     // cycle later; the controller ANDs tag_match with the valid array's
     // output to determine the real hit/hit_way.
     // -----------------------------------------------------------------
-    input  logic [SET_IDX_WIDTH-1:0] rd_set_idx,
-    input  logic [TAG_WIDTH-1:0]     lookup_tag,
-    output logic [NUM_WAYS-1:0]      tag_match,
-    output logic [NUM_WAYS-1:0]      dirty_out,
+    input  wire logic [SET_IDX_WIDTH-1:0] rd_set_idx,
+    input  wire logic [TAG_WIDTH-1:0]     lookup_tag,
+    output      logic [NUM_WAYS-1:0]      tag_match,
+    output      logic [NUM_WAYS-1:0]      dirty_out,
 
     // -----------------------------------------------------------------
     // Write port (cache controller -> tag array)
@@ -79,13 +79,13 @@ module cache_tag_array #(
     //   - Fill write: wr_tag_en = 1, wr_tag = new line's tag,
     //                 wr_dirty_en = 1, wr_dirty = fill_is_write.
     // -----------------------------------------------------------------
-    input  logic                     wr_en,
-    input  logic [SET_IDX_WIDTH-1:0] wr_set_idx,
-    input  logic [WAY_WIDTH-1:0]     wr_way_sel,
-    input  logic [TAG_WIDTH-1:0]     wr_tag,
-    input  logic                     wr_tag_en,
-    input  logic                     wr_dirty,
-    input  logic                     wr_dirty_en
+    input  wire logic                     wr_en,
+    input  wire logic [SET_IDX_WIDTH-1:0] wr_set_idx,
+    input  wire logic [WAY_WIDTH-1:0]     wr_way_sel,
+    input  wire logic [TAG_WIDTH-1:0]     wr_tag,
+    input  wire logic                     wr_tag_en,
+    input  wire logic                     wr_dirty,
+    input  wire logic                     wr_dirty_en
 );
 
     // Storage: one (tag, dirty) pair per (way, set), modeled as

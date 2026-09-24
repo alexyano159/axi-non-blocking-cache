@@ -44,8 +44,8 @@ module cache_valid_array #(
     parameter int SET_IDX_WIDTH = $clog2(NUM_SETS),          // 6
     parameter int WAY_WIDTH     = $clog2(NUM_WAYS)           // 2
 ) (
-    input  logic clk,
-    input  logic rst_n,
+    input  wire logic clk,
+    input  wire logic rst_n,
 
     // -----------------------------------------------------------------
     // Read port (cache controller -> valid array)
@@ -55,8 +55,8 @@ module cache_valid_array #(
     // cycle later -- the controller ANDs this with tag_match to get
     // the real hit/hit_way.
     // -----------------------------------------------------------------
-    input  logic [SET_IDX_WIDTH-1:0] rd_set_idx,
-    output logic [NUM_WAYS-1:0]      valid_out,
+    input  wire logic [SET_IDX_WIDTH-1:0] rd_set_idx,
+    output      logic [NUM_WAYS-1:0]      valid_out,
 
     // -----------------------------------------------------------------
     // Write port (cache controller -> valid array)
@@ -65,10 +65,10 @@ module cache_valid_array #(
     //                   resident.
     //   - Invalidate  : wr_valid = 0, marking a way no longer resident.
     // -----------------------------------------------------------------
-    input  logic                     wr_en,
-    input  logic [SET_IDX_WIDTH-1:0] wr_set_idx,
-    input  logic [WAY_WIDTH-1:0]     wr_way_sel,
-    input  logic                     wr_valid
+    input  wire logic                     wr_en,
+    input  wire logic [SET_IDX_WIDTH-1:0] wr_set_idx,
+    input  wire logic [WAY_WIDTH-1:0]     wr_way_sel,
+    input  wire logic                     wr_valid
 );
 
     // Storage: one valid bit per (way, set), modeled as NUM_WAYS

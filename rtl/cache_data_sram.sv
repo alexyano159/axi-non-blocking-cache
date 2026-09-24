@@ -38,7 +38,7 @@ module cache_data_sram #(
     parameter int SET_IDX_WIDTH  = $clog2(NUM_SETS),            // 6
     parameter int WAY_WIDTH      = $clog2(NUM_WAYS)             // 2
 ) (
-    input  logic clk,
+    input  wire logic clk,
 
     // -----------------------------------------------------------------
     // Read port (cache controller -> SRAM)
@@ -47,8 +47,8 @@ module cache_data_sram #(
     // controller combines this with the tag array's hit-way result
     // (read with matching latency) to select data or a write target.
     // -----------------------------------------------------------------
-    input  logic [SET_IDX_WIDTH-1:0] rd_set_idx,
-    output logic [LINE_WIDTH-1:0]    rd_line [NUM_WAYS],
+    input  wire logic [SET_IDX_WIDTH-1:0] rd_set_idx,
+    output      logic [LINE_WIDTH-1:0]    rd_line [NUM_WAYS],
 
     // -----------------------------------------------------------------
     // Write port (cache controller -> SRAM)
@@ -61,11 +61,11 @@ module cache_data_sram #(
     //   - Fill write: wr_word_en = all-ones, wr_data is the full line
     //                 returned by the MSHR.
     // -----------------------------------------------------------------
-    input  logic                        wr_en,
-    input  logic [SET_IDX_WIDTH-1:0]    wr_set_idx,
-    input  logic [WAY_WIDTH-1:0]        wr_way_sel,
-    input  logic [WORDS_PER_LINE-1:0]   wr_word_en,
-    input  logic [LINE_WIDTH-1:0]       wr_data
+    input  wire logic                        wr_en,
+    input  wire logic [SET_IDX_WIDTH-1:0]    wr_set_idx,
+    input  wire logic [WAY_WIDTH-1:0]        wr_way_sel,
+    input  wire logic [WORDS_PER_LINE-1:0]   wr_word_en,
+    input  wire logic [LINE_WIDTH-1:0]       wr_data
 );
 
     // Storage: one line per (way, set) pair. Modeled as four independent

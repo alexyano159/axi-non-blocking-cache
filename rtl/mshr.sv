@@ -40,40 +40,40 @@ module mshr #(
     parameter int NUM_ENTRIES   = (1 << ID_WIDTH),         // one entry per AXI ID value
     parameter int WB_QUEUE_DEPTH = 4                       // victim writebacks that can be queued awaiting the AXI write channel
 ) (
-    input  logic clk,
-    input  logic rst_n,  // active-low, synchronous reset
+    input  wire logic clk,
+    input  wire logic rst_n,  // active-low, synchronous reset
 
     // -----------------------------------------------------------------
     // Miss allocation (cache controller -> MSHR)
     // Driven the cycle the controller's tag compare detects a miss.
     // -----------------------------------------------------------------
-    input  logic                  alloc_valid,     // controller is reporting a miss
-    input  logic [ADDR_WIDTH-1:0] alloc_addr,      // line-aligned address that missed
-    input  logic                  alloc_is_write,  // 1 = the access that missed was a store
-    output logic                  alloc_ready,     // 0 = no free entry and no in-flight entry to merge with; controller must stall
-    output logic [ID_WIDTH-1:0]   alloc_id,        // entry index / AXI ID assigned to this miss
+    input  wire logic                  alloc_valid,     // controller is reporting a miss
+    input  wire logic [ADDR_WIDTH-1:0] alloc_addr,      // line-aligned address that missed
+    input  wire logic                  alloc_is_write,  // 1 = the access that missed was a store
+    output      logic                  alloc_ready,     // 0 = no free entry and no in-flight entry to merge with; controller must stall
+    output      logic [ID_WIDTH-1:0]   alloc_id,        // entry index / AXI ID assigned to this miss
 
     // -----------------------------------------------------------------
     // Victim writeback (cache controller -> MSHR)
     // Driven when the controller evicts a dirty line and needs it
     // flushed to memory.
     // -----------------------------------------------------------------
-    input  logic                    wb_valid,  // controller is handing off a dirty victim line
-    input  logic [ADDR_WIDTH-1:0]   wb_addr,   // victim line address
-    input  logic [LINE_WIDTH-1:0]   wb_data,   // victim line data
-    output logic                    wb_ready,  // 0 = writeback queue is full
-    output logic                    wb_done,   // pulses for one cycle once the AXI write is confirmed by a B response
+    input  wire logic                    wb_valid,  // controller is handing off a dirty victim line
+    input  wire logic [ADDR_WIDTH-1:0]   wb_addr,   // victim line address
+    input  wire logic [LINE_WIDTH-1:0]   wb_data,   // victim line data
+    output      logic                    wb_ready,  // 0 = writeback queue is full
+    output      logic                    wb_done,   // pulses for one cycle once the AXI write is confirmed by a B response
 
     // -----------------------------------------------------------------
     // Fill completion (MSHR -> cache controller)
     // Driven once an outstanding read miss has been fully serviced.
     // -----------------------------------------------------------------
-    output logic                  fill_valid,     // a completed line is available this cycle
-    output logic [ID_WIDTH-1:0]   fill_id,        // entry that completed
-    output logic [ADDR_WIDTH-1:0] fill_addr,      // address of the completed line
-    output logic [LINE_WIDTH-1:0] fill_data,      // reassembled line data, all beats concatenated
-    output logic                  fill_is_write,  // 1 = controller must merge the pending store and mark the line dirty
-    input  logic                  fill_ready,     // 1 = the data array can accept the fill this cycle
+    output      logic                  fill_valid,     // a completed line is available this cycle
+    output      logic [ID_WIDTH-1:0]   fill_id,        // entry that completed
+    output      logic [ADDR_WIDTH-1:0] fill_addr,      // address of the completed line
+    output      logic [LINE_WIDTH-1:0] fill_data,      // reassembled line data, all beats concatenated
+    output      logic                  fill_is_write,  // 1 = controller must merge the pending store and mark the line dirty
+    input  wire logic                  fill_ready,     // 1 = the data array can accept the fill this cycle
 
     // -----------------------------------------------------------------
     // AXI4 master port to main memory.
