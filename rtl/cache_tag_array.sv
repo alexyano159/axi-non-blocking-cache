@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------
 // Stores the tag and dirty bit of every cache line: 4-way set-associative,
 // one (tag, dirty) pair per (way, set). Holds NO valid bits -- those live
-// in a separate, dedicated valid-bit array (not yet built), which is the
+// in the separate, dedicated valid-bit array (cache_valid_array), which is the
 // only piece of tag-side state that requires a synchronous reset. Keeping
 // this array reset-free means the comparator below can never be trusted
 // on its own: a "match" against garbage tag data in an invalid entry is
