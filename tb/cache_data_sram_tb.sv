@@ -104,6 +104,12 @@ module cache_data_sram_tb;
         wr_data    = data;
         wr_en      = 1'b1;
         @(posedge clk);
+        // The DUT's write-port always_ff is triggered by this same edge;
+        // deasserting wr_en in the same timestep would race that block's
+        // "if (wr_en)" evaluation. The #1 pushes the deassertion strictly
+        // past the edge, so the DUT is guaranteed to have sampled wr_en
+        // high -- mirroring tag_write in cache_tag_array_tb.
+        #1;
         wr_en      = 1'b0;
     endtask
 
@@ -198,8 +204,10 @@ module cache_data_sram_tb;
             wr_data    = new_line_buf;
             wr_en      = 1'b1;
             @(posedge clk);
-            wr_en = 1'b0;
+            // Deassert only after #1, for the same reason as in
+            // sram_write: wr_en must not change within the edge's timestep.
             #1;
+            wr_en    = 1'b0;
             got_line = rd_line;
 
             if (got_line[test_way][0*DATA_WIDTH +: DATA_WIDTH] !== old_word)
