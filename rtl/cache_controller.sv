@@ -125,8 +125,71 @@ module cache_controller #(
     output      logic                     mshr_fill_ready
 );
 
-    // Internal logic (hit/miss detection, pending-request table,
-    // fill/eviction FSM, replacement policy) is implemented in a later step.
+    // -------------------------------------------------------------------
+    // Address decomposition
+    // Splits an incoming request address into the fields the tag array
+    // was built to index on. Word/byte offset are not needed for the
+    // lookup itself, but are decomposed here since the word offset is
+    // needed later to select/mask the correct word within the hit line.
+    // -------------------------------------------------------------------
+    logic [SET_IDX_WIDTH-1:0]  req_set_idx;
+    logic [TAG_WIDTH-1:0]      req_tag;
+    logic [WORD_OFF_WIDTH-1:0] req_word_off;
+
+    assign req_word_off = req_addr[BYTE_OFF_WIDTH +: WORD_OFF_WIDTH];
+    assign req_set_idx  = req_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH +: SET_IDX_WIDTH];
+    assign req_tag      = req_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH + SET_IDX_WIDTH +: TAG_WIDTH];
+
+    // Drive the same decomposed address into all three arrays every
+    // cycle a request is accepted -- their registered outputs return
+    // together, one cycle later, so the controller can combine them.
+    assign tag_rd_set_idx   = req_set_idx;
+    assign tag_lookup_tag   = req_tag;
+    assign valid_rd_set_idx = req_set_idx;
+    assign data_rd_set_idx  = req_set_idx;
+
+    // Placeholder: will be gated by the pending-request table once it
+    // exists. For now nothing yet stalls the CPU-facing request port.
+    assign req_ready = 1'b1;
+
+    // -------------------------------------------------------------------
+    // Lookup shadow register
+    // The tag/valid/data arrays register their read result one cycle
+    // after the address is presented. This carries the request's own
+    // metadata forward by that same one cycle, so it lines up with
+    // tag_match/valid_out/data_rd_line on the cycle they become valid.
+    // -------------------------------------------------------------------
+    typedef struct packed {
+        logic                      valid;     // this slot holds a real request looked up last cycle
+        logic [ADDR_WIDTH-1:0]     addr;
+        logic [SET_IDX_WIDTH-1:0]  set_idx;
+        logic [TAG_WIDTH-1:0]      tag;
+        logic [WORD_OFF_WIDTH-1:0] word_off;
+        logic                      we;
+        logic [DATA_WIDTH-1:0]     wdata;
+        logic [TXN_ID_WIDTH-1:0]   id;
+    } lookup_meta_t;
+
+    lookup_meta_t lookup_q;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            lookup_q.valid <= 1'b0;
+        end else begin
+            lookup_q.valid    <= req_valid && req_ready;
+            lookup_q.addr     <= req_addr;
+            lookup_q.set_idx  <= req_set_idx;
+            lookup_q.tag      <= req_tag;
+            lookup_q.word_off <= req_word_off;
+            lookup_q.we       <= req_we;
+            lookup_q.wdata    <= req_wdata;
+            lookup_q.id       <= req_id;
+        end
+    end
+
+    // Remaining internal logic (hit/miss detection, pending-request
+    // table, fill/eviction FSM, replacement policy) is implemented in
+    // later steps.
 
 endmodule : cache_controller
 
