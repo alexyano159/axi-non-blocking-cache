@@ -20,8 +20,9 @@
 // leave that capability unused, since the CPU would stall on every miss
 // regardless of how many MSHR entries exist.
 //
-// IO-only skeleton: internal hit/miss logic, the pending-request tracking
-// table, and the fill/eviction FSM are added in a later step.
+// Work in progress: address decomposition, the lookup shadow register and
+// hit/miss detection are implemented; the pending-request tracking table,
+// replacement policy and fill/eviction FSM are added in later steps.
 // -----------------------------------------------------------------------
 `default_nettype none
 
@@ -187,9 +188,53 @@ module cache_controller #(
         end
     end
 
-    // Remaining internal logic (hit/miss detection, pending-request
-    // table, fill/eviction FSM, replacement policy) is implemented in
-    // later steps.
+    // -------------------------------------------------------------------
+    // Hit / miss detection (lookup stage, cycle N+1)
+    // A way hits only when its stored tag matches AND its line is valid:
+    // tag_match alone is insufficient, since an invalid way may retain a
+    // stale (or post-reset uninitialised) tag that coincidentally matches.
+    // -------------------------------------------------------------------
+    logic [NUM_WAYS-1:0]  hit_vec;      // one-hot (or zero) per-way hit
+    logic                 hit_any;
+    logic [WAY_WIDTH-1:0] hit_way;      // binary index of the hitting way
+    logic                 lookup_hit;   // real request, and it hit
+    logic                 lookup_miss;  // real request, and it missed
+
+    assign hit_vec     = tag_match & valid_out;
+    assign hit_any     = |hit_vec;
+    assign lookup_hit  = lookup_q.valid &&  hit_any;
+    assign lookup_miss = lookup_q.valid && !hit_any;
+
+    // One-hot to binary encoder. The allocation policy never places the
+    // same tag in two ways of one set, so at most one bit of hit_vec is
+    // set; the loop therefore acts as a plain encoder rather than a
+    // priority selector.
+    always_comb begin
+        hit_way = '0;
+        for (int w = 0; w < NUM_WAYS; w++) begin
+            if (hit_vec[w]) hit_way = WAY_WIDTH'(w);
+        end
+    end
+
+    // Word select: extract the requested 32-bit word from the hitting
+    // way's 128-bit line, using the word offset carried in lookup_q.
+    logic [LINE_WIDTH-1:0] hit_line;
+    logic [DATA_WIDTH-1:0] hit_word;
+
+    assign hit_line = data_rd_line[hit_way];
+    assign hit_word = hit_line[lookup_q.word_off * DATA_WIDTH +: DATA_WIDTH];
+
+`ifndef SYNTHESIS
+    // Invariant check: a duplicated tag within a set would indicate an
+    // allocation bug, and would make hit_way ambiguous.
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     lookup_q.valid |-> $onehot0(hit_vec))
+        else $error("cache_controller: multiple ways hit in set %0d (hit_vec=%b)",
+                    lookup_q.set_idx, hit_vec);
+`endif
+
+    // Remaining internal logic (pending-request table, fill/eviction
+    // FSM, replacement policy) is implemented in later steps.
 
 endmodule : cache_controller
 
