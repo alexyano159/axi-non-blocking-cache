@@ -376,6 +376,28 @@ module cache_controller_tb;
                 $display("[PASS] test 1: idle after reset -- ready, no response, no array writes, no MSHR requests");
         end
 
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- test 1 implemented and passing (2026-09-29).
+        //
+        // Next: test 2, single load hit. Plan (agreed, not yet coded):
+        //   - preload_line(set, way, tag, data): one-edge write of tag,
+        //     valid and data through the preload mux (tb_preload = 1).
+        //   - cpu_send(addr, we, wdata, id): CPU BFM task; holds
+        //     req_valid until req_valid && req_ready is sampled.
+        //   - background response monitor: records (id, data, we,
+        //     arrival cycle) of every response into a queue.
+        //   - check: preload set 5 / way 2 with four distinct words, load
+        //     word 1 with id 7; expect id = 7, we = 0, data = word 1,
+        //     response exactly 2 cycles after acceptance.
+        //
+        // Remaining hit-path tests (see plan): 3 every way x every word,
+        // 4 valid gating (matching tag, valid = 0 -> must miss),
+        // 5 store hit + readback + dirty bit (scoreboard added here),
+        // 6 back-to-back store->load same set (RAW stall, 1 cycle only),
+        // 7 full throughput, 8 back-pressure (FIFO fills to 3, drains),
+        // 9 random load/store mix with random resp_ready.
+        // ---------------------------------------------------------------
+
         $finish;
     end
 

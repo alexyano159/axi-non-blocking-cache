@@ -410,8 +410,24 @@ module cache_controller #(
         else $error("cache_controller: response FIFO overflow");
 `endif
 
-    // Remaining internal logic (miss handling via the MSHR, fill/eviction
-    // sequencing, replacement policy) is implemented in later steps.
+    // -------------------------------------------------------------------
+    // PROGRESS MARKER -- steps 1-4 implemented (2026-09-29).
+    // The hit path (step 4) is being verified in tb/cache_controller_tb.sv
+    // before further RTL is added; test 1 passes, tests 2-9 pending.
+    //
+    // Next RTL step (5), miss handling -- plan proposed, not yet approved:
+    //   - on lookup_miss: drive mshr_alloc_* with the line-aligned address
+    //     and is_write; record the returned mshr_alloc_id.
+    //   - pending-request (replay) table, 16 entries (bounded by the 4-bit
+    //     CPU id): each holds the missed request (addr, we, wdata, id)
+    //     and the MSHR entry it waits on.
+    //   - req_ready additionally requires (pending count + lookup_q.valid)
+    //     < 16, which also guarantees mshr_alloc_ready (every busy MSHR
+    //     entry has at least one waiting request); assert this.
+    // Then: step 6 tree pseudo-LRU replacement, step 7 fill/eviction
+    // with replay of pending requests through the hit path (see
+    // DESIGN_DECISIONS.txt).
+    // -------------------------------------------------------------------
 
 endmodule : cache_controller
 
