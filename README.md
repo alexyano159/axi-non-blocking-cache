@@ -86,15 +86,20 @@ across all four words, way isolation, `wr_en` gating, and set isolation.
 
 ## Running the testbenches
 
-**`mshr_tb`** — requires Questa (path configured in `tools/sim/run.sh`):
+All testbenches run under Questa (Intel/Altera FPGA Starter Edition,
+installed under `C:\altera_lite\<release>\`, license `.dat` in `tools/`):
 
 ```bash
-./tools/sim/run.sh
+./tools/sim/run.sh [tb_name]     # default: mshr_tb
+./tools/sim/run.sh cache_tag_array_tb
 ```
 
-Compiles `rtl/axi_if.sv`, `rtl/mshr.sv`, and `tb/mshr_tb.sv` into
-`tools/sim/work/`, then runs all directed tests to completion, printing
-a `[PASS]`/`[FAIL]` line per test.
+Compiles every file in `rtl/` plus `tb/<tb_name>.sv`, then runs all
+directed tests to completion, printing a `[PASS]`/`[FAIL]` line per
+test. Questa cannot handle non-ASCII paths, so if the project lives
+under one the script transparently simulates from an ASCII staging copy
+in `%LOCALAPPDATA%\axi-non-blocking-cache-sim\`; otherwise it runs in
+`tools/sim/`.
 
 **`cache_tag_array_tb`** and **`cache_valid_array_tb`** — verified
 with `iverilog`/`vvp` (Icarus Verilog):
