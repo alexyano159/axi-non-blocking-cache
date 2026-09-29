@@ -13,7 +13,7 @@ self-checking, directed testbench per module.
 | Line size | 4 words (128 bits), matching the AXI burst length |
 | Write policy | Write-back, write-allocate |
 | Miss handling | Non-blocking via a fully-associative MSHR, up to 16 outstanding misses, with hit-under-miss merging |
-| Replacement policy | Not yet decided (LRU vs. pseudo-LRU) — pending the cache-controller module |
+| Replacement policy | Tree pseudo-LRU (3 bits per set); victim chosen at fill time |
 
 The cache and the MSHR use two different addressing schemes on purpose:
 the cache is indexed (`[TAG | SET | OFFSET]`) for fast, single-row
