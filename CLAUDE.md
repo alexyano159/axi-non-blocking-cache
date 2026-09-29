@@ -66,7 +66,7 @@ Before and after making any significant modification to the code:
 - **Line size:** 4 words per line (128 bits), matching the AXI burst length already fixed in `axi_if.sv`/`mshr.sv` (`arlen = 3` → 4 beats).
 - **Write policy:** Write-back with write-allocate — dirty lines are flushed to memory lazily on eviction (via the MSHR's writeback path), not written through on every store.
 - **Miss handling:** Non-blocking, via the MSHR (`mshr.sv`), supporting up to 16 outstanding misses (`ID_WIDTH = 4`) with secondary-miss merging (hit-under-miss).
-- **Replacement policy:** Not yet decided — to be specified when the tag-array/cache-controller module is designed (candidates: true LRU vs. tree-based pseudo-LRU).
+- **Replacement policy:** Tree-based pseudo-LRU — 3 bits per set (a root bit selects the less-recently-used half, one bit per half selects the way within it), updated on every access to point away from the used way. Chosen over true LRU (≥5 bits per set and a full-order update on every access) because it updates in a single cycle, scales to 8+ ways, and is the standard choice in real L1 caches; at 4 ways its hit-rate loss versus true LRU is small. The victim is chosen at fill time, not at miss time, so the old line keeps serving hits while the miss is in flight.
 
 ---
 
