@@ -316,6 +316,50 @@ module cache_controller_tb;
     end
 
     // -------------------------------------------------------------------
+    // Cycle counter and response monitor.
+    // cycle_cnt holds the index of the most recent rising edge. The
+    // monitor runs in the same process, so each logged response carries
+    // the index of the edge on which its handshake completed -- directly
+    // comparable with cpu_send's accept_cycle. DUT outputs read here are
+    // their pre-edge values, since flop updates land in the NBA region.
+    // -------------------------------------------------------------------
+    typedef struct {
+        logic [TXN_ID_WIDTH-1:0] id;
+        logic [DATA_WIDTH-1:0]   data;
+        logic                    we;
+        int unsigned             cycle;
+    } resp_rec_t;
+
+    int unsigned cycle_cnt = 0;
+    resp_rec_t   resp_log [$];
+
+    always @(posedge clk) begin
+        cycle_cnt++;
+        if (rst_n && resp_valid && resp_ready)
+            resp_log.push_back('{id: resp_id, data: resp_data, we: resp_we, cycle: cycle_cnt});
+    end
+
+    // -------------------------------------------------------------------
+    // Side-effect watcher.
+    // While chk_no_side_effects = 1, any array write or MSHR request
+    // issued by the controller is counted. Used by tests whose stimulus
+    // must leave the cache contents and the MSHR untouched.
+    // -------------------------------------------------------------------
+    logic        chk_no_side_effects = 1'b0;
+    int unsigned side_effect_cnt     = 0;
+
+    always @(posedge clk) begin
+        if (chk_no_side_effects &&
+            (ctrl_tag_wr_en || ctrl_valid_wr_en || ctrl_data_wr_en ||
+             mshr_alloc_valid || mshr_wb_valid)) begin
+            $error("side-effect watcher: unexpected write/request at cycle %0d (tag=%b valid=%b data=%b alloc=%b wb=%b)",
+                   cycle_cnt, ctrl_tag_wr_en, ctrl_valid_wr_en, ctrl_data_wr_en,
+                   mshr_alloc_valid, mshr_wb_valid);
+            side_effect_cnt++;
+        end
+    end
+
+    // -------------------------------------------------------------------
     // Helper tasks.
     // -------------------------------------------------------------------
 
@@ -328,6 +372,97 @@ module cache_controller_tb;
         repeat (3) @(posedge clk);
         #1;
         rst_n = 1'b1;
+    endtask
+
+    // Builds a word-aligned request address from its cache fields.
+    function automatic logic [ADDR_WIDTH-1:0] make_addr(
+        input logic [TAG_WIDTH-1:0]      tag,
+        input logic [SET_IDX_WIDTH-1:0]  set_idx,
+        input logic [WORD_OFF_WIDTH-1:0] word_off
+    );
+        return {tag, set_idx, word_off, BYTE_OFF_WIDTH'(0)};
+    endfunction
+
+    // Installs one complete, valid, clean line through the preload mux:
+    // tag (with dirty = 0), valid bit and all four data words are
+    // written on a single edge. Called #1 after an edge, and only while
+    // no request is in flight -- during preload the controller's own
+    // array writes are disconnected and would be lost.
+    task automatic preload_line(
+        input logic [SET_IDX_WIDTH-1:0] set_idx,
+        input logic [WAY_WIDTH-1:0]     way,
+        input logic [TAG_WIDTH-1:0]     tag,
+        input logic [LINE_WIDTH-1:0]    line
+    );
+        tb_preload = 1'b1;
+
+        pre_tag_wr_en        = 1'b1;
+        pre_tag_wr_set_idx   = set_idx;
+        pre_tag_wr_way_sel   = way;
+        pre_tag_wr_tag       = tag;
+        pre_tag_wr_tag_en    = 1'b1;
+        pre_tag_wr_dirty     = 1'b0;
+        pre_tag_wr_dirty_en  = 1'b1;
+
+        pre_valid_wr_en      = 1'b1;
+        pre_valid_wr_set_idx = set_idx;
+        pre_valid_wr_way_sel = way;
+        pre_valid_wr_valid   = 1'b1;
+
+        pre_data_wr_en       = 1'b1;
+        pre_data_wr_set_idx  = set_idx;
+        pre_data_wr_way_sel  = way;
+        pre_data_wr_word_en  = '1;
+        pre_data_wr_data     = line;
+
+        @(posedge clk);
+        #1;
+
+        pre_tag_wr_en   = 1'b0;
+        pre_valid_wr_en = 1'b0;
+        pre_data_wr_en  = 1'b0;
+        tb_preload      = 1'b0;
+    endtask
+
+    // CPU bus-functional model: presents one request and holds it until
+    // the handshake completes. accept_cycle returns the index of the
+    // edge on which req_valid && req_ready was sampled.
+    //
+    // req_ready is read #1 after the preceding edge, where it is stable:
+    // it depends only on state registered at that edge and on the
+    // TB-held request fields. If it is high, the next edge completes the
+    // handshake. A bounded wait turns a permanently stalled controller
+    // into a clear failure rather than a hung simulation.
+    localparam int unsigned REQ_TIMEOUT_CYCLES = 100;
+
+    task automatic cpu_send(
+        input  logic [ADDR_WIDTH-1:0]   addr,
+        input  logic                    we,
+        input  logic [DATA_WIDTH-1:0]   wdata,
+        input  logic [TXN_ID_WIDTH-1:0] id,
+        output int unsigned             accept_cycle
+    );
+        logic        accepted;
+        int unsigned waited;
+
+        req_valid = 1'b1;
+        req_addr  = addr;
+        req_we    = we;
+        req_wdata = wdata;
+        req_id    = id;
+
+        waited = 0;
+        do begin
+            accepted = req_ready;
+            @(posedge clk);
+            #1;
+            if (++waited > REQ_TIMEOUT_CYCLES)
+                $fatal(1, "cpu_send: request id %0d not accepted within %0d cycles",
+                       id, REQ_TIMEOUT_CYCLES);
+        end while (!accepted);
+
+        accept_cycle = cycle_cnt;
+        req_valid    = 1'b0;
     endtask
 
     // -------------------------------------------------------------------
@@ -377,18 +512,88 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- test 1 implemented and passing (2026-09-29).
-        //
-        // Next: test 2, single load hit. Plan (agreed, not yet coded):
-        //   - preload_line(set, way, tag, data): one-edge write of tag,
-        //     valid and data through the preload mux (tb_preload = 1).
-        //   - cpu_send(addr, we, wdata, id): CPU BFM task; holds
-        //     req_valid until req_valid && req_ready is sampled.
-        //   - background response monitor: records (id, data, we,
-        //     arrival cycle) of every response into a queue.
-        //   - check: preload set 5 / way 2 with four distinct words, load
-        //     word 1 with id 7; expect id = 7, we = 0, data = word 1,
-        //     response exactly 2 cycles after acceptance.
+        // Test 2: single load hit.
+        // One line with four distinct words is installed in a non-zero
+        // way, and one load to a middle word of that line is issued.
+        // Miss handling is not implemented, so any response at all
+        // implies the lookup hit. The checks then prove the rest of the
+        // hit path: the correct way and word were selected (data), the
+        // request metadata travelled with it (id, we), the pipeline has
+        // the designed depth (accept -> response = 2 edges), and a load
+        // hit neither writes the arrays nor involves the MSHR.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0]  t_set;
+            logic [WAY_WIDTH-1:0]      t_way;
+            logic [TAG_WIDTH-1:0]      t_tag;
+            logic [WORD_OFF_WIDTH-1:0] t_word;
+            logic [TXN_ID_WIDTH-1:0]   t_id;
+            logic [LINE_WIDTH-1:0]     t_line;
+            logic [DATA_WIDTH-1:0]     exp_data;
+            int unsigned               accept_cycle;
+            int unsigned               errors;
+
+            t_set  = 6'd5;
+            t_way  = 2'd2;       // non-zero: catches a hit-way encoder stuck at 0
+            t_tag  = 22'h15A5A5;
+            t_word = 2'd1;       // interior word: catches an off-by-one word select
+            t_id   = 4'd7;
+            // Word 0 occupies the least-significant 32 bits of the line.
+            t_line = {32'hDDDD_0003, 32'hCCCC_0002, 32'hBBBB_0001, 32'hAAAA_0000};
+            exp_data = t_line[t_word * DATA_WIDTH +: DATA_WIDTH];
+            errors   = 0;
+
+            preload_line(t_set, t_way, t_tag, t_line);
+
+            resp_log.delete();
+            side_effect_cnt     = 0;
+            chk_no_side_effects = 1'b1;
+
+            cpu_send(make_addr(t_tag, t_set, t_word), 1'b0, '0, t_id, accept_cycle);
+
+            // Drain window, comfortably longer than the expected latency,
+            // so that a late or duplicated response is also observed.
+            repeat (6) @(posedge clk);
+            #1;
+            chk_no_side_effects = 1'b0;
+
+            if (resp_log.size() != 1) begin
+                $error("[FAIL] test 2: %0d responses received, expected exactly 1", resp_log.size());
+                errors++;
+            end else begin
+                if (resp_log[0].id !== t_id) begin
+                    $error("[FAIL] test 2: resp_id = %0d, expected %0d", resp_log[0].id, t_id);
+                    errors++;
+                end
+                if (resp_log[0].we !== 1'b0) begin
+                    $error("[FAIL] test 2: resp_we = %b, expected 0 (load)", resp_log[0].we);
+                    errors++;
+                end
+                if (resp_log[0].data !== exp_data) begin
+                    $error("[FAIL] test 2: resp_data = 0x%08h, expected 0x%08h", resp_log[0].data, exp_data);
+                    errors++;
+                end
+                if (resp_log[0].cycle - accept_cycle != 2) begin
+                    $error("[FAIL] test 2: response %0d cycles after acceptance, expected 2",
+                           resp_log[0].cycle - accept_cycle);
+                    errors++;
+                end
+            end
+            if (side_effect_cnt != 0) begin
+                $error("[FAIL] test 2: %0d cycles with an array write or MSHR request, expected none",
+                       side_effect_cnt);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 2: load hit (set %0d, way %0d, word %0d) -> id %0d, data 0x%08h, 2-cycle latency, no side effects",
+                         t_set, t_way, t_word, t_id, exp_data);
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-2 implemented and passing (2026-09-30).
+        // Test infrastructure now available: make_addr, preload_line,
+        // cpu_send, response monitor (resp_log), side-effect watcher.
         //
         // Remaining hit-path tests (see plan): 3 every way x every word,
         // 4 valid gating (matching tag, valid = 0 -> must miss),
