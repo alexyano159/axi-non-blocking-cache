@@ -376,6 +376,79 @@ module cache_controller_tb;
     end
 
     // -------------------------------------------------------------------
+    // Array write logger.
+    // Records every array write the controller commits (tb_preload = 0),
+    // one entry per cycle, with the full write-port contents. Allows a
+    // test to assert both the number of writes and their exact fields.
+    // MSHR requests are counted separately.
+    // -------------------------------------------------------------------
+    typedef struct {
+        logic                      data_en;
+        logic [SET_IDX_WIDTH-1:0]  data_set;
+        logic [WAY_WIDTH-1:0]      data_way;
+        logic [WORDS_PER_LINE-1:0] data_word_en;
+        logic [LINE_WIDTH-1:0]     data_data;
+        logic                      tag_en;
+        logic [SET_IDX_WIDTH-1:0]  tag_set;
+        logic [WAY_WIDTH-1:0]      tag_way;
+        logic                      tag_tag_en;
+        logic                      tag_dirty;
+        logic                      tag_dirty_en;
+        logic                      valid_en;
+    } wr_rec_t;
+
+    wr_rec_t     wr_log [$];
+    int unsigned mshr_req_cnt = 0;
+
+    always @(posedge clk) begin
+        if (rst_n && !tb_preload &&
+            (ctrl_data_wr_en || ctrl_tag_wr_en || ctrl_valid_wr_en)) begin
+            wr_log.push_back('{
+                data_en:      ctrl_data_wr_en,
+                data_set:     ctrl_data_wr_set_idx,
+                data_way:     ctrl_data_wr_way_sel,
+                data_word_en: ctrl_data_wr_word_en,
+                data_data:    ctrl_data_wr_data,
+                tag_en:       ctrl_tag_wr_en,
+                tag_set:      ctrl_tag_wr_set_idx,
+                tag_way:      ctrl_tag_wr_way_sel,
+                tag_tag_en:   ctrl_tag_wr_tag_en,
+                tag_dirty:    ctrl_tag_wr_dirty,
+                tag_dirty_en: ctrl_tag_wr_dirty_en,
+                valid_en:     ctrl_valid_wr_en
+            });
+        end
+        if (rst_n && (mshr_alloc_valid || mshr_wb_valid))
+            mshr_req_cnt++;
+    end
+
+    // -------------------------------------------------------------------
+    // Scoreboard: reference model of the cache contents.
+    // Mirrors what every (set, way) should hold. preload_line and
+    // set_valid keep it in step with the TB's direct array writes;
+    // sb_access predicts the outcome of each CPU request from it and
+    // updates it for stores. Expected responses are queued in exp_log in
+    // issue order -- hits complete in order, since they share one
+    // fixed-latency pipeline -- and compared against resp_log by
+    // check_responses.
+    // -------------------------------------------------------------------
+    logic [LINE_WIDTH-1:0] model_line  [NUM_SETS][NUM_WAYS];
+    logic [TAG_WIDTH-1:0]  model_tag   [NUM_SETS][NUM_WAYS];
+    logic                  model_valid [NUM_SETS][NUM_WAYS];
+    logic                  model_dirty [NUM_SETS][NUM_WAYS];
+
+    initial begin
+        foreach (model_valid[s, w]) begin
+            model_valid[s][w] = 1'b0;
+            model_dirty[s][w] = 1'b0;
+        end
+    end
+
+    resp_rec_t exp_log [$];
+
+    localparam int unsigned HIT_LATENCY = 2;   // accept edge -> response edge
+
+    // -------------------------------------------------------------------
     // Helper tasks.
     // -------------------------------------------------------------------
 
@@ -438,6 +511,11 @@ module cache_controller_tb;
         pre_valid_wr_en = 1'b0;
         pre_data_wr_en  = 1'b0;
         tb_preload      = 1'b0;
+
+        model_line [set_idx][way] = line;
+        model_tag  [set_idx][way] = tag;
+        model_valid[set_idx][way] = 1'b1;
+        model_dirty[set_idx][way] = 1'b0;
     endtask
 
     // Writes only the valid bit of one (set, way) through the preload
@@ -460,6 +538,8 @@ module cache_controller_tb;
 
         pre_valid_wr_en = 1'b0;
         tb_preload      = 1'b0;
+
+        model_valid[set_idx][way] = valid;
     endtask
 
     // CPU bus-functional model: presents one request and holds it until
@@ -501,6 +581,95 @@ module cache_controller_tb;
 
         accept_cycle = cycle_cnt;
         req_valid    = 1'b0;
+    endtask
+
+    // Scoreboard-checked CPU access. Predicts the outcome from the
+    // reference model, issues the request through cpu_send, and queues
+    // the expected response. A store hit also updates the model word and
+    // marks the line dirty. A predicted miss queues nothing, since miss
+    // handling is not implemented. Returns #1 after the acceptance edge,
+    // with no further delay, so the caller can sample the arrays' lookup
+    // outputs for this request immediately.
+    task automatic sb_access(
+        input logic [ADDR_WIDTH-1:0]   addr,
+        input logic                    we,
+        input logic [DATA_WIDTH-1:0]   wdata,
+        input logic [TXN_ID_WIDTH-1:0] id
+    );
+        logic [SET_IDX_WIDTH-1:0]  s;
+        logic [TAG_WIDTH-1:0]      t;
+        logic [WORD_OFF_WIDTH-1:0] d;
+        logic                      hit;
+        int                        way;
+        int unsigned               accept_cycle;
+        resp_rec_t                 exp;
+
+        {t, s, d} = addr[ADDR_WIDTH-1:BYTE_OFF_WIDTH];
+
+        hit = 1'b0;
+        way = 0;
+        for (int w = 0; w < NUM_WAYS; w++) begin
+            if (model_valid[s][w] && model_tag[s][w] == t) begin
+                hit = 1'b1;
+                way = w;
+            end
+        end
+
+        // Expected response. A store acknowledge carries no meaningful
+        // data; check_responses does not compare data when we = 1.
+        exp.id   = id;
+        exp.we   = we;
+        exp.data = model_line[s][way][d * DATA_WIDTH +: DATA_WIDTH];
+
+        if (hit && we) begin
+            model_line [s][way][d * DATA_WIDTH +: DATA_WIDTH] = wdata;
+            model_dirty[s][way] = 1'b1;
+        end
+
+        cpu_send(addr, we, wdata, id, accept_cycle);
+
+        if (hit) begin
+            exp.cycle = accept_cycle + HIT_LATENCY;
+            exp_log.push_back(exp);
+        end
+    endtask
+
+    // Compares every logged response against the scoreboard's expected
+    // responses, in order: id, we, data (loads only) and arrival cycle.
+    // Adds the number of mismatches found to errors.
+    task automatic check_responses(input string test_name, inout int unsigned errors);
+        if (resp_log.size() != exp_log.size()) begin
+            $error("[FAIL] %s: %0d responses received, expected %0d",
+                   test_name, resp_log.size(), exp_log.size());
+            foreach (resp_log[i])
+                $display("         received %0d: id %0d we %b data 0x%08h cycle %0d",
+                         i, resp_log[i].id, resp_log[i].we, resp_log[i].data, resp_log[i].cycle);
+            errors++;
+            return;
+        end
+
+        foreach (exp_log[i]) begin
+            if (resp_log[i].id !== exp_log[i].id) begin
+                $error("[FAIL] %s: response %0d has id %0d, expected %0d",
+                       test_name, i, resp_log[i].id, exp_log[i].id);
+                errors++;
+            end
+            if (resp_log[i].we !== exp_log[i].we) begin
+                $error("[FAIL] %s: id %0d: resp_we = %b, expected %b",
+                       test_name, exp_log[i].id, resp_log[i].we, exp_log[i].we);
+                errors++;
+            end
+            if (!exp_log[i].we && resp_log[i].data !== exp_log[i].data) begin
+                $error("[FAIL] %s: id %0d: resp_data = 0x%08h, expected 0x%08h",
+                       test_name, exp_log[i].id, resp_log[i].data, exp_log[i].data);
+                errors++;
+            end
+            if (resp_log[i].cycle !== exp_log[i].cycle) begin
+                $error("[FAIL] %s: id %0d: response at cycle %0d, expected %0d",
+                       test_name, exp_log[i].id, resp_log[i].cycle, exp_log[i].cycle);
+                errors++;
+            end
+        end
     endtask
 
     // -------------------------------------------------------------------
@@ -864,13 +1033,137 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-4 implemented and passing (2026-09-30).
+        // Test 5: store hit, readback, dirty bit.
+        // The first test in which the cache changes state. Two clean
+        // lines are installed in one set; one word of the first is
+        // stored to. Verified:
+        //   - the store is acknowledged (id, we = 1, 2-cycle latency);
+        //   - exactly one array write results: the data SRAM, with a
+        //     one-hot word enable at the stored word, and the tag array,
+        //     dirty-only (tag field untouched); no valid-array write and
+        //     no MSHR request;
+        //   - readback of all four words returns the new value only in
+        //     the stored word (no over-write of neighbouring words);
+        //   - the dirty bit of the stored line transitions 0 -> 1, while
+        //     the other line in the same set remains clean and intact.
+        // Expected responses come from the scoreboard (sb_access).
+        //
+        // Dirty-bit observation: sb_access returns #1 after the
+        // acceptance edge, on which the tag array registered its lookup
+        // of the request's set; tag_dirty_out then holds that set's
+        // dirty bits, and is sampled directly at the array boundary.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0]  t_set;
+            logic [TAG_WIDTH-1:0]      tag_0, tag_2;
+            logic [LINE_WIDTH-1:0]     line_0, line_2;
+            logic [WORD_OFF_WIDTH-1:0] st_word;
+            logic [DATA_WIDTH-1:0]     st_data;
+            logic [NUM_WAYS-1:0]       dirty_before, dirty_after;
+            int unsigned               errors;
+
+            t_set   = 6'd9;
+            tag_0   = 22'h111111;
+            tag_2   = 22'h222222;
+            line_0  = {32'h5050_0003, 32'h5050_0002, 32'h5050_0001, 32'h5050_0000};
+            line_2  = {32'h5252_0003, 32'h5252_0002, 32'h5252_0001, 32'h5252_0000};
+            st_word = 2'd2;
+            st_data = 32'hC0FF_EE00;
+            errors  = 0;
+
+            preload_line(t_set, 2'd0, tag_0, line_0);
+            preload_line(t_set, 2'd2, tag_2, line_2);
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            mshr_req_cnt = 0;
+
+            // Store to way 0, word 2 (id 1). The store's own lookup still
+            // observes the line before the write: dirty must be 0 here.
+            sb_access(make_addr(tag_0, t_set, st_word), 1'b1, st_data, 4'd1);
+            dirty_before = tag_dirty_out;
+            repeat (3) @(posedge clk);
+            #1;
+
+            // Readback of every word of way 0 (ids 2-5); the first lookup
+            // after the store observes the committed dirty bit.
+            for (int d = 0; d < WORDS_PER_LINE; d++) begin
+                sb_access(make_addr(tag_0, t_set, WORD_OFF_WIDTH'(d)), 1'b0, '0,
+                          TXN_ID_WIDTH'(2 + d));
+                if (d == 0)
+                    dirty_after = tag_dirty_out;
+                repeat (3) @(posedge clk);
+                #1;
+            end
+
+            // The other line of the set, at the same word offset (id 6).
+            sb_access(make_addr(tag_2, t_set, st_word), 1'b0, '0, 4'd6);
+            repeat (3) @(posedge clk);
+            #1;
+
+            // Responses: store ack, then five loads, all against the model.
+            check_responses("test 5", errors);
+
+            // Dirty bit: way 0 clean before, dirty after; way 2 clean.
+            if (dirty_before[0] !== 1'b0 || dirty_before[2] !== 1'b0) begin
+                $error("[FAIL] test 5: dirty before store = way0 %b way2 %b, expected 0 0",
+                       dirty_before[0], dirty_before[2]);
+                errors++;
+            end
+            if (dirty_after[0] !== 1'b1 || dirty_after[2] !== 1'b0) begin
+                $error("[FAIL] test 5: dirty after store = way0 %b way2 %b, expected 1 0",
+                       dirty_after[0], dirty_after[2]);
+                errors++;
+            end
+
+            // Exactly one array write, with the expected fields.
+            if (wr_log.size() != 1) begin
+                $error("[FAIL] test 5: %0d cycles with array writes, expected exactly 1",
+                       wr_log.size());
+                errors++;
+            end else begin
+                wr_rec_t r;
+                r = wr_log[0];
+                if (!(r.data_en && r.data_set == t_set && r.data_way == 2'd0 &&
+                      r.data_word_en == (WORDS_PER_LINE'(1) << st_word) &&
+                      r.data_data[st_word * DATA_WIDTH +: DATA_WIDTH] == st_data)) begin
+                    $error("[FAIL] test 5: data write en %b set %0d way %0d word_en %b word 0x%08h, expected 1 %0d 0 %b 0x%08h",
+                           r.data_en, r.data_set, r.data_way, r.data_word_en,
+                           r.data_data[st_word * DATA_WIDTH +: DATA_WIDTH],
+                           t_set, WORDS_PER_LINE'(1) << st_word, st_data);
+                    errors++;
+                end
+                if (!(r.tag_en && r.tag_set == t_set && r.tag_way == 2'd0 &&
+                      !r.tag_tag_en && r.tag_dirty && r.tag_dirty_en)) begin
+                    $error("[FAIL] test 5: tag write en %b set %0d way %0d tag_en %b dirty %b dirty_en %b, expected 1 %0d 0 0 1 1",
+                           r.tag_en, r.tag_set, r.tag_way, r.tag_tag_en,
+                           r.tag_dirty, r.tag_dirty_en, t_set);
+                    errors++;
+                end
+                if (r.valid_en) begin
+                    $error("[FAIL] test 5: valid array written by a store hit");
+                    errors++;
+                end
+            end
+            if (mshr_req_cnt != 0) begin
+                $error("[FAIL] test 5: %0d cycles with an MSHR request, expected none",
+                       mshr_req_cnt);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 5: store hit acked, single masked write, readback correct, dirty 0 -> 1, neighbour way untouched");
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-5 implemented and passing (2026-09-30).
         // Test infrastructure now available: make_addr, preload_line,
-        // set_valid, cpu_send, response monitor (resp_log), miss counter,
-        // side-effect watcher.
+        // set_valid, cpu_send, sb_access + check_responses (scoreboard),
+        // response monitor (resp_log), array write logger (wr_log),
+        // miss counter, side-effect watcher.
         //
         // Remaining hit-path tests (see plan):
-        // 5 store hit + readback + dirty bit (scoreboard added here),
         // 6 back-to-back store->load same set (RAW stall, 1 cycle only),
         // 7 full throughput, 8 back-pressure (FIFO fills to 3, drains),
         // 9 random load/store mix with random resp_ready.
