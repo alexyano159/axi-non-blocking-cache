@@ -591,12 +591,124 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-2 implemented and passing (2026-09-30).
+        // Test 3: load hit on every way x every word of one full set.
+        // Test 2 covered a single (way, word) point; an encoder or word
+        // select defect confined to another way or to the top word lane
+        // would pass it. Here all four ways of one set are valid at
+        // once, and each of the 16 words is loaded in turn, so every
+        // lookup also has three valid, non-matching ways as competitors.
+        //
+        // - Set 42 (6'b101010) differs from test 2's set and toggles
+        //   alternate index bits.
+        // - The four tags differ only in their least- and most-
+        //   significant bits, so a tag field sliced one bit off in
+        //   either direction aliases two ways and is detected.
+        // - Each word encodes its own location (A<way>0<word>_<set>),
+        //   so a mismatch identifies the (way, word) actually returned.
+        // - Loads are issued one at a time and each is allowed to
+        //   complete, isolating selection correctness from pipelining
+        //   (back-to-back issue is covered by the throughput test).
+        // - The id of each load is way*4 + word, using all 16 ids.
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned N_LOADS = NUM_WAYS * WORDS_PER_LINE;   // 16
+
+            logic [SET_IDX_WIDTH-1:0] t_set;
+            logic [TAG_WIDTH-1:0]     t_tags [NUM_WAYS];
+            logic [LINE_WIDTH-1:0]    t_line;
+            logic [DATA_WIDTH-1:0]    exp_data [N_LOADS];   // indexed by id
+            int unsigned              accept_cycles [N_LOADS];
+            int unsigned              id;
+            int unsigned              errors;
+
+            t_set     = 6'd42;
+            t_tags[0] = 22'h0A5A5A;
+            t_tags[1] = 22'h0A5A5A ^ 22'h000001;   // differs in tag bit 0
+            t_tags[2] = 22'h0A5A5A ^ 22'h200000;   // differs in tag bit 21
+            t_tags[3] = 22'h0A5A5A ^ 22'h200001;   // differs in both
+            errors    = 0;
+
+            // Build and install the four lines; record each word's
+            // expected value under the id of the load that will read it.
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                for (int d = 0; d < WORDS_PER_LINE; d++) begin
+                    id = w * WORDS_PER_LINE + d;
+                    exp_data[id] = {4'hA, 4'(w), 4'h0, 4'(d), 16'(t_set)};
+                    t_line[d * DATA_WIDTH +: DATA_WIDTH] = exp_data[id];
+                end
+                preload_line(t_set, WAY_WIDTH'(w), t_tags[w], t_line);
+            end
+
+            resp_log.delete();
+            side_effect_cnt     = 0;
+            chk_no_side_effects = 1'b1;
+
+            // Issue the 16 loads in (way, word) order. Three edges after
+            // acceptance cover the expected 2-edge latency with margin.
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                for (int d = 0; d < WORDS_PER_LINE; d++) begin
+                    id = w * WORDS_PER_LINE + d;
+                    cpu_send(make_addr(t_tags[w], t_set, WORD_OFF_WIDTH'(d)),
+                             1'b0, '0, TXN_ID_WIDTH'(id), accept_cycles[id]);
+                    repeat (3) @(posedge clk);
+                    #1;
+                end
+            end
+
+            // Additional idle window, so a late or duplicated response
+            // is still captured before the log is checked.
+            repeat (3) @(posedge clk);
+            #1;
+            chk_no_side_effects = 1'b0;
+
+            // Loads were serialised, so responses must arrive in issue
+            // order: the i-th logged response belongs to id i.
+            if (resp_log.size() != N_LOADS) begin
+                $error("[FAIL] test 3: %0d responses received, expected %0d",
+                       resp_log.size(), N_LOADS);
+                errors++;
+            end else begin
+                for (int i = 0; i < N_LOADS; i++) begin
+                    if (resp_log[i].id !== TXN_ID_WIDTH'(i)) begin
+                        $error("[FAIL] test 3: response %0d has id %0d, expected %0d",
+                               i, resp_log[i].id, i);
+                        errors++;
+                    end
+                    if (resp_log[i].we !== 1'b0) begin
+                        $error("[FAIL] test 3: id %0d: resp_we = %b, expected 0 (load)",
+                               i, resp_log[i].we);
+                        errors++;
+                    end
+                    if (resp_log[i].data !== exp_data[i]) begin
+                        $error("[FAIL] test 3: way %0d word %0d (id %0d): resp_data = 0x%08h, expected 0x%08h",
+                               i / WORDS_PER_LINE, i % WORDS_PER_LINE, i,
+                               resp_log[i].data, exp_data[i]);
+                        errors++;
+                    end
+                    if (resp_log[i].cycle - accept_cycles[i] != 2) begin
+                        $error("[FAIL] test 3: id %0d: response %0d cycles after acceptance, expected 2",
+                               i, resp_log[i].cycle - accept_cycles[i]);
+                        errors++;
+                    end
+                end
+            end
+            if (side_effect_cnt != 0) begin
+                $error("[FAIL] test 3: %0d cycles with an array write or MSHR request, expected none",
+                       side_effect_cnt);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 3: all %0d (way, word) loads of full set %0d hit with correct data, id and 2-cycle latency",
+                         N_LOADS, t_set);
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-3 implemented and passing (2026-09-30).
         // Test infrastructure now available: make_addr, preload_line,
         // cpu_send, response monitor (resp_log), side-effect watcher.
         //
-        // Remaining hit-path tests (see plan): 3 every way x every word,
-        // 4 valid gating (matching tag, valid = 0 -> must miss),
+        // Remaining hit-path tests (see plan): 4 valid gating (matching tag, valid = 0 -> must miss),
         // 5 store hit + readback + dirty bit (scoreboard added here),
         // 6 back-to-back store->load same set (RAW stall, 1 cycle only),
         // 7 full throughput, 8 back-pressure (FIFO fills to 3, drains),
