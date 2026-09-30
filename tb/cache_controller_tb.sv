@@ -546,11 +546,15 @@ module cache_controller_tb;
     // the handshake completes. accept_cycle returns the index of the
     // edge on which req_valid && req_ready was sampled.
     //
-    // req_ready is read #1 after the preceding edge, where it is stable:
-    // it depends only on state registered at that edge and on the
-    // TB-held request fields. If it is high, the next edge completes the
-    // handshake. A bounded wait turns a permanently stalled controller
-    // into a clear failure rather than a hung simulation.
+    // req_ready is sampled on the edge itself, as the DUT samples it: a
+    // process resuming on @(posedge clk) runs before that edge's NBA
+    // updates, so it observes the pre-edge value. It must not be read
+    // directly after the request fields are driven -- req_ready depends
+    // combinationally on req_addr (read-after-write stall), and in the
+    // same time step it would still reflect the previous address (see
+    // VERIFICATION_PROBLEMS.txt). A bounded wait turns a permanently
+    // stalled controller into a clear failure rather than a hung
+    // simulation.
     localparam int unsigned REQ_TIMEOUT_CYCLES = 100;
 
     task automatic cpu_send(
@@ -571,8 +575,8 @@ module cache_controller_tb;
 
         waited = 0;
         do begin
-            accepted = req_ready;
             @(posedge clk);
+            accepted = req_ready;   // pre-edge value: exactly what the DUT sampled
             #1;
             if (++waited > REQ_TIMEOUT_CYCLES)
                 $fatal(1, "cpu_send: request id %0d not accepted within %0d cycles",
@@ -589,19 +593,20 @@ module cache_controller_tb;
     // marks the line dirty. A predicted miss queues nothing, since miss
     // handling is not implemented. Returns #1 after the acceptance edge,
     // with no further delay, so the caller can sample the arrays' lookup
-    // outputs for this request immediately.
+    // outputs for this request immediately, or issue the next request
+    // back-to-back. accept_cycle is passed through from cpu_send.
     task automatic sb_access(
-        input logic [ADDR_WIDTH-1:0]   addr,
-        input logic                    we,
-        input logic [DATA_WIDTH-1:0]   wdata,
-        input logic [TXN_ID_WIDTH-1:0] id
+        input  logic [ADDR_WIDTH-1:0]   addr,
+        input  logic                    we,
+        input  logic [DATA_WIDTH-1:0]   wdata,
+        input  logic [TXN_ID_WIDTH-1:0] id,
+        output int unsigned             accept_cycle
     );
         logic [SET_IDX_WIDTH-1:0]  s;
         logic [TAG_WIDTH-1:0]      t;
         logic [WORD_OFF_WIDTH-1:0] d;
         logic                      hit;
         int                        way;
-        int unsigned               accept_cycle;
         resp_rec_t                 exp;
 
         {t, s, d} = addr[ADDR_WIDTH-1:BYTE_OFF_WIDTH];
@@ -631,6 +636,23 @@ module cache_controller_tb;
         if (hit) begin
             exp.cycle = accept_cycle + HIT_LATENCY;
             exp_log.push_back(exp);
+        end
+    endtask
+
+    // Checks the number of edges between two consecutive acceptances:
+    // 1 means the second request was accepted on the very next edge (no
+    // stall); each additional edge is one stall cycle.
+    task automatic check_gap(
+        input  string       what,
+        input  int unsigned accept_1,
+        input  int unsigned accept_2,
+        input  int unsigned expected,
+        inout  int unsigned errors
+    );
+        if (accept_2 - accept_1 != expected) begin
+            $error("[FAIL] %s: second request accepted %0d edge(s) after the first, expected %0d",
+                   what, accept_2 - accept_1, expected);
+            errors++;
         end
     endtask
 
@@ -1060,6 +1082,7 @@ module cache_controller_tb;
             logic [WORD_OFF_WIDTH-1:0] st_word;
             logic [DATA_WIDTH-1:0]     st_data;
             logic [NUM_WAYS-1:0]       dirty_before, dirty_after;
+            int unsigned               acc;          // accept cycle (unused here)
             int unsigned               errors;
 
             t_set   = 6'd9;
@@ -1081,7 +1104,7 @@ module cache_controller_tb;
 
             // Store to way 0, word 2 (id 1). The store's own lookup still
             // observes the line before the write: dirty must be 0 here.
-            sb_access(make_addr(tag_0, t_set, st_word), 1'b1, st_data, 4'd1);
+            sb_access(make_addr(tag_0, t_set, st_word), 1'b1, st_data, 4'd1, acc);
             dirty_before = tag_dirty_out;
             repeat (3) @(posedge clk);
             #1;
@@ -1090,7 +1113,7 @@ module cache_controller_tb;
             // after the store observes the committed dirty bit.
             for (int d = 0; d < WORDS_PER_LINE; d++) begin
                 sb_access(make_addr(tag_0, t_set, WORD_OFF_WIDTH'(d)), 1'b0, '0,
-                          TXN_ID_WIDTH'(2 + d));
+                          TXN_ID_WIDTH'(2 + d), acc);
                 if (d == 0)
                     dirty_after = tag_dirty_out;
                 repeat (3) @(posedge clk);
@@ -1098,7 +1121,7 @@ module cache_controller_tb;
             end
 
             // The other line of the set, at the same word offset (id 6).
-            sb_access(make_addr(tag_2, t_set, st_word), 1'b0, '0, 4'd6);
+            sb_access(make_addr(tag_2, t_set, st_word), 1'b0, '0, 4'd6, acc);
             repeat (3) @(posedge clk);
             #1;
 
@@ -1157,14 +1180,110 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-5 implemented and passing (2026-09-30).
+        // Test 6: back-to-back request pairs -- read-after-write stall.
+        // A store hit commits its array write one cycle after acceptance.
+        // The arrays are read-old on a same-edge read/write collision, so
+        // a request to the same set issued directly behind the store must
+        // be held off for exactly one cycle to observe the store's
+        // effect. Each pair is issued with zero gap from a quiet pipeline;
+        // the acceptance gap (1 = no stall, 2 = one stall cycle) and, via
+        // the scoreboard, the data returned are both checked:
+        //   P1 store -> load,  same set, same word   : stall; new value
+        //   P2 store -> load,  same set, other way   : stall (set-granular)
+        //   P3 store -> load,  different set         : no stall
+        //   P4 load  -> load,  same set              : no stall
+        //   P5 store -> store, same set, same word   : stall; the later
+        //      store wins, confirmed by a readback
+        // Too short a stall returns stale data; too long, or a stall in
+        // P3/P4, is a performance defect.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] set_x, set_y;
+            logic [TAG_WIDTH-1:0]     tag_a, tag_b, tag_c;
+            int unsigned              a1, a2, acc;
+            int unsigned              errors;
+
+            set_x  = 6'd20;
+            set_y  = 6'd21;
+            tag_a  = 22'h0AAAAA;   // set_x, way 0
+            tag_b  = 22'h0BBBBB;   // set_x, way 1
+            tag_c  = 22'h0CCCCC;   // set_y, way 0
+            errors = 0;
+
+            preload_line(set_x, 2'd0, tag_a, {32'hA000_0003, 32'hA000_0002, 32'hA000_0001, 32'hA000_0000});
+            preload_line(set_x, 2'd1, tag_b, {32'hB000_0003, 32'hB000_0002, 32'hB000_0001, 32'hB000_0000});
+            preload_line(set_y, 2'd0, tag_c, {32'hC000_0003, 32'hC000_0002, 32'hC000_0001, 32'hC000_0000});
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            mshr_req_cnt = 0;
+
+            // P1: store -> load, same set, same word.
+            sb_access(make_addr(tag_a, set_x, 2'd1), 1'b1, 32'h1111_0001, 4'd1, a1);
+            sb_access(make_addr(tag_a, set_x, 2'd1), 1'b0, '0,            4'd2, a2);
+            check_gap("test 6 P1 (store->load, same word)", a1, a2, 2, errors);
+            repeat (3) @(posedge clk);
+            #1;
+
+            // P2: store -> load, same set, different way.
+            sb_access(make_addr(tag_a, set_x, 2'd3), 1'b1, 32'h2222_0003, 4'd3, a1);
+            sb_access(make_addr(tag_b, set_x, 2'd0), 1'b0, '0,            4'd4, a2);
+            check_gap("test 6 P2 (store->load, same set, other way)", a1, a2, 2, errors);
+            repeat (3) @(posedge clk);
+            #1;
+
+            // P3: store -> load, different set.
+            sb_access(make_addr(tag_a, set_x, 2'd0), 1'b1, 32'h3333_0000, 4'd5, a1);
+            sb_access(make_addr(tag_c, set_y, 2'd0), 1'b0, '0,            4'd6, a2);
+            check_gap("test 6 P3 (store->load, different set)", a1, a2, 1, errors);
+            repeat (3) @(posedge clk);
+            #1;
+
+            // P4: load -> load, same set.
+            sb_access(make_addr(tag_a, set_x, 2'd1), 1'b0, '0, 4'd7, a1);
+            sb_access(make_addr(tag_b, set_x, 2'd1), 1'b0, '0, 4'd8, a2);
+            check_gap("test 6 P4 (load->load, same set)", a1, a2, 1, errors);
+            repeat (3) @(posedge clk);
+            #1;
+
+            // P5: store -> store, same word; then read back the result.
+            sb_access(make_addr(tag_b, set_x, 2'd2), 1'b1, 32'h5555_0001, 4'd9,  a1);
+            sb_access(make_addr(tag_b, set_x, 2'd2), 1'b1, 32'h5555_0002, 4'd10, a2);
+            check_gap("test 6 P5 (store->store, same word)", a1, a2, 2, errors);
+            repeat (3) @(posedge clk);
+            #1;
+            sb_access(make_addr(tag_b, set_x, 2'd2), 1'b0, '0, 4'd11, acc);
+            repeat (3) @(posedge clk);
+            #1;
+
+            // Data, ids and latency of all 11 responses, from the scoreboard.
+            check_responses("test 6", errors);
+
+            // One array write per store (P1, P2, P3, P5 x2); no MSHR traffic.
+            if (wr_log.size() != 5) begin
+                $error("[FAIL] test 6: %0d cycles with array writes, expected 5 (one per store)",
+                       wr_log.size());
+                errors++;
+            end
+            if (mshr_req_cnt != 0) begin
+                $error("[FAIL] test 6: %0d cycles with an MSHR request, expected none",
+                       mshr_req_cnt);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 6: same-set request behind a store stalls exactly 1 cycle and sees the new data; no stall otherwise");
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-6 implemented and passing (2026-09-30).
         // Test infrastructure now available: make_addr, preload_line,
         // set_valid, cpu_send, sb_access + check_responses (scoreboard),
-        // response monitor (resp_log), array write logger (wr_log),
+        // check_gap, response monitor (resp_log), array write logger (wr_log),
         // miss counter, side-effect watcher.
         //
         // Remaining hit-path tests (see plan):
-        // 6 back-to-back store->load same set (RAW stall, 1 cycle only),
         // 7 full throughput, 8 back-pressure (FIFO fills to 3, drains),
         // 9 random load/store mix with random resp_ready.
         // ---------------------------------------------------------------
