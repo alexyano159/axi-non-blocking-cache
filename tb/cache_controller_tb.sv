@@ -340,6 +340,22 @@ module cache_controller_tb;
     end
 
     // -------------------------------------------------------------------
+    // Miss counter (white-box).
+    // Until miss handling is implemented, a miss has no externally
+    // visible effect: the request is accepted and never answered. The
+    // absence of a response alone cannot distinguish a correct miss from
+    // a lost request, so the controller's internal lookup classification
+    // is probed directly. Once misses allocate MSHR entries, this is
+    // replaced by a check on the MSHR allocation port.
+    // -------------------------------------------------------------------
+    int unsigned miss_cnt = 0;
+
+    always @(posedge clk) begin
+        if (rst_n && dut.lookup_miss)
+            miss_cnt++;
+    end
+
+    // -------------------------------------------------------------------
     // Side-effect watcher.
     // While chk_no_side_effects = 1, any array write or MSHR request
     // issued by the controller is counted. Used by tests whose stimulus
@@ -421,6 +437,28 @@ module cache_controller_tb;
         pre_tag_wr_en   = 1'b0;
         pre_valid_wr_en = 1'b0;
         pre_data_wr_en  = 1'b0;
+        tb_preload      = 1'b0;
+    endtask
+
+    // Writes only the valid bit of one (set, way) through the preload
+    // mux; the tag and data arrays are left untouched, mirroring a real
+    // invalidation. Same calling rules as preload_line.
+    task automatic set_valid(
+        input logic [SET_IDX_WIDTH-1:0] set_idx,
+        input logic [WAY_WIDTH-1:0]     way,
+        input logic                     valid
+    );
+        tb_preload = 1'b1;
+
+        pre_valid_wr_en      = 1'b1;
+        pre_valid_wr_set_idx = set_idx;
+        pre_valid_wr_way_sel = way;
+        pre_valid_wr_valid   = valid;
+
+        @(posedge clk);
+        #1;
+
+        pre_valid_wr_en = 1'b0;
         tb_preload      = 1'b0;
     endtask
 
@@ -704,11 +742,134 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-3 implemented and passing (2026-09-30).
+        // Test 4: valid gating.
+        // A way whose stored tag matches but whose valid bit is clear
+        // must not hit. The same line is observed in four phases in
+        // which only its valid bit changes:
+        //   1. valid        -> load hits   (positive control: address
+        //                                   and preload are correct)
+        //   2. invalidate the valid bit only; tag and data remain
+        //   3. invalid      -> load misses; a valid line in another way
+        //                      of the same set still hits
+        //   4. re-validate  -> load hits with the original data, proving
+        //                      tag and data were intact throughout, so
+        //                      the miss in phase 3 was due to valid alone
+        // A miss is evidenced by the absence of a response together with
+        // exactly one internal miss classification (miss counter).
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] t_set;
+            logic [WAY_WIDTH-1:0]     way_a, way_b;
+            logic [TAG_WIDTH-1:0]     tag_a, tag_b;
+            logic [LINE_WIDTH-1:0]    line_a, line_b;
+            logic [DATA_WIDTH-1:0]    exp_a, exp_b;
+            logic [TXN_ID_WIDTH-1:0]  exp_id  [3];  // expected responses, in order
+            logic [DATA_WIDTH-1:0]    exp_dat [3];
+            int unsigned              exp_acc [3];
+            int unsigned              acc [4];      // accept cycle, per load
+            int unsigned              errors;
+
+            t_set  = 6'd17;
+            way_a  = 2'd1;
+            way_b  = 2'd3;
+            tag_a  = 22'h3C3C3C;
+            tag_b  = 22'h0C3C3C;
+            line_a = {32'hA1A1_0003, 32'hA1A1_0002, 32'hA1A1_0001, 32'hA1A1_0000};
+            line_b = {32'hB3B3_0003, 32'hB3B3_0002, 32'hB3B3_0001, 32'hB3B3_0000};
+            exp_a  = line_a[2 * DATA_WIDTH +: DATA_WIDTH];   // line A is read at word 2
+            exp_b  = line_b[0 * DATA_WIDTH +: DATA_WIDTH];   // line B is read at word 0
+            errors = 0;
+
+            preload_line(t_set, way_a, tag_a, line_a);
+            preload_line(t_set, way_b, tag_b, line_b);
+
+            resp_log.delete();
+            miss_cnt            = 0;
+            side_effect_cnt     = 0;
+            chk_no_side_effects = 1'b1;
+
+            // Phase 1: line A valid -> hit (id 1).
+            cpu_send(make_addr(tag_a, t_set, 2'd2), 1'b0, '0, 4'd1, acc[0]);
+            repeat (3) @(posedge clk);
+            #1;
+
+            // Phase 2: clear line A's valid bit only.
+            set_valid(t_set, way_a, 1'b0);
+
+            // Phase 3: line A invalid -> miss (id 2, no response);
+            // line B in the same set still valid -> hit (id 3).
+            cpu_send(make_addr(tag_a, t_set, 2'd2), 1'b0, '0, 4'd2, acc[1]);
+            repeat (3) @(posedge clk);
+            #1;
+            cpu_send(make_addr(tag_b, t_set, 2'd0), 1'b0, '0, 4'd3, acc[2]);
+            repeat (3) @(posedge clk);
+            #1;
+
+            // Phase 4: re-validate line A -> hit with original data (id 4).
+            set_valid(t_set, way_a, 1'b1);
+            cpu_send(make_addr(tag_a, t_set, 2'd2), 1'b0, '0, 4'd4, acc[3]);
+            repeat (3) @(posedge clk);
+            #1;
+            chk_no_side_effects = 1'b0;
+
+            // Expected: ids 1, 3, 4 answered in that order; id 2 never.
+            exp_id  = '{4'd1, 4'd3, 4'd4};
+            exp_dat = '{exp_a, exp_b, exp_a};
+            exp_acc = '{acc[0], acc[2], acc[3]};
+
+            if (resp_log.size() != 3) begin
+                $error("[FAIL] test 4: %0d responses received, expected 3 (ids 1, 3, 4)",
+                       resp_log.size());
+                foreach (resp_log[i])
+                    $display("         response %0d: id %0d data 0x%08h",
+                             i, resp_log[i].id, resp_log[i].data);
+                errors++;
+            end else begin
+                for (int i = 0; i < 3; i++) begin
+                    if (resp_log[i].id !== exp_id[i]) begin
+                        $error("[FAIL] test 4: response %0d has id %0d, expected %0d",
+                               i, resp_log[i].id, exp_id[i]);
+                        errors++;
+                    end
+                    if (resp_log[i].we !== 1'b0) begin
+                        $error("[FAIL] test 4: id %0d: resp_we = %b, expected 0 (load)",
+                               exp_id[i], resp_log[i].we);
+                        errors++;
+                    end
+                    if (resp_log[i].data !== exp_dat[i]) begin
+                        $error("[FAIL] test 4: id %0d: resp_data = 0x%08h, expected 0x%08h",
+                               exp_id[i], resp_log[i].data, exp_dat[i]);
+                        errors++;
+                    end
+                    if (resp_log[i].cycle - exp_acc[i] != 2) begin
+                        $error("[FAIL] test 4: id %0d: response %0d cycles after acceptance, expected 2",
+                               exp_id[i], resp_log[i].cycle - exp_acc[i]);
+                        errors++;
+                    end
+                end
+            end
+            if (miss_cnt != 1) begin
+                $error("[FAIL] test 4: %0d lookups classified as miss, expected exactly 1 (id 2)",
+                       miss_cnt);
+                errors++;
+            end
+            if (side_effect_cnt != 0) begin
+                $error("[FAIL] test 4: %0d cycles with an array write or MSHR request, expected none",
+                       side_effect_cnt);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 4: matching tag with valid = 0 misses; neighbour way and re-validated line hit with original data");
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-4 implemented and passing (2026-09-30).
         // Test infrastructure now available: make_addr, preload_line,
-        // cpu_send, response monitor (resp_log), side-effect watcher.
+        // set_valid, cpu_send, response monitor (resp_log), miss counter,
+        // side-effect watcher.
         //
-        // Remaining hit-path tests (see plan): 4 valid gating (matching tag, valid = 0 -> must miss),
+        // Remaining hit-path tests (see plan):
         // 5 store hit + readback + dirty bit (scoreboard added here),
         // 6 back-to-back store->load same set (RAW stall, 1 cycle only),
         // 7 full throughput, 8 back-pressure (FIFO fills to 3, drains),
