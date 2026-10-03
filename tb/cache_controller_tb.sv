@@ -371,6 +371,19 @@ module cache_controller_tb;
     end
 
     // -------------------------------------------------------------------
+    // Read-after-write stall counter (white-box, coverage).
+    // Counts cycles in which a presented request is held off by the
+    // read-after-write hazard. Used by random tests to confirm that the
+    // generated traffic actually exercised the stall.
+    // -------------------------------------------------------------------
+    int unsigned raw_stall_cnt = 0;
+
+    always @(posedge clk) begin
+        if (rst_n && req_valid && dut.raw_hazard)
+            raw_stall_cnt++;
+    end
+
+    // -------------------------------------------------------------------
     // Response hold-stability checker.
     // Valid/ready rule: once a response is presented (resp_valid = 1) and
     // not taken (resp_ready = 0), it must remain valid with unchanged
@@ -701,8 +714,12 @@ module cache_controller_tb;
 
     // Compares every logged response against the scoreboard's expected
     // responses, in order: id, we, data (loads only) and arrival cycle.
-    // Adds the number of mismatches found to errors.
-    task automatic check_responses(input string test_name, inout int unsigned errors);
+    // Adds the number of mismatches found to errors. With exact_cycle = 0
+    // (random back-pressure, where queueing delay is not predicted), the
+    // expected cycle is treated as a lower bound: a response may arrive
+    // later than HIT_LATENCY after acceptance, never earlier.
+    task automatic check_responses(input string test_name, inout int unsigned errors,
+                                   input bit exact_cycle = 1'b1);
         if (resp_log.size() != exp_log.size()) begin
             $error("[FAIL] %s: %0d responses received, expected %0d",
                    test_name, resp_log.size(), exp_log.size());
@@ -729,9 +746,11 @@ module cache_controller_tb;
                        test_name, exp_log[i].id, resp_log[i].data, exp_log[i].data);
                 errors++;
             end
-            if (resp_log[i].cycle !== exp_log[i].cycle) begin
-                $error("[FAIL] %s: id %0d: response at cycle %0d, expected %0d",
-                       test_name, exp_log[i].id, resp_log[i].cycle, exp_log[i].cycle);
+            if (exact_cycle ? (resp_log[i].cycle != exp_log[i].cycle)
+                            : (resp_log[i].cycle <  exp_log[i].cycle)) begin
+                $error("[FAIL] %s: id %0d: response at cycle %0d, expected %s%0d",
+                       test_name, exp_log[i].id, resp_log[i].cycle,
+                       exact_cycle ? "" : ">= ", exp_log[i].cycle);
                 errors++;
             end
         end
@@ -1594,15 +1613,192 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-8 implemented and passing (2026-10-03).
+        // Test 9: constrained-random load/store mix with random
+        // back-pressure.
+        // Tests 2-8 each target one mechanism in isolation; this test
+        // exercises their interactions (read-after-write stalls while
+        // the FIFO is full, back-pressure released mid-stall, misses
+        // interleaved with hits, ...) under traffic no directed test
+        // enumerates.
+        //
+        // Constraints:
+        // - Addresses are drawn from a small pool (two sets, six resident
+        //   lines) so that same-set collisions and store -> load reuse
+        //   occur frequently. About 10% of requests use a non-resident
+        //   tag and must miss without disturbing the hits around them.
+        // - About 30% of requests repeat the previous address. Without this
+        //   locality a store followed at once by a load of the same word --
+        //   the only pairing in which a missing read-after-write stall
+        //   returns wrong data -- is too rare to be reliably generated.
+        // - About 40% stores, with random data.
+        // - 0-3 idle cycles between requests; zero gap in half the cases.
+        // - resp_ready is re-drawn every cycle (high 70% of the time) by a
+        //   background thread.
+        //
+        // Checking: the scoreboard predicts every outcome; response timing
+        // is checked as a lower bound (queueing delay is not modelled).
+        // Coverage: at least T9_MIN_RAW read-after-write stalls must occur,
+        // so that a pass cannot result from traffic that never reached
+        // the hazard.
+        // The hold checker runs throughout. The seed is printed and can be
+        // overridden with +seed=<n> to reproduce a failure.
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned T9_N          = 500;
+            localparam int unsigned T9_STORE_PCT  = 40;
+            localparam int unsigned T9_MISS_PCT   = 10;
+            localparam int unsigned T9_READY_PCT  = 70;
+            localparam int unsigned T9_REUSE_PCT  = 30;
+            localparam int unsigned T9_MIN_RAW    = 20;   // coverage floor for read-after-write stalls
+
+            logic [SET_IDX_WIDTH-1:0] set_a, set_b, s;
+            logic [TAG_WIDTH-1:0]     tags_a [NUM_WAYS];   // set_a: all four ways resident
+            logic [TAG_WIDTH-1:0]     tags_b [2];          // set_b: ways 0 and 1 resident
+            logic [TAG_WIDTH-1:0]     t;
+            logic [TAG_WIDTH-1:0]     tag_miss;
+            logic                     we;
+            logic [ADDR_WIDTH-1:0]    addr, prev_addr;
+            int unsigned              seed;
+            int unsigned              acc;
+            int unsigned              miss_base, raw_base, exp_misses, exp_store_hits;
+            int unsigned              errors;
+            bit                       t9_running;
+
+            if (!$value$plusargs("seed=%d", seed))
+                seed = 1;
+            process::self().srandom(seed);
+            $display("         test 9: seed = %0d", seed);
+
+            set_a    = 6'd60;
+            set_b    = 6'd61;
+            tags_a   = '{22'h300000, 22'h311111, 22'h322222, 22'h333333};
+            tags_b   = '{22'h344444, 22'h355555};
+            tag_miss = 22'h3FFFFF;
+            errors   = 0;
+
+            foreach (tags_a[w])
+                preload_line(set_a, WAY_WIDTH'(w), tags_a[w], {$urandom(), $urandom(), $urandom(), $urandom()});
+            foreach (tags_b[w])
+                preload_line(set_b, WAY_WIDTH'(w), tags_b[w], {$urandom(), $urandom(), $urandom(), $urandom()});
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            mshr_req_cnt  = 0;
+            resp_peak     = 0;
+            resp_hold_err = 0;
+            miss_base     = miss_cnt;
+            raw_base      = raw_stall_cnt;
+            prev_addr     = make_addr(tags_a[0], set_a, 2'd0);
+
+            // Random back-pressure, re-drawn #1 after every edge.
+            t9_running = 1'b1;
+            fork
+                while (t9_running) begin
+                    @(posedge clk);
+                    #1;
+                    resp_ready = ($urandom_range(99) < T9_READY_PCT);
+                end
+            join_none
+
+            for (int i = 0; i < T9_N; i++) begin
+                // Address: either the previous request's address (locality,
+                // which makes same-word store -> load pairs common), or a
+                // resident line of set_a or set_b, or (rarely) a non-resident
+                // tag in either set.
+                if ($urandom_range(99) < T9_REUSE_PCT) begin
+                    addr = prev_addr;
+                end else begin
+                    s = $urandom_range(1) ? set_a : set_b;
+                    if ($urandom_range(99) < T9_MISS_PCT)
+                        t = tag_miss;
+                    else if (s == set_a)
+                        t = tags_a[$urandom_range(NUM_WAYS - 1)];
+                    else
+                        t = tags_b[$urandom_range(1)];
+                    addr = make_addr(t, s, WORD_OFF_WIDTH'($urandom_range(WORDS_PER_LINE - 1)));
+                end
+                prev_addr = addr;
+                we = ($urandom_range(99) < T9_STORE_PCT);
+
+                sb_access(addr, we, $urandom(), TXN_ID_WIDTH'(i), acc);
+
+                // Idle gap: none in half the cases, otherwise 1-3 edges.
+                if ($urandom_range(1)) begin
+                    repeat ($urandom_range(3, 1)) @(posedge clk);
+                    #1;
+                end
+            end
+
+            // Stop the back-pressure thread, then drain with resp_ready = 1.
+            // The thread makes one final draw #1 after the next edge before
+            // observing t9_running = 0, so resp_ready is forced high only
+            // after the edge that follows. Worst case to drain: three queued
+            // responses plus one in lookup.
+            t9_running = 1'b0;
+            repeat (2) @(posedge clk);
+            #1;
+            resp_ready = 1'b1;
+            repeat (6) @(posedge clk);
+            #1;
+
+            // Predicted outcome counts, from the scoreboard: every hit
+            // queued one expected response; the rest were misses.
+            exp_misses     = T9_N - exp_log.size();
+            exp_store_hits = 0;
+            foreach (exp_log[i])
+                if (exp_log[i].we) exp_store_hits++;
+
+            check_responses("test 9", errors, 1'b0);
+
+            if (miss_cnt - miss_base != exp_misses) begin
+                $error("[FAIL] test 9: %0d lookups classified as miss, expected %0d",
+                       miss_cnt - miss_base, exp_misses);
+                errors++;
+            end
+            if (resp_hold_err != 0) begin
+                $error("[FAIL] test 9: %0d stalled-response stability violations", resp_hold_err);
+                errors++;
+            end
+            if (resp_peak > 3) begin
+                $error("[FAIL] test 9: response FIFO peaked at %0d entries, exceeds depth 3", resp_peak);
+                errors++;
+            end
+            if (resp_valid !== 1'b0 || dut.resp_count != 0) begin
+                $error("[FAIL] test 9: after drain resp_valid = %b, resp_count = %0d, expected 0, 0",
+                       resp_valid, dut.resp_count);
+                errors++;
+            end
+            if (wr_log.size() != exp_store_hits) begin
+                $error("[FAIL] test 9: %0d cycles with array writes, expected %0d (one per store hit)",
+                       wr_log.size(), exp_store_hits);
+                errors++;
+            end
+            if (raw_stall_cnt - raw_base < T9_MIN_RAW) begin
+                $error("[FAIL] test 9: coverage -- only %0d read-after-write stalls occurred, required >= %0d",
+                       raw_stall_cnt - raw_base, T9_MIN_RAW);
+                errors++;
+            end
+            if (mshr_req_cnt != 0) begin
+                $error("[FAIL] test 9: %0d cycles with an MSHR request, expected none",
+                       mshr_req_cnt);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 9: %0d random requests (%0d hits, %0d store hits, %0d misses) under random back-pressure -- all responses correct and in order, FIFO peak %0d, %0d RAW stalls, no hold violations",
+                         T9_N, exp_log.size(), exp_store_hits, exp_misses, resp_peak, raw_stall_cnt - raw_base);
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-9 implemented and passing (2026-10-03).
         // Test infrastructure now available: make_addr, preload_line,
         // set_valid, cpu_send, sb_access + check_responses (scoreboard),
         // check_gap, response monitor (resp_log), array write logger (wr_log),
         // miss counter, side-effect watcher, response-FIFO peak monitor
         // (resp_peak), stalled-response hold checker (resp_hold_err).
         //
-        // Remaining hit-path tests (see plan):
-        // 9 random load/store mix with random resp_ready.
+        // Hit-path test plan complete. Next: miss handling via the MSHR.
         // ---------------------------------------------------------------
 
         $finish;
