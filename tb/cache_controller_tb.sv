@@ -371,6 +371,34 @@ module cache_controller_tb;
     end
 
     // -------------------------------------------------------------------
+    // Response hold-stability checker.
+    // Valid/ready rule: once a response is presented (resp_valid = 1) and
+    // not taken (resp_ready = 0), it must remain valid with unchanged
+    // id, data and we until the handshake completes. Each edge records
+    // whether the response was stalled; on the following edge the
+    // presented response is compared against the recorded one.
+    // -------------------------------------------------------------------
+    logic                    hold_pending = 1'b0;
+    logic [TXN_ID_WIDTH-1:0] hold_id;
+    logic [DATA_WIDTH-1:0]   hold_data;
+    logic                    hold_we;
+    int unsigned             resp_hold_err = 0;
+
+    always @(posedge clk) begin
+        if (rst_n && hold_pending &&
+            !(resp_valid === 1'b1 && resp_id === hold_id &&
+              resp_data === hold_data && resp_we === hold_we)) begin
+            $error("hold checker: stalled response changed at cycle %0d (valid %b id %0d data 0x%08h we %b, held id %0d data 0x%08h we %b)",
+                   cycle_cnt, resp_valid, resp_id, resp_data, resp_we, hold_id, hold_data, hold_we);
+            resp_hold_err++;
+        end
+        hold_pending = rst_n && resp_valid && !resp_ready;
+        hold_id      = resp_id;
+        hold_data    = resp_data;
+        hold_we      = resp_we;
+    end
+
+    // -------------------------------------------------------------------
     // Side-effect watcher.
     // While chk_no_side_effects = 1, any array write or MSHR request
     // issued by the controller is counted. Used by tests whose stimulus
@@ -1424,14 +1452,156 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-7 implemented and passing (2026-10-03).
+        // Test 8: response back-pressure.
+        // A back-to-back hit stream is running with resp_ready = 1 when
+        // the CPU withdraws resp_ready directly after request 3 is
+        // accepted, and restores it T8_HOLD edges later. Expected
+        // behaviour, with the 3-entry FIFO and req_ready computed from
+        // internal state only:
+        //   - Request 4 is still accepted on the very next edge: at the
+        //     moment of the drop one response is queued and one request
+        //     is in lookup, and the third FIFO slot is reserved for
+        //     exactly this request.
+        //   - The FIFO then fills to 3 (responses 2, 3, 4) and acceptance
+        //     stops; request 5, a store, waits and must not write the
+        //     arrays before it is accepted.
+        //   - The head response holds stable while stalled.
+        //   - On release the three queued responses drain on consecutive
+        //     edges, request 5 is accepted on the second of those edges,
+        //     and the stream continues at full rate.
+        // Requests 6 and 7 read back the stores of requests 3 and 5,
+        // confirming that the stalled store committed correctly.
+        // ---------------------------------------------------------------
+        begin
+            typedef struct {
+                logic [SET_IDX_WIDTH-1:0]  set_idx;
+                logic [TAG_WIDTH-1:0]      tag;
+                logic [WORD_OFF_WIDTH-1:0] word;
+                logic                      we;
+                logic [DATA_WIDTH-1:0]     wdata;
+            } t8_req_t;
+
+            localparam int unsigned T8_N    = 8;
+            localparam int unsigned T8_DROP = 3;   // resp_ready drops after this request's acceptance
+            localparam int unsigned T8_HOLD = 5;   // edges for which resp_ready is held low
+
+            logic [SET_IDX_WIDTH-1:0] set_p, set_q;
+            logic [TAG_WIDTH-1:0]     tag_0, tag_1, tag_2;
+            t8_req_t                  stream [T8_N];
+            int unsigned              acc    [T8_N];
+            int unsigned              rel;       // first edge sampling resp_ready = 1 again
+            int unsigned              errors;
+
+            set_p  = 6'd50;
+            set_q  = 6'd51;
+            tag_0  = 22'h200000;   // set_p, way 0
+            tag_1  = 22'h211111;   // set_p, way 1
+            tag_2  = 22'h222222;   // set_q, way 2
+            errors = 0;
+
+            preload_line(set_p, 2'd0, tag_0, {32'h2000_0003, 32'h2000_0002, 32'h2000_0001, 32'h2000_0000});
+            preload_line(set_p, 2'd1, tag_1, {32'h2100_0003, 32'h2100_0002, 32'h2100_0001, 32'h2100_0000});
+            preload_line(set_q, 2'd2, tag_2, {32'h2200_0003, 32'h2200_0002, 32'h2200_0001, 32'h2200_0000});
+
+            // Fields: set, tag, word, we, wdata. Array index = request id.
+            stream[0] = '{set_p, tag_0, 2'd0, 1'b0, '0};                  // load
+            stream[1] = '{set_p, tag_1, 2'd1, 1'b0, '0};                  // load
+            stream[2] = '{set_q, tag_2, 2'd2, 1'b0, '0};                  // load; queued during the stall
+            stream[3] = '{set_p, tag_0, 2'd3, 1'b1, 32'h8000_0003};       // store; ack queued; resp_ready drops after it
+            stream[4] = '{set_q, tag_2, 2'd0, 1'b0, '0};                  // load; accepted in the drop cycle
+            stream[5] = '{set_q, tag_2, 2'd1, 1'b1, 32'h8000_0005};       // store; waits while the FIFO is full
+            stream[6] = '{set_p, tag_0, 2'd3, 1'b0, '0};                  // reads id 3's store
+            stream[7] = '{set_q, tag_2, 2'd1, 1'b0, '0};                  // reads id 5's store
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            mshr_req_cnt  = 0;
+            resp_peak     = 0;
+            resp_hold_err = 0;
+            resp_ready    = 1'b1;
+
+            for (int i = 0; i < T8_N; i++) begin
+                sb_access(make_addr(stream[i].tag, stream[i].set_idx, stream[i].word),
+                          stream[i].we, stream[i].wdata, TXN_ID_WIDTH'(i), acc[i]);
+
+                // Withdraw resp_ready #1 after request T8_DROP's acceptance
+                // edge. The release runs in a separate thread, since the
+                // main thread blocks in cpu_send while the FIFO is full.
+                if (i == T8_DROP) begin
+                    resp_ready = 1'b0;
+                    fork
+                        begin
+                            repeat (T8_HOLD) @(posedge clk);
+                            #1;
+                            resp_ready = 1'b1;
+                        end
+                    join_none
+                end
+            end
+
+            repeat (HIT_LATENCY + 2) @(posedge clk);
+            #1;
+
+            // resp_ready is low for edges acc[3]+1 .. acc[3]+T8_HOLD.
+            rel = acc[T8_DROP] + T8_HOLD + 1;
+
+            // Acceptance timing: full rate up to the drop cycle, request 5
+            // admitted on the second drain edge, full rate thereafter.
+            for (int i = 1; i <= T8_DROP + 1; i++)
+                check_gap($sformatf("test 8 ids %0d -> %0d", i - 1, i), acc[i-1], acc[i], 1, errors);
+            check_gap("test 8 ids 4 -> 5 (stalled on full FIFO)", acc[4], acc[5], rel + 1 - acc[4], errors);
+            for (int i = 6; i < T8_N; i++)
+                check_gap($sformatf("test 8 ids %0d -> %0d", i - 1, i), acc[i-1], acc[i], 1, errors);
+
+            // The three responses queued during the stall arrive on the
+            // three consecutive edges starting at the release edge, not
+            // HIT_LATENCY after acceptance; all others keep the default.
+            exp_log[2].cycle = rel;
+            exp_log[3].cycle = rel + 1;
+            exp_log[4].cycle = rel + 2;
+            check_responses("test 8", errors);
+
+            if (resp_peak != 3) begin
+                $error("[FAIL] test 8: response FIFO peaked at %0d entries, expected 3", resp_peak);
+                errors++;
+            end
+            if (resp_hold_err != 0) begin
+                $error("[FAIL] test 8: %0d stalled-response stability violations", resp_hold_err);
+                errors++;
+            end
+            if (resp_valid !== 1'b0 || dut.resp_count != 0) begin
+                $error("[FAIL] test 8: after drain resp_valid = %b, resp_count = %0d, expected 0, 0",
+                       resp_valid, dut.resp_count);
+                errors++;
+            end
+
+            // One write per store (ids 3, 5): the waiting store wrote once,
+            // after its acceptance. No MSHR traffic.
+            if (wr_log.size() != 2) begin
+                $error("[FAIL] test 8: %0d cycles with array writes, expected 2 (one per store)",
+                       wr_log.size());
+                errors++;
+            end
+            if (mshr_req_cnt != 0) begin
+                $error("[FAIL] test 8: %0d cycles with an MSHR request, expected none",
+                       mshr_req_cnt);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 8: FIFO fills to 3 under back-pressure (incl. request accepted in the drop cycle), stalled response held stable, drains 1/cycle, waiting store commits once");
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-8 implemented and passing (2026-10-03).
         // Test infrastructure now available: make_addr, preload_line,
         // set_valid, cpu_send, sb_access + check_responses (scoreboard),
         // check_gap, response monitor (resp_log), array write logger (wr_log),
-        // miss counter, side-effect watcher, response-FIFO peak monitor (resp_peak).
+        // miss counter, side-effect watcher, response-FIFO peak monitor
+        // (resp_peak), stalled-response hold checker (resp_hold_err).
         //
         // Remaining hit-path tests (see plan):
-        // 8 back-pressure (FIFO fills to 3, drains),
         // 9 random load/store mix with random resp_ready.
         // ---------------------------------------------------------------
 
