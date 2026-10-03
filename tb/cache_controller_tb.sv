@@ -356,6 +356,21 @@ module cache_controller_tb;
     end
 
     // -------------------------------------------------------------------
+    // Response-FIFO occupancy peak (white-box).
+    // Records the highest occupancy the controller's response FIFO
+    // reaches. A test clears resp_peak before its stimulus and bounds it
+    // afterwards: with resp_ready held high, any accumulation of entries
+    // indicates that responses are not draining at the issue rate, even
+    // before the FIFO is full enough to stall acceptance.
+    // -------------------------------------------------------------------
+    int unsigned resp_peak = 0;
+
+    always @(posedge clk) begin
+        if (rst_n && dut.resp_count > resp_peak)
+            resp_peak = dut.resp_count;
+    end
+
+    // -------------------------------------------------------------------
     // Side-effect watcher.
     // While chk_no_side_effects = 1, any array write or MSHR request
     // issued by the controller is counted. Used by tests whose stimulus
@@ -1277,14 +1292,146 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-6 implemented and passing (2026-09-30).
+        // Test 7: full throughput.
+        // A stream of 16 hits is issued with no idle cycle between
+        // requests while resp_ready is held high. The stream is free of
+        // read-after-write collisions by construction -- every store is
+        // followed by a request to a different set -- so the controller
+        // must accept one request per edge and return one response per
+        // edge, each HIT_LATENCY edges after its acceptance. This
+        // validates the response-FIFO depth argument (three entries
+        // sustain one response per cycle) under a sustained load rather
+        // than an isolated pair.
+        //
+        // Stream properties:
+        // - Loads back-to-back within one set (ids 0 -> 1): no stall.
+        // - Store -> store in different sets (ids 7 -> 8 -> 9).
+        // - A load two requests behind a store to the same set
+        //   (ids 4 -> 6, 8 -> 10): the closest legal reuse distance,
+        //   at which the store's write must already be visible.
+        // - ids 0..15 cover every TXN_ID_WIDTH tag value once, so any
+        //   truncation or aliasing of the id through the FIFO is seen.
+        // ---------------------------------------------------------------
+        begin
+            typedef struct {
+                logic [SET_IDX_WIDTH-1:0]  set_idx;
+                logic [TAG_WIDTH-1:0]      tag;
+                logic [WORD_OFF_WIDTH-1:0] word;
+                logic                      we;
+                logic [DATA_WIDTH-1:0]     wdata;
+            } t7_req_t;
+
+            localparam int unsigned T7_N = 16;
+
+            logic [SET_IDX_WIDTH-1:0] set_p, set_q, set_r;
+            logic [TAG_WIDTH-1:0]     tag_0, tag_1, tag_2, tag_3;
+            t7_req_t                  stream [T7_N];
+            int unsigned              acc    [T7_N];
+            int unsigned              n_stores;
+            int unsigned              errors;
+
+            set_p  = 6'd30;
+            set_q  = 6'd31;
+            set_r  = 6'd32;
+            tag_0  = 22'h100000;   // set_p, way 0
+            tag_1  = 22'h111111;   // set_p, way 3
+            tag_2  = 22'h122222;   // set_q, way 1
+            tag_3  = 22'h133333;   // set_r, way 2
+            errors = 0;
+
+            preload_line(set_p, 2'd0, tag_0, {32'h1000_0003, 32'h1000_0002, 32'h1000_0001, 32'h1000_0000});
+            preload_line(set_p, 2'd3, tag_1, {32'h1100_0003, 32'h1100_0002, 32'h1100_0001, 32'h1100_0000});
+            preload_line(set_q, 2'd1, tag_2, {32'h1200_0003, 32'h1200_0002, 32'h1200_0001, 32'h1200_0000});
+            preload_line(set_r, 2'd2, tag_3, {32'h1300_0003, 32'h1300_0002, 32'h1300_0001, 32'h1300_0000});
+
+            // Fields: set, tag, word, we, wdata. Array index = request id.
+            stream[ 0] = '{set_p, tag_0, 2'd0, 1'b0, '0};                 // load
+            stream[ 1] = '{set_p, tag_1, 2'd1, 1'b0, '0};                 // load, same set as 0
+            stream[ 2] = '{set_p, tag_0, 2'd2, 1'b1, 32'h7000_0002};      // store
+            stream[ 3] = '{set_q, tag_2, 2'd0, 1'b0, '0};                 // load, other set
+            stream[ 4] = '{set_q, tag_2, 2'd3, 1'b1, 32'h7000_0004};      // store
+            stream[ 5] = '{set_r, tag_3, 2'd1, 1'b0, '0};                 // load, other set
+            stream[ 6] = '{set_q, tag_2, 2'd3, 1'b0, '0};                 // reads id 4's store
+            stream[ 7] = '{set_r, tag_3, 2'd0, 1'b1, 32'h7000_0007};      // store
+            stream[ 8] = '{set_p, tag_1, 2'd3, 1'b1, 32'h7000_0008};      // store, other set
+            stream[ 9] = '{set_q, tag_2, 2'd1, 1'b1, 32'h7000_0009};      // store, other set
+            stream[10] = '{set_p, tag_1, 2'd3, 1'b0, '0};                 // reads id 8's store
+            stream[11] = '{set_r, tag_3, 2'd0, 1'b0, '0};                 // reads id 7's store
+            stream[12] = '{set_q, tag_2, 2'd1, 1'b0, '0};                 // reads id 9's store
+            stream[13] = '{set_p, tag_0, 2'd2, 1'b0, '0};                 // reads id 2's store
+            stream[14] = '{set_r, tag_3, 2'd2, 1'b1, 32'h7000_000E};      // store
+            stream[15] = '{set_p, tag_0, 2'd0, 1'b0, '0};                 // load, other set
+
+            n_stores = 0;
+            foreach (stream[i])
+                if (stream[i].we) n_stores++;
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            mshr_req_cnt = 0;
+            resp_peak    = 0;
+
+            // Issue the stream with zero gap: sb_access returns #1 after
+            // the acceptance edge, and the next call re-asserts req_valid
+            // in the same time step.
+            for (int i = 0; i < T7_N; i++)
+                sb_access(make_addr(stream[i].tag, stream[i].set_idx, stream[i].word),
+                          stream[i].we, stream[i].wdata, TXN_ID_WIDTH'(i), acc[i]);
+
+            // Drain: the last response is due HIT_LATENCY edges after the
+            // last acceptance; one further edge confirms nothing follows.
+            repeat (HIT_LATENCY + 2) @(posedge clk);
+            #1;
+
+            // One acceptance per edge across the whole stream.
+            for (int i = 1; i < T7_N; i++)
+                check_gap($sformatf("test 7 ids %0d -> %0d", i - 1, i), acc[i-1], acc[i], 1, errors);
+
+            // Count, order, ids, load data and per-response latency.
+            check_responses("test 7", errors);
+
+            // With no back-pressure, each response leaves the FIFO on the
+            // edge after it enters, so occupancy never exceeds one.
+            if (resp_peak > 1) begin
+                $error("[FAIL] test 7: response FIFO peaked at %0d entries, expected at most 1",
+                       resp_peak);
+                errors++;
+            end
+
+            // FIFO fully drained.
+            if (resp_valid !== 1'b0 || dut.resp_count != 0) begin
+                $error("[FAIL] test 7: after drain resp_valid = %b, resp_count = %0d, expected 0, 0",
+                       resp_valid, dut.resp_count);
+                errors++;
+            end
+
+            // Exactly one array-write cycle per store; no MSHR traffic.
+            if (wr_log.size() != n_stores) begin
+                $error("[FAIL] test 7: %0d cycles with array writes, expected %0d (one per store)",
+                       wr_log.size(), n_stores);
+                errors++;
+            end
+            if (mshr_req_cnt != 0) begin
+                $error("[FAIL] test 7: %0d cycles with an MSHR request, expected none",
+                       mshr_req_cnt);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 7: %0d back-to-back hits (%0d stores) accepted on consecutive edges, responses on consecutive edges with 2-cycle latency and correct data, FIFO peak %0d",
+                         T7_N, n_stores, resp_peak);
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-7 implemented and passing (2026-10-03).
         // Test infrastructure now available: make_addr, preload_line,
         // set_valid, cpu_send, sb_access + check_responses (scoreboard),
         // check_gap, response monitor (resp_log), array write logger (wr_log),
-        // miss counter, side-effect watcher.
+        // miss counter, side-effect watcher, response-FIFO peak monitor (resp_peak).
         //
         // Remaining hit-path tests (see plan):
-        // 7 full throughput, 8 back-pressure (FIFO fills to 3, drains),
+        // 8 back-pressure (FIFO fills to 3, drains),
         // 9 random load/store mix with random resp_ready.
         // ---------------------------------------------------------------
 
