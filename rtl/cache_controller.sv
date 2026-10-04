@@ -424,7 +424,7 @@ module cache_controller #(
     //   - req_ready additionally requires (pending count + lookup_q.valid)
     //     < 16, which also guarantees mshr_alloc_ready (every busy MSHR
     //     entry has at least one waiting request); assert this.
-    // Then: step 6 tree pseudo-LRU replacement, step 7 fill/eviction
+    // Then: step 6 true-LRU replacement (age counters), step 7 fill/eviction
     // with replay of pending requests through the hit path (see
     // DESIGN_DECISIONS.txt).
     // -------------------------------------------------------------------
