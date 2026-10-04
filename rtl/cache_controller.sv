@@ -22,9 +22,10 @@
 //
 // Work in progress: address decomposition, the lookup shadow register,
 // hit/miss detection and the hit completion path (load-hit response,
-// store-hit write, read-after-write stall, response FIFO) are
-// implemented; miss handling via the MSHR, the replacement policy and
-// fill/eviction sequencing are added in later steps.
+// store-hit write, read-after-write stall, response FIFO) and the
+// true-LRU replacement state (updated on hits) are implemented; miss
+// handling via the MSHR and fill/eviction sequencing are added in later
+// steps.
 // -----------------------------------------------------------------------
 `default_nettype none
 
@@ -267,6 +268,102 @@ module cache_controller #(
     assign valid_wr_valid   = 1'b0;
 
     // -------------------------------------------------------------------
+    // Replacement state: true LRU, one age counter per way
+    // Each way of a set holds a WAY_WIDTH-bit age: 0 = most recently
+    // used, NUM_WAYS-1 = least recently used. The ages of a set always
+    // form a permutation of 0..NUM_WAYS-1, i.e. a total recency order.
+    //
+    // Update on an access to way W, whose current age is a_W:
+    //   - W                    : age <- 0
+    //   - every way with age < a_W (used more recently than W): age + 1
+    //   - every way with age > a_W                            : unchanged
+    // which moves W to the front of the order and shifts back exactly the
+    // ways it overtook, preserving the permutation.
+    //
+    // Storage is in flip-flops rather than in a registered-read array, so
+    // the read-modify-write completes in the lookup cycle: a hit to the
+    // same set on the next cycle already observes this update, and no
+    // read-after-write stall is required. Cost: NUM_SETS x NUM_WAYS x
+    // WAY_WIDTH = 512 flip-flops at the default parameters.
+    //
+    // Only hits update the order at present. Fills will be added as a
+    // second source of lru_upd_* together with the fill path; a miss
+    // itself does not update the order, since its line is not yet present.
+    // -------------------------------------------------------------------
+    typedef logic [NUM_WAYS-1:0][WAY_WIDTH-1:0] lru_ages_t;   // ages of one set, indexed by way
+
+    lru_ages_t lru_age [NUM_SETS];
+
+    logic                     lru_upd_en;
+    logic [SET_IDX_WIDTH-1:0] lru_upd_set;
+    logic [WAY_WIDTH-1:0]     lru_upd_way;
+    lru_ages_t                lru_cur;    // current ages of the set being updated
+    lru_ages_t                lru_nxt;    // ages after the update
+
+    assign lru_upd_en  = lookup_hit;
+    assign lru_upd_set = lookup_q.set_idx;
+    assign lru_upd_way = hit_way;
+    assign lru_cur     = lru_age[lru_upd_set];
+
+    always_comb begin
+        for (int w = 0; w < NUM_WAYS; w++) begin
+            if (WAY_WIDTH'(w) == lru_upd_way)
+                lru_nxt[w] = '0;
+            else if (lru_cur[w] < lru_cur[lru_upd_way])
+                lru_nxt[w] = lru_cur[w] + 1'b1;
+            else
+                lru_nxt[w] = lru_cur[w];
+        end
+    end
+
+    // Reset establishes the order way 0 (youngest) .. way NUM_WAYS-1
+    // (oldest) in every set. Any permutation would serve; this one is the
+    // simplest to state. Invalid ways are filled before the order is
+    // consulted, so the initial order does not affect behaviour.
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            for (int s = 0; s < NUM_SETS; s++)
+                for (int w = 0; w < NUM_WAYS; w++)
+                    lru_age[s][w] <= WAY_WIDTH'(w);
+        end else if (lru_upd_en) begin
+            lru_age[lru_upd_set] <= lru_nxt;
+        end
+    end
+
+    // Victim lookup: the least recently used way of a set is the one whose
+    // age is NUM_WAYS-1. The ages form a permutation, so exactly one way
+    // matches. The set is driven by the fill path once it is implemented.
+    logic [SET_IDX_WIDTH-1:0] lru_victim_set;
+    logic [WAY_WIDTH-1:0]     lru_victim_way;
+
+    assign lru_victim_set = mshr_fill_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH +: SET_IDX_WIDTH];
+
+    always_comb begin
+        lru_victim_way = '0;
+        for (int w = 0; w < NUM_WAYS; w++) begin
+            if (lru_age[lru_victim_set][w] == WAY_WIDTH'(NUM_WAYS - 1))
+                lru_victim_way = WAY_WIDTH'(w);
+        end
+    end
+
+`ifndef SYNTHESIS
+    // Returns 1 if the ages of one set are a permutation of 0..NUM_WAYS-1.
+    function automatic logic lru_is_permutation(input lru_ages_t ages);
+        logic [NUM_WAYS-1:0] seen = '0;
+        for (int w = 0; w < NUM_WAYS; w++)
+            seen[ages[w]] = 1'b1;
+        return &seen;
+    endfunction
+
+    // Invariant check: an update must preserve the total recency order. A
+    // duplicated or missing age would make the victim ambiguous or absent.
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     lru_upd_en |-> lru_is_permutation(lru_nxt))
+        else $error("cache_controller: LRU ages of set %0d not a permutation after update (%p -> %p)",
+                    lru_upd_set, lru_cur, lru_nxt);
+`endif
+
+    // -------------------------------------------------------------------
     // Read-after-write hazard stall
     // The arrays perform a same-edge read and write without forwarding:
     // a read issued on the edge that commits a write returns the
@@ -411,11 +508,10 @@ module cache_controller #(
 `endif
 
     // -------------------------------------------------------------------
-    // PROGRESS MARKER -- steps 1-4 implemented (2026-09-29).
-    // The hit path (step 4) is being verified in tb/cache_controller_tb.sv
-    // before further RTL is added; test 1 passes, tests 2-9 pending.
+    // PROGRESS MARKER -- steps 1-4 implemented and verified (tests 1-9),
+    // true-LRU replacement state added (2026-10-04).
     //
-    // Next RTL step (5), miss handling -- plan proposed, not yet approved:
+    // Next RTL step, miss handling (approved: 16-entry table, replay):
     //   - on lookup_miss: drive mshr_alloc_* with the line-aligned address
     //     and is_write; record the returned mshr_alloc_id.
     //   - pending-request (replay) table, 16 entries (bounded by the 4-bit
@@ -424,9 +520,9 @@ module cache_controller #(
     //   - req_ready additionally requires (pending count + lookup_q.valid)
     //     < 16, which also guarantees mshr_alloc_ready (every busy MSHR
     //     entry has at least one waiting request); assert this.
-    // Then: step 6 true-LRU replacement (age counters), step 7 fill/eviction
-    // with replay of pending requests through the hit path (see
-    // DESIGN_DECISIONS.txt).
+    // Then: fill/eviction (victim = invalid way first, else lru_victim_way;
+    // fills become a second lru_upd_* source), with replay of pending
+    // requests through the hit path (see DESIGN_DECISIONS.txt).
     // -------------------------------------------------------------------
 
 endmodule : cache_controller
