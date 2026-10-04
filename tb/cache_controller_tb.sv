@@ -135,6 +135,9 @@ module cache_controller_tb;
     // MSHR port. Controller outputs are observed (they must stay idle on
     // the hit path); inputs are tied to the values an idle MSHR drives
     // just after reset (free entries, empty writeback queue, no fill).
+    // mshr_fill_addr is a variable rather than a constant: with
+    // mshr_fill_valid = 0 it carries no fill, but it selects the set whose
+    // LRU victim the controller computes, which test 10 probes.
     // -------------------------------------------------------------------
     logic                     mshr_alloc_valid;
     logic [ADDR_WIDTH-1:0]    mshr_alloc_addr;
@@ -150,7 +153,7 @@ module cache_controller_tb;
     wire logic                     mshr_wb_done      = 1'b0;
     wire logic                     mshr_fill_valid   = 1'b0;
     wire logic [MSHR_ID_WIDTH-1:0] mshr_fill_id      = '0;
-    wire logic [ADDR_WIDTH-1:0]    mshr_fill_addr    = '0;
+    logic      [ADDR_WIDTH-1:0]    mshr_fill_addr    = '0;   // TB-driven: selects the set for the LRU victim probe (test 10)
     wire logic [LINE_WIDTH-1:0]    mshr_fill_data    = '0;
     wire logic                     mshr_fill_is_write = 1'b0;
 
@@ -493,10 +496,20 @@ module cache_controller_tb;
     logic                  model_valid [NUM_SETS][NUM_WAYS];
     logic                  model_dirty [NUM_SETS][NUM_WAYS];
 
+    // LRU ages, mirroring the controller's replacement state (0 = most
+    // recently used). Initialised to the controller's reset order and
+    // advanced by sb_access on every predicted hit. Accurate only for sets
+    // accessed exclusively through sb_access since reset: tests 2-4 issue
+    // requests through cpu_send directly, so their sets are not tracked.
+    typedef logic [WAY_WIDTH-1:0] age_set_t [NUM_WAYS];   // ages of one set, indexed by way
+
+    age_set_t              model_age   [NUM_SETS];
+
     initial begin
         foreach (model_valid[s, w]) begin
             model_valid[s][w] = 1'b0;
             model_dirty[s][w] = 1'b0;
+            model_age  [s][w] = WAY_WIDTH'(w);
         end
     end
 
@@ -687,6 +700,19 @@ module cache_controller_tb;
             model_dirty[s][way] = 1'b1;
         end
 
+        // Every hit, load or store, makes its way the most recently used:
+        // the ways it overtakes (younger ages) each age by one.
+        if (hit) begin
+            logic [WAY_WIDTH-1:0] hit_age;
+            hit_age = model_age[s][way];
+            for (int w = 0; w < NUM_WAYS; w++) begin
+                if (w == way)
+                    model_age[s][w] = '0;
+                else if (model_age[s][w] < hit_age)
+                    model_age[s][w] = model_age[s][w] + 1'b1;
+            end
+        end
+
         cpu_send(addr, we, wdata, id, accept_cycle);
 
         if (hit) begin
@@ -709,6 +735,30 @@ module cache_controller_tb;
             $error("[FAIL] %s: second request accepted %0d edge(s) after the first, expected %0d",
                    what, accept_2 - accept_1, expected);
             errors++;
+        end
+    endtask
+
+    // Compares the controller's LRU ages of one set (white-box) against an
+    // expected set of ages -- either a hand-computed literal or the
+    // scoreboard's model_age. The ages are updated on the edge after a
+    // hit's acceptance, so a caller must allow one edge after the last
+    // acceptance before checking.
+    task automatic check_lru(
+        input  string                    what,
+        input  logic [SET_IDX_WIDTH-1:0] set_idx,
+        input  age_set_t                 expected,
+        inout  int unsigned              errors
+    );
+        for (int w = 0; w < NUM_WAYS; w++) begin
+            if (dut.lru_age[set_idx][w] !== expected[w]) begin
+                $error("[FAIL] %s: set %0d LRU ages (w0..w3) = %0d %0d %0d %0d, expected %0d %0d %0d %0d",
+                       what, set_idx,
+                       dut.lru_age[set_idx][0], dut.lru_age[set_idx][1],
+                       dut.lru_age[set_idx][2], dut.lru_age[set_idx][3],
+                       expected[0], expected[1], expected[2], expected[3]);
+                errors++;
+                return;
+            end
         end
     endtask
 
@@ -1785,20 +1835,175 @@ module cache_controller_tb;
                 errors++;
             end
 
+            // Final recency order of both sets after ~450 random hits,
+            // against the scoreboard's independently maintained ages.
+            check_lru("test 9 set_a", set_a, model_age[set_a], errors);
+            check_lru("test 9 set_b", set_b, model_age[set_b], errors);
+
             if (errors == 0)
                 $display("[PASS] test 9: %0d random requests (%0d hits, %0d store hits, %0d misses) under random back-pressure -- all responses correct and in order, FIFO peak %0d, %0d RAW stalls, no hold violations",
                          T9_N, exp_log.size(), exp_store_hits, exp_misses, resp_peak, raw_stall_cnt - raw_base);
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-9 implemented and passing (2026-10-03).
+        // Test 10: LRU recency order.
+        // The replacement state has no externally visible effect until
+        // fills consume it, so it is checked white-box: after each access
+        // the controller's ages for the set are compared against
+        // hand-computed values. Hand-computed rather than model-derived,
+        // so that a misreading of the update rule shared by the RTL and
+        // the scoreboard model cannot cancel out; the model is compared
+        // once at the end, validating it for its use in test 9.
+        //
+        // Ages are listed as (way 0, way 1, way 2, way 3); 0 = most
+        // recently used. Cases:
+        //   - single hits on the oldest way, the newest way (no change),
+        //     a middle way, and a store hit (stores update the order too)
+        //   - four back-to-back hits to the set: each must observe the
+        //     previous update, and none may stall
+        //   - a miss to the set, and a hit to another set: no change here
+        //   - victim probe: the way with age 3 is reported as the victim
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned T10_STEPS = 5;
+            localparam int unsigned T10_BURST = 4;
+
+            logic [SET_IDX_WIDTH-1:0] set_t, set_o;
+            logic [TAG_WIDTH-1:0]     tags [NUM_WAYS];
+            logic [TAG_WIDTH-1:0]     tag_o, tag_miss;
+            int unsigned              acc [T10_BURST];
+            int unsigned              miss_base;
+            int unsigned              errors;
+
+            // Single-access steps: way accessed, load/store, ages after it.
+            int                       step_way [T10_STEPS];
+            logic                     step_we  [T10_STEPS];
+            age_set_t                 step_exp [T10_STEPS];
+            // Back-to-back burst: ways accessed (all loads).
+            int                       burst_way [T10_BURST];
+
+            set_t    = 6'd12;   // untouched by tests 1-9: still in reset order
+            set_o    = 6'd13;
+            tags     = '{22'h0A0000, 22'h0A1111, 22'h0A2222, 22'h0A3333};
+            tag_o    = 22'h0B0000;
+            tag_miss = 22'h0AFFFF;
+            errors   = 0;
+
+            //             way  we     ages after: w0 w1 w2 w3
+            step_way[0] = 3; step_we[0] = 1'b0; step_exp[0] = '{1, 2, 3, 0};   // oldest -> newest; all others age
+            step_way[1] = 3; step_we[1] = 1'b0; step_exp[1] = '{1, 2, 3, 0};   // already newest: no change
+            step_way[2] = 1; step_we[2] = 1'b0; step_exp[2] = '{2, 0, 3, 1};   // middle: only w0, w3 age
+            step_way[3] = 2; step_we[3] = 1'b0; step_exp[3] = '{3, 1, 0, 2};   // oldest again: all others age
+            step_way[4] = 0; step_we[4] = 1'b1; step_exp[4] = '{0, 2, 1, 3};   // store hit updates the order
+            burst_way   = '{3, 2, 3, 1};                                       // -> '{3, 0, 2, 1}
+
+            foreach (tags[w])
+                preload_line(set_t, WAY_WIDTH'(w), tags[w],
+                             {32'hA000_0003 + w, 32'hA000_0002 + w, 32'hA000_0001 + w, 32'hA000_0000 + w});
+            preload_line(set_o, 2'd2, tag_o, {32'hB000_0003, 32'hB000_0002, 32'hB000_0001, 32'hB000_0000});
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            mshr_req_cnt = 0;
+            miss_base    = miss_cnt;
+            resp_ready   = 1'b1;
+
+            // Preloading writes the arrays directly and does not touch the
+            // replacement state: the set must still be in reset order.
+            check_lru("test 10 initial order", set_t, '{0, 1, 2, 3}, errors);
+
+            // Single accesses, each checked one edge after acceptance, when
+            // the lookup-stage update has been committed.
+            for (int i = 0; i < T10_STEPS; i++) begin
+                sb_access(make_addr(tags[step_way[i]], set_t, 2'd0), step_we[i], 32'h5EED_0000 + i,
+                          TXN_ID_WIDTH'(i), acc[0]);
+                @(posedge clk);
+                #1;
+                check_lru($sformatf("test 10 step %0d (%s way %0d)", i, step_we[i] ? "store" : "load", step_way[i]),
+                          set_t, step_exp[i], errors);
+            end
+            repeat (2) @(posedge clk);
+            #1;
+
+            // Back-to-back burst: four same-set hits on consecutive edges.
+            // A hit that read stale ages would leave a different final order.
+            for (int i = 0; i < T10_BURST; i++)
+                sb_access(make_addr(tags[burst_way[i]], set_t, 2'd1), 1'b0, '0,
+                          TXN_ID_WIDTH'(T10_STEPS + i), acc[i]);
+            for (int i = 1; i < T10_BURST; i++)
+                check_gap($sformatf("test 10 burst %0d -> %0d", i - 1, i), acc[i-1], acc[i], 1, errors);
+            @(posedge clk);
+            #1;
+            check_lru("test 10 after back-to-back burst", set_t, '{3, 0, 2, 1}, errors);
+
+            // A miss to the set, then a hit to another set: neither changes
+            // this set's order; the other set's order changes on its own.
+            sb_access(make_addr(tag_miss, set_t, 2'd0), 1'b0, '0, 4'd10, acc[0]);
+            sb_access(make_addr(tag_o,    set_o, 2'd0), 1'b0, '0, 4'd11, acc[0]);
+            @(posedge clk);
+            #1;
+            check_lru("test 10 after miss + other-set hit", set_t, '{3, 0, 2, 1}, errors);
+            check_lru("test 10 other set",                  set_o, '{1, 2, 0, 3}, errors);
+
+            // Victim probe: the fill-address set selects whose oldest way the
+            // controller reports. No fill occurs (mshr_fill_valid = 0).
+            mshr_fill_addr = make_addr('0, set_t, 2'd0);
+            #1;
+            if (dut.lru_victim_way !== 2'd0) begin
+                $error("[FAIL] test 10: victim of set %0d = way %0d, expected way 0 (age 3)",
+                       set_t, dut.lru_victim_way);
+                errors++;
+            end
+            mshr_fill_addr = make_addr('0, set_o, 2'd0);
+            #1;
+            if (dut.lru_victim_way !== 2'd3) begin
+                $error("[FAIL] test 10: victim of set %0d = way %0d, expected way 3 (age 3)",
+                       set_o, dut.lru_victim_way);
+                errors++;
+            end
+            mshr_fill_addr = '0;
+
+            // The scoreboard model, maintained independently, must agree.
+            check_lru("test 10 model vs DUT", set_t, model_age[set_t], errors);
+            check_lru("test 10 model vs DUT", set_o, model_age[set_o], errors);
+
+            // The LRU addition must leave the visible behaviour unchanged:
+            // every hit answered correctly on time, one write (the store),
+            // exactly one miss, no MSHR traffic.
+            repeat (HIT_LATENCY + 2) @(posedge clk);
+            #1;
+            check_responses("test 10", errors);
+            if (wr_log.size() != 1) begin
+                $error("[FAIL] test 10: %0d cycles with array writes, expected 1 (the store)",
+                       wr_log.size());
+                errors++;
+            end
+            if (miss_cnt - miss_base != 1) begin
+                $error("[FAIL] test 10: %0d lookups classified as miss, expected 1",
+                       miss_cnt - miss_base);
+                errors++;
+            end
+            if (mshr_req_cnt != 0) begin
+                $error("[FAIL] test 10: %0d cycles with an MSHR request, expected none",
+                       mshr_req_cnt);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 10: LRU order correct after every hit (oldest/newest/middle/store), back-to-back burst without stall, unchanged by miss and other-set hit, victim = oldest way");
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-10 implemented and passing (2026-10-04).
         // Test infrastructure now available: make_addr, preload_line,
         // set_valid, cpu_send, sb_access + check_responses (scoreboard),
         // check_gap, response monitor (resp_log), array write logger (wr_log),
         // miss counter, side-effect watcher, response-FIFO peak monitor
-        // (resp_peak), stalled-response hold checker (resp_hold_err).
+        // (resp_peak), stalled-response hold checker (resp_hold_err),
+        // LRU checker (check_lru + model_age).
         //
-        // Hit-path test plan complete. Next: miss handling via the MSHR.
+        // Hit path and LRU state verified. Next: miss handling via the MSHR.
         // ---------------------------------------------------------------
 
         $finish;
