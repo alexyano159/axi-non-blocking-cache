@@ -1,11 +1,11 @@
 // -----------------------------------------------------------------------
 // Testbench for the MSHR (Miss Status Holding Register).
 //
-// Structure (built up incrementally):
-//   1. Clock/reset generation and DUT instantiation           <- this step
+// Structure:
+//   1. Clock/reset generation and DUT instantiation
 //   2. AXI memory model (slave-side BFM on the same axi_if)
-//   3. Driver/helper tasks (alloc_miss, push_writeback, ...)
-//   4. Directed test sequences
+//   3. Driver/helper tasks (send_miss, wait_for_fill, push_writeback, ...)
+//   4. Directed tests 1-13
 //
 // See docs/MSHR_README.md for the design rationale being
 // verified here (merge-over-new-alloc, round-robin AR arbitration,
@@ -68,8 +68,8 @@ module mshr_tb;
     logic                  fill_ready;
 
     // -------------------------------------------------------------------
-    // AXI interface instance. The DUT drives it as .master; the TB will
-    // act as the memory (.slave side) once the BFM is added in step 2.
+    // AXI interface instance. The DUT drives it as .master; the memory
+    // model below plays the slave side.
     // -------------------------------------------------------------------
     axi_if #(
         .ADDR_WIDTH(ADDR_WIDTH),
@@ -149,7 +149,7 @@ module mshr_tb;
 
     // Testbench-only override: when raised, forces the read-address
     // channel to refuse every request regardless of the read model's own
-    // state. Not a real protocol condition -- used by test 7 to force
+    // state. Not a real protocol condition -- used by tests 7 and 9 to force
     // several fill-engine entries to pile up as simultaneous requesters,
     // which never happens if requests are served as fast as they arrive.
     logic ar_block;
@@ -267,8 +267,8 @@ module mshr_tb;
         @(posedge clk);
         // alloc_ready deasserting here is genuine DUT behavior (no free or
         // matching entry) -- this loop is not simulating the stall itself,
-        // only standing in for the not-yet-designed cache controller's
-        // reaction to it: hold alloc_valid and keep waiting.
+        // only standing in for the cache controller's (whose MSHR path is
+        // not yet implemented) reaction to it: hold alloc_valid and keep waiting.
         while (!alloc_ready) @(posedge clk);
 
         id          = alloc_id;
@@ -276,9 +276,9 @@ module mshr_tb;
     endtask
 
     // Blocks until the entry `id` presents its completed fill, then
-    // returns the reassembled line and the dirty/is_write flag. Relies
-    // on fill_ready being held permanently high below -- this simplified
-    // TB "controller" never stalls a fill, so the wait here is purely
+    // returns the reassembled line and the dirty/is_write flag. Assumes
+    // fill_ready is high (its default) while this task runs -- the TB
+    // "controller" does not stall a fill here, so the wait here is purely
     // about which entry is being presented this cycle, not a handshake
     // retry loop like send_miss's alloc_ready wait.
     task automatic wait_for_fill(input  logic [ID_WIDTH-1:0]   id,
@@ -292,7 +292,8 @@ module mshr_tb;
     // Hands a dirty victim line to the MSHR's writeback queue and blocks
     // until it's accepted. Mirrors send_miss's shape: if the queue is
     // full, wb_ready simply stays low and the while loop waits, standing
-    // in for the not-yet-designed controller's reaction to that stall.
+    // in for the cache controller's (whose MSHR path is not yet
+    // implemented) reaction to that stall.
     task automatic push_writeback(input logic [ADDR_WIDTH-1:0] addr,
                                    input logic [LINE_WIDTH-1:0] data);
         wb_addr  = addr;
@@ -333,9 +334,9 @@ module mshr_tb;
     endtask
 
     // -------------------------------------------------------------------
-    // Idle-value drive for controller-side inputs. Overridden by driver
-    // tasks in later steps; keeping this here means the DUT always sees
-    // legal, deasserted inputs even before any stimulus exists.
+    // Idle-value drive for controller-side inputs; the driver tasks above
+    // override these during each test, so the DUT always sees legal,
+    // deasserted inputs between stimuli.
     // -------------------------------------------------------------------
     initial begin
         alloc_valid    = 1'b0;
@@ -344,11 +345,12 @@ module mshr_tb;
         wb_valid       = 1'b0;
         wb_addr        = '0;
         wb_data        = '0;
-        // Held permanently high: this TB models a controller that always
-        // has room to accept a completed fill, the same simplification
-        // the DUT itself makes on the AXI side (axi.rready tied high).
+        // High by default: this TB models a controller that normally
+        // always accepts a completed fill (mirroring axi.rready tied high
+        // in the DUT). Tests 6 and 9 temporarily drop it to park entries
+        // in FE_DONE.
         fill_ready     = 1'b1;
-        // Off by default -- only test 7 raises this to force simultaneous
+        // Off by default -- only tests 7 and 9 raise this to force simultaneous
         // AR requesters; every other test sees the memory model's normal
         // as-fast-as-possible accept behavior.
         ar_block       = 1'b0;
@@ -484,8 +486,7 @@ module mshr_tb;
         // Test 5: single victim writeback.
         // Exercises the writeback engine end-to-end for the first time:
         // wb_valid/wb_addr/wb_data -> queue accept -> AW/W/B drain ->
-        // wb_done. This TB plays the role of the (not-yet-designed) cache
-        // controller, handing the MSHR a made-up dirty line directly --
+        // wb_done. This TB plays the role of the cache controller, handing the MSHR a made-up dirty line directly --
         // the same simplification send_miss makes on the alloc side.
         //
         // The target address is preloaded with a sentinel value first, so
@@ -614,10 +615,9 @@ module mshr_tb;
         // check.
         //
         // Test 6 leaves the MSHR mid-drain (it only guarantees one entry
-        // freed, not all sixteen), so this test opens with a generous
-        // fixed settle window -- long enough for everything left in
-        // flight from test 6 to fully retire -- before relying on entries
-        // 0/1/2 being free. The expected grant order is then computed
+        // freed, not all sixteen), so this test opens by waiting
+        // (watchdog-bounded) until every entry is back in FE_IDLE, before
+        // relying on entries 0/1/2 being free. The expected grant order is then computed
         // from whatever ar_last_grant actually is at that point, instead
         // of assuming it has settled back to its reset value (0). This
         // keeps the test's pass/fail independent of test 6's internal
@@ -975,7 +975,7 @@ module mshr_tb;
         // wait_for_fill and wait_for_wb_done are launched together inside
         // a blocking fork/join rather than called one after another:
         // each engine's completion (fill_valid for this id; wb_done) is
-        // only a single-cycle pulse, and test 9's timing shows both
+        // only a single-cycle pulse, and with this test's setup both
         // bursts start in near lockstep, so their completions can land on
         // the same cycle. Waiting on them sequentially would risk the
         // first wait's multi-cycle block silently swallowing the other

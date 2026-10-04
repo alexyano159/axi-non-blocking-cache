@@ -23,30 +23,36 @@ miss. From there:
 
 **Read miss:**
 1. Controller asserts `alloc_valid` + `alloc_addr` (`alloc_is_write = 0`).
-2. MSHR checks: is any entry already fetching this exact address?
+2. MSHR checks: does any occupied entry (still fetching, or finished but
+   not yet handed back) already hold this exact address?
    - **Yes** → merge into it (`alloc_id` = that entry's index). No new
      AXI traffic — this is the hit-under-miss case.
    - **No, and a slot is free** → open a new entry, issue an AXI read
      burst (`AR`/`R`) for the line.
    - **No slot free either** → `alloc_ready = 0`, controller stalls.
 3. Memory streams back 4 beats on `R`; the MSHR reassembles them.
-4. `fill_valid` + `fill_data` are presented to the controller, which
-   writes the line into the data array. Every access that had merged
+4. `fill_valid` + `fill_data` are presented to the controller; once it
+   accepts with `fill_ready`, it writes the line into the data array and
+   the entry frees that same cycle (until then it stays parked in
+   `FE_DONE`, still occupied). Every access that had merged
    into this entry is now satisfied by simply re-checking the cache.
 
 **Write miss:** identical flow, except `alloc_is_write = 1`. The MSHR
 doesn't do anything differently for a store — it just remembers the flag
-and hands it back as `fill_is_write`, so the *controller* knows to merge
-the pending store data into the line and mark it dirty once it arrives.
+and hands it back as `fill_is_write`. The controller itself keeps the
+store (its data and word) in its waiting table and replays it through
+the normal hit path once the line is installed, which writes the word
+and marks the line dirty.
 (If a read and a write both merge into the same entry, `fill_is_write`
 ends up `1` — a store anywhere in the merge chain means the line must
 come back dirty.)
 
-**Eviction (runs alongside a miss, not instead of it):** if the
-controller had to kick out a dirty line to make room for the incoming
-one, it *also* asserts `wb_valid`/`wb_addr`/`wb_data` that same cycle.
-This is entirely independent of the miss's `AR`/`R` traffic — see the
-writeback section below.
+**Eviction (happens at fill time, not at miss time):** the victim way is
+only chosen when the fetched line comes back, so the old line keeps
+serving hits while the miss is in flight. If that victim is dirty, the
+controller hands it over on `wb_valid`/`wb_addr`/`wb_data` as part of
+installing the fill. This writeback is entirely independent of the
+`AR`/`R` traffic — see the writeback section below.
 
 ## What data moves where, and on which AXI channel
 

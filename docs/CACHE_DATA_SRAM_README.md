@@ -14,8 +14,9 @@ mem[NUM_WAYS][NUM_SETS]   -- one 128-bit line per (way, set) pair
 Modeled as `NUM_WAYS` independent banks rather than one flat array,
 reflecting that a real 4-way SRAM is four parallel memories sharing an
 address bus -- not one wide memory with an extra address bit. This lets
-all four ways of a set come back in the same cycle, which the
-controller needs in order to tag-compare every way in parallel.
+all four ways of a set come back in the same cycle, in parallel with
+the tag/valid lookup, so the controller can select the hitting way's
+line the moment the hit is resolved -- without a second SRAM access.
 
 ## Who it talks to
 
@@ -23,10 +24,13 @@ controller needs in order to tag-compare every way in parallel.
 Cache Controller  <---->  Cache Data SRAM
 ```
 
-The cache controller (not yet built) is the **only** client. It is
-responsible for:
-- Doing the tag compare (against the separate tag array) to know which
-  way holds a hit, or which way to evict on a miss.
+The cache controller (`rtl/cache_controller.sv`) is the **only**
+client; it reaches this module through its `data_`-prefixed port
+group. It is responsible for:
+- Forming the hit by ANDing the tag array's raw `tag_match` with the
+  valid array's `valid_out`, then selecting the hitting way's line from
+  `rd_line`. (Choosing a victim way at fill time, via true LRU, is added
+  with the fill path.)
 - Merging its two write sources onto this module's single write port
   (see below) -- this module has no arbitration logic of its own.
 - This module has **no direct connection to the MSHR** -- fill data
@@ -47,7 +51,9 @@ responsible for:
 
 ## Two write sources, one port
 
-The controller merges both onto the single write port every cycle:
+The port is shared by two sources. The controller currently drives only
+the hit-write source (the store-hit path); the fill-write source is
+added with miss handling, and will be muxed onto the same port:
 
 | Source | `wr_word_en` | When |
 |---|---|---|
@@ -70,8 +76,8 @@ Both the read and write ports are synchronous (`always_ff`):
 There is no `rst_n` on this module -- a real SRAM macro has no reset
 pin, and synchronously clearing an array this size in one cycle isn't
 representative of real hardware. Line contents are undefined until
-written; correctness after reset is guaranteed by the **tag array's**
-valid bits being cleared there, not by this module.
+written; correctness after reset is guaranteed by the **valid array's**
+(`cache_valid_array`) bits being cleared there, not by this module.
 
 ## Parameters
 

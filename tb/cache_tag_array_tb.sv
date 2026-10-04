@@ -47,7 +47,7 @@ module cache_tag_array_tb;
 
     // -------------------------------------------------------------------
     // Controller-side ports: driven by the TB, sampled from the DUT.
-    // The TB stands in for the (not yet designed) cache controller --
+    // The TB stands in for the cache controller (rtl/cache_controller.sv) --
     // the only client of this module.
     // -------------------------------------------------------------------
     logic [SET_IDX_WIDTH-1:0] rd_set_idx;

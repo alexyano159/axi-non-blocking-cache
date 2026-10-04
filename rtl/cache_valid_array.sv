@@ -29,8 +29,8 @@
 // tag/dirty fields, this module stores only one bit, so wr_en alone
 // gates the write.
 //
-// Synchronous reset: on rst_n deassertion, every (way, set) entry is
-// cleared to invalid in a single cycle. This is only feasible because
+// Synchronous reset: on any clock edge with rst_n asserted (low), every
+// (way, set) entry is cleared to invalid in a single cycle. This is only feasible because
 // this array is small enough (NUM_WAYS * NUM_SETS bits) to be built
 // from flip-flops rather than a real SRAM macro -- unlike the tag/data
 // arrays, which are sized to map onto real SRAM and so forgo reset

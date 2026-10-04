@@ -49,12 +49,13 @@ Each entry (one "way" within one "set") holds:
 |---|---|---|
 | `V` (valid) | 1 bit | Does this way currently hold real data? |
 | `D` (dirty) | 1 bit | Has this line been written since it was fetched? Must be written back before eviction if set. |
-| `Tag` | 25 bits* | The upper address bits — compared against the incoming tag to detect HIT/MISS. |
+| `Tag` | 22 bits* | The upper address bits — compared against the incoming tag to detect HIT/MISS. |
 | `Data` | 128 bits | The actual cache line (4 × 32-bit words). |
 
-*Example only — actual tag width depends on the final number of sets,
-which isn't decided yet. The example below uses **8 sets** just to make
-the matrix concrete:
+*The real design uses **64 sets** (4 KB / 4 ways / 16 B per line), so
+the address splits as `[ TAG: 22 | SET: 6 | OFFSET: 4 ]`. The matrix
+below shrinks it to **8 sets** (`[ TAG: 25 | SET: 3 | OFFSET: 4 ]`) only
+to keep it small enough to draw:
 
 ```
 Address (32 bits) = [ TAG: 25 bits | SET: 3 bits | OFFSET: 4 bits ]
@@ -89,24 +90,23 @@ lookup compares the incoming address against **every row at once**.
 
 | Field | Width | Purpose |
 |---|---|---|
-| `Valid` | 1 bit | Is this entry currently tracking an in-flight miss? |
-| `Addr` | 32 bits | Full line address being fetched (compared against every new miss to detect a merge). |
-| `IsWrite` | 1 bit | Was the original miss a store? |
-| `State` | ~3 bits | `WAIT_WB` → `REQ` → `DATA` → `DONE` |
+| `Addr` | 32 bits | Full line address being fetched (compared against every new miss to detect a merge; only occupied entries, i.e. not `FE_IDLE`, can match). |
+| `IsWrite` | 1 bit | Was any access to this line (the original miss or any merged one) a store? Returned as `fill_is_write`. |
+| `State` | 2 bits | `FE_IDLE` → `FE_REQ` → `FE_DATA` → `FE_DONE` → back to `FE_IDLE`. `FE_IDLE` doubles as the "entry free" flag, so no separate valid bit is stored. |
 | `BeatCnt` | 2 bits | How many of the 4 burst beats have arrived. |
 | `LineBuf` | 128 bits | The line being assembled beat-by-beat; becomes `fill_data`. |
 
 The table as a matrix — rows are entries (= AXI IDs), columns are the
 fields above:
 
-| Entry (= AXI ID) | Valid | Addr | IsWrite | State | BeatCnt | LineBuf |
-|---|---|---|---|---|---|---|
-| 0 | | | | | | |
-| 1 | | | | | | |
-| 2 | | | | | | |
-| 3 | | | | | | |
-| ... | | | | | | |
-| 15 | | | | | | |
+| Entry (= AXI ID) | Addr | IsWrite | State | BeatCnt | LineBuf |
+|---|---|---|---|---|---|
+| 0 | | | | | |
+| 1 | | | | | |
+| 2 | | | | | |
+| 3 | | | | | |
+| ... | | | | | |
+| 15 | | | | | |
 
 A lookup on a new miss address compares it against the `Addr` column of
 **all 16 rows simultaneously** — there is no indexing step at all, which

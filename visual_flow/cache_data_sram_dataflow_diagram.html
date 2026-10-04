@@ -164,7 +164,7 @@
 <div class="sheet">
   <header class="sheet-head">
     <h1>AXI Non-Blocking Cache — Data SRAM I/O</h1>
-    <div class="meta">SHEET 1 · controller &lt;-&gt; data SRAM<br>REV: io-defined, logic TBD</div>
+    <div class="meta">SHEET 1 · controller &lt;-&gt; data SRAM<br>REV: implemented, verified (6 tests)</div>
   </header>
 
   <figure>
@@ -178,13 +178,13 @@
       <!-- Cache Controller -->
       <rect x="40" y="40" width="220" height="420" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="6 4"></rect>
       <text x="150" y="245" text-anchor="middle" class="boxtitle">CACHE CONTROLLER</text>
-      <text x="150" y="263" text-anchor="middle" class="boxsub">tag compare · way select</text>
-      <text x="150" y="277" text-anchor="middle" class="boxsub" font-style="italic">(not yet designed)</text>
+      <text x="150" y="263" text-anchor="middle" class="boxsub">hit = tag_match &amp; valid · way select</text>
+      <text x="150" y="277" text-anchor="middle" class="boxsub" font-style="italic">(hit path implemented; fill TBD)</text>
 
       <!-- Data SRAM outer container -->
       <rect x="620" y="40" width="300" height="420" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="6 4"></rect>
       <text x="635" y="63" class="group-label">DATA SRAM</text>
-      <text x="750" y="63" class="group-note">(cache_data_sram.sv — io defined)</text>
+      <text x="750" y="63" class="group-note">(cache_data_sram.sv)</text>
 
       <!-- Way sub-blocks -->
       <rect x="650" y="80" width="240" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"></rect>
@@ -227,7 +227,7 @@
       <text x="455" y="372" text-anchor="middle" class="wire-label">rd_line[3][127:0]</text>
     </svg>
     <figcaption>
-      The SRAM is really four independent way memories side by side. One <span style="font-family:var(--font-mono)">rd_set_idx</span> broadcasts to all four in parallel every cycle, and all four answer back on <strong style="color:var(--accent); font-weight:600;">four separate 128-bit buses</strong> — not one bus carrying four values in turn. The controller (with the tag array, elsewhere) decides which one is the actual hit and picks that bus's data; the other three are simply unused that cycle. The single write port is shared by both write sources (store-hit word write and miss-fill line write) — <span style="font-family:var(--font-mono)">wr_way_sel</span> picks the one way that's actually written; <span style="font-family:var(--font-mono)">wr_word_en</span> picks which word(s) of that way's line.
+      The SRAM is really four independent way memories side by side. One <span style="font-family:var(--font-mono)">rd_set_idx</span> broadcasts to all four in parallel every cycle, and all four answer back on <strong style="color:var(--accent); font-weight:600;">four separate 128-bit buses</strong> — not one bus carrying four values in turn. The controller (combining the tag array's match vector with the valid array's bits, elsewhere) decides which one is the actual hit and picks that bus's data; the other three are simply unused that cycle. The single write port is shared by both write sources (store-hit word write and miss-fill line write) — <span style="font-family:var(--font-mono)">wr_way_sel</span> picks the one way that's actually written; <span style="font-family:var(--font-mono)">wr_word_en</span> picks which word(s) of that way's line.
     </figcaption>
   </figure>
 

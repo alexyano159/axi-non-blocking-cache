@@ -51,8 +51,8 @@ interface axi_if #(
     logic                  rready;
 
     // Master: drives requests (addr/burst/data/valid), samples readys and
-    // responses. Use on any module that initiates transactions (MSHR,
-    // cache controller writeback path, etc).
+    // responses. Used by the MSHR, the only block in this design that
+    // initiates AXI transactions.
     modport master (
         output awid, awaddr, awlen, awsize, awburst, awvalid,
         input  awready,

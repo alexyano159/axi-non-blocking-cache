@@ -3,7 +3,8 @@
 A non-blocking L1 data cache with AXI4 memory access, built around a
 Miss Status Holding Register (MSHR) that supports hit-under-miss
 merging and out-of-order fill completion. SystemVerilog RTL, with a
-self-checking, directed testbench per module.
+self-checking testbench per module (directed tests, plus a
+constrained-random test for the cache controller).
 
 ## Architecture
 
@@ -55,7 +56,7 @@ and the data SRAM — conceptual, not cycle-accurate).
 | `cache_tag_array.sv` — tag + dirty bit, 4-way | Done | 8 directed tests, all passing |
 | `cache_valid_array.sv` — valid bit, 4-way, sync reset | Done | 8 directed tests, all passing |
 | `cache_data_sram.sv` — line data, 4-way | Done | 6 directed tests, all passing |
-| Cache controller | Not started (next up) | — |
+| `cache_controller.sv` — lookup, hit path, true-LRU state | Hit path + LRU done; miss handling (MSHR allocation, replay, fill/eviction) in progress | 10 tests (9 directed + 1 constrained-random), all passing |
 | Top-level cache integration | Not started | — |
 
 `mshr.sv` currently covers: single read/write miss fill, hit-under-miss
@@ -83,6 +84,20 @@ register directly without a lookup.
 `cache_data_sram.sv` currently covers: single-word hit-write readback,
 a same-cycle read/write collision, a fill-write overwriting stale data
 across all four words, way isolation, `wr_en` gating, and set isolation.
+
+`cache_controller.sv` currently covers (hit path; the three real arrays
+are instantiated, lines are installed through a TB preload mux, and the
+MSHR ports are tied idle): reset idle state, a single load hit with
+exact 2-cycle latency, a load hit on every way x word of a full set,
+valid gating (matching tag with valid = 0 misses), a store hit with a
+single masked word write and dirty 0 -> 1, the 1-cycle same-set
+read-after-write stall (and its absence otherwise), full one-per-cycle
+throughput, response back-pressure filling the 3-entry FIFO with a
+stable held response, a 500-request constrained-random load/store mix
+under random back-pressure (scoreboard-checked, with a read-after-write
+coverage floor and a reproducible `+seed`), and the true-LRU recency
+order after every kind of hit, including back-to-back same-set hits
+and the reported victim.
 
 ## Running the testbenches
 
@@ -112,6 +127,11 @@ iverilog -g2012 -o valid_tb.vvp rtl/cache_valid_array.sv tb/cache_valid_array_tb
 **`cache_data_sram_tb`** — requires Questa; its unpacked-array task
 ports aren't supported by Icarus Verilog's current SystemVerilog
 elaboration.
+
+**`cache_controller_tb`** — requires Questa (concurrent assertions,
+queues, `process::self().srandom`). The random test's seed can be set
+with `+seed=<n>` when invoking `vsim` directly (`run.sh` does not forward
+plusargs).
 
 ## Repo layout
 

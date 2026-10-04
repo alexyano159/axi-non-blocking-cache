@@ -240,12 +240,12 @@
       <rect x="20" y="250" width="110" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
       <text x="75" y="289" text-anchor="middle" class="boxtitle">CPU / CORE</text>
 
-      <!-- Controller (not yet designed) -->
+      <!-- Controller (MSHR path in progress) -->
       <rect x="190" y="190" width="190" height="190" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="6 4"></rect>
       <text x="285" y="235" text-anchor="middle" class="boxtitle">CACHE CONTROLLER</text>
       <text x="285" y="253" text-anchor="middle" class="boxsub">tag compare · way select</text>
       <text x="285" y="267" text-anchor="middle" class="boxsub">replacement policy</text>
-      <text x="285" y="345" text-anchor="middle" class="boxsub" font-style="italic">(not yet designed)</text>
+      <text x="285" y="345" text-anchor="middle" class="boxsub" font-style="italic">(MSHR path in progress)</text>
 
       <!-- Fill Engine -->
       <rect x="460" y="90" width="260" height="180" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
@@ -308,8 +308,8 @@
             <tr><th>Arrow</th><th>Signals</th></tr>
           </thead>
           <tbody>
-            <tr><td class="arrow">miss req</td><td class="sig">alloc_valid, alloc_addr, alloc_is_write, alloc_ready</td></tr>
-            <tr><td class="arrow">fill</td><td class="sig">fill_valid, fill_data, fill_id, fill_is_write, fill_ready</td></tr>
+            <tr><td class="arrow">miss req</td><td class="sig">alloc_valid, alloc_addr, alloc_is_write, alloc_ready, alloc_id</td></tr>
+            <tr><td class="arrow">fill</td><td class="sig">fill_valid, fill_id, fill_addr, fill_data, fill_is_write, fill_ready</td></tr>
             <tr><td class="arrow">evict</td><td class="sig">wb_valid, wb_addr, wb_data, wb_ready</td></tr>
             <tr><td class="arrow">done</td><td class="sig">wb_done (1-cycle pulse)</td></tr>
             <tr><td class="arrow">AR / R</td><td class="sig">arvalid, araddr, arid, arready / rvalid, rdata, rid, rlast, rready</td></tr>

@@ -1,12 +1,13 @@
 // -----------------------------------------------------------------------
 // Testbench for the cache controller (rtl/cache_controller.sv) --
-// hit-path scope.
+// hit-path and replacement-state (LRU) scope.
 //
 // The DUT is the controller wired to the real, already-verified
 // cache_tag_array, cache_valid_array and cache_data_sram, so any failure
 // here is attributable to the controller itself. The MSHR is not
-// instantiated: miss handling is not yet implemented, so its ports are
-// tied to an idle MSHR's values.
+// instantiated: miss handling is not yet implemented, so its inputs are
+// tied to an idle MSHR's values, except mshr_fill_addr, which test 10
+// drives to probe the LRU victim.
 //
 // Preload mode: with no fill path yet, lines can only become valid if
 // the TB installs them. While tb_preload = 1, a mux in front of each

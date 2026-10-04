@@ -3,7 +3,8 @@
 // -----------------------------------------------------------------------
 // Stores the raw data of every cache line: 4-way set-associative, 4 KB
 // total capacity. Holds ONLY line data -- no tags, valid bits, or dirty
-// bits, which live in the (separate) tag array.
+// bits. Tag and dirty live in cache_tag_array; valid bits live in
+// cache_valid_array.
 //
 // Two write sources are merged onto a single shared write port by the
 // cache controller, which is the only client of this module:
@@ -18,13 +19,14 @@
 // rd_set_idx is presented -- a registered read, matching the latency
 // of a real single-port SRAM macro (address sampled on the clock
 // edge, data available the following edge). Which way holds the
-// requested line is not known until the tag array (read in parallel,
-// elsewhere, with matching latency) reports the hit way.
+// requested line is not known until the controller combines the tag
+// array's tag_match with the valid array's valid_out (both read in
+// parallel, with matching latency) into the hit way.
 //
 // No reset: a physical SRAM macro has no reset pin, and clearing this
 // array synchronously in one cycle is not representative of real
 // hardware. Line data is undefined until written; correctness after
-// reset is guaranteed by the tag array's valid bits being cleared
+// reset is guaranteed by cache_valid_array's valid bits being cleared
 // there, not by this module.
 // -----------------------------------------------------------------------
 `default_nettype none

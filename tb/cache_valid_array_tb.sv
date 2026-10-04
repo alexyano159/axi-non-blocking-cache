@@ -35,7 +35,7 @@ module cache_valid_array_tb;
 
     // -------------------------------------------------------------------
     // Controller-side ports: driven by the TB, sampled from the DUT.
-    // The TB stands in for the (not yet designed) cache controller --
+    // The TB stands in for the cache controller (rtl/cache_controller.sv) --
     // the only client of this module.
     // -------------------------------------------------------------------
     logic                     rst_n;
@@ -441,8 +441,8 @@ module cache_valid_array_tb;
         // fresh lookup. Test 1 already proved reset clears the
         // underlying storage (observable via a lookup performed after
         // reset). This test isolates the other reset mechanism: the
-        // output register itself is forced to 0 the instant reset is
-        // asserted, even with no lookup performed at all -- so a stale,
+        // output register itself is forced to 0 on the first clock edge
+        // with reset asserted, even with no lookup performed at all -- so a stale,
         // non-zero valid_out left over from before reset can never be
         // observed, even for one cycle.
         // ---------------------------------------------------------------

@@ -15,8 +15,9 @@ once.
 |---|---|---|
 | `ADDR_WIDTH` | 32 | Width of an address |
 | `DATA_WIDTH` | 32 | Width of one beat of data (one word) |
-| `ID_WIDTH` | 4 | Width of the transaction ID → supports up to 16 outstanding transactions |
-| `STRB_WIDTH` | `DATA_WIDTH/8` = 4 | Byte-lane write mask width |
+| `ID_WIDTH` | 4 | Width of the transaction ID → supports up to 16 outstanding read transactions (the MSHR keeps one write outstanding, `awid = 0`) |
+
+`STRB_WIDTH` (derived localparam, not overridable) = `DATA_WIDTH/8` = 4 — byte-lane write mask width.
 
 ## The one rule that governs every channel
 

@@ -2,8 +2,9 @@
 // Testbench for the cache data SRAM (rtl/cache_data_sram.sv).
 //
 // This module has no ready/valid handshake and no reset: a write is a
-// guarantee, not a request (see rtl/cache_data_sram.sv header), so
-// there is nothing to negotiate and no reset state to check. Every
+// guarantee, not a request, so there is nothing to negotiate, and there
+// is no reset state to check (see rtl/cache_data_sram.sv header for why
+// there is no reset). Every
 // test here therefore follows the same shape -- write via the port,
 // then read the same (or a deliberately different) location back and
 // compare against a known value -- since a subsequent read is the
@@ -42,7 +43,7 @@ module cache_data_sram_tb;
 
     // -------------------------------------------------------------------
     // Controller-side ports: driven by the TB, sampled from the DUT.
-    // The TB stands in for the (not yet designed) cache controller --
+    // The TB stands in for the cache controller (rtl/cache_controller.sv) --
     // the only client of this module.
     // -------------------------------------------------------------------
     logic [SET_IDX_WIDTH-1:0] rd_set_idx;

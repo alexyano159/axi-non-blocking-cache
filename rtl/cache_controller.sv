@@ -9,7 +9,8 @@
 //
 // This module does not instantiate its four collaborators -- it exposes
 // ports that mirror each of their existing interfaces one-for-one, so a
-// separate top-level module wires the five together. Port groups are
+// separate top-level module (not yet written) will wire the five
+// together. Port groups are
 // prefixed (tag_/valid_/data_/mshr_) since each collaborator's generic
 // port names (wr_en, rd_set_idx, ...) would otherwise collide here.
 //
@@ -145,8 +146,9 @@ module cache_controller #(
     assign req_tag      = req_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH + SET_IDX_WIDTH +: TAG_WIDTH];
 
     // Drive the same decomposed address into all three arrays every
-    // cycle a request is accepted -- their registered outputs return
-    // together, one cycle later, so the controller can combine them.
+    // cycle; the result is consumed only for an accepted request (marked
+    // by lookup_q.valid). Their registered outputs return together, one
+    // cycle later, so the controller can combine them.
     assign tag_rd_set_idx   = req_set_idx;
     assign tag_lookup_tag   = req_tag;
     assign valid_rd_set_idx = req_set_idx;
@@ -405,7 +407,8 @@ module cache_controller #(
     //   1 entry  -- request accepted in the current cycle, since
     //               req_ready cannot react to a same-cycle resp_ready drop
     // Three entries sustain one response per cycle; two would be correct
-    // but would halve throughput.
+    // but would insert a bubble after every second request (2/3
+    // throughput), and a single entry would reach only 1/3.
     // -------------------------------------------------------------------
     localparam int RESP_FIFO_DEPTH = 3;
     localparam int RESP_PTR_WIDTH  = $clog2(RESP_FIFO_DEPTH);      // 2
@@ -508,8 +511,9 @@ module cache_controller #(
 `endif
 
     // -------------------------------------------------------------------
-    // PROGRESS MARKER -- steps 1-4 implemented and verified (tests 1-9),
-    // true-LRU replacement state added (2026-10-04).
+    // PROGRESS MARKER -- steps 1-4 implemented and verified (tests 1-9);
+    // true-LRU replacement state implemented and verified (test 10),
+    // 2026-10-04.
     //
     // Next RTL step, miss handling (approved: 16-entry table, replay):
     //   - on lookup_miss: drive mshr_alloc_* with the line-aligned address
@@ -520,6 +524,11 @@ module cache_controller #(
     //   - req_ready additionally requires (pending count + lookup_q.valid)
     //     < 16, which also guarantees mshr_alloc_ready (every busy MSHR
     //     entry has at least one waiting request); assert this.
+    //   - corner case to handle: a miss that merges into an MSHR entry in
+    //     the same cycle that entry's fill is handed off (FE_DONE ->
+    //     FE_IDLE, mshr.sv) receives an alloc_id whose fill has already
+    //     been presented. Such a request must not wait on that id; it
+    //     should be replayed (it will hit the just-installed line).
     // Then: fill/eviction (victim = invalid way first, else lru_victim_way;
     // fills become a second lru_upd_* source), with replay of pending
     // requests through the hit path (see DESIGN_DECISIONS.txt).

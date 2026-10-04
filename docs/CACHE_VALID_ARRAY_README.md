@@ -21,13 +21,16 @@ identically and read together with matching latency.
 Cache Controller  <---->  Cache Valid Array
 ```
 
-The cache controller (not yet built) is the **only** client. It is
-responsible for:
+The cache controller (`rtl/cache_controller.sv`) is the **only**
+client; it reaches this module through its `valid_`-prefixed port
+group. It is responsible for:
 - ANDing this module's `valid_out` with `cache_tag_array`'s raw
   `tag_match` to obtain the real hit/hit_way -- `tag_match` alone is
   meaningless for an entry that was never validly filled.
 - Driving this module's write port on a fill (mark the newly allocated
-  way valid) or an explicit invalidate (mark a way no longer resident).
+  way valid) -- added with the fill path; until then the controller
+  holds `wr_en` low. The invalidate encoding (`wr_valid = 0`) is
+  supported by the port but has no user in the controller yet.
 - No direct connection to the MSHR -- fill/invalidate requests reach
   this module only via the controller.
 
@@ -45,6 +48,9 @@ responsible for:
 | `wr_valid` | 1 | in | New valid value: `1` on a fill, `0` on an explicit invalidate. |
 
 ## Two write sources, one port
+
+Neither source is driven by the controller yet: the fill write is added
+with miss handling, and the invalidate encoding has no user so far.
 
 | Source | `wr_valid` | When |
 |---|---|---|
@@ -131,5 +137,6 @@ See `tb/cache_valid_array_tb.sv` -- 8 directed tests, verified with
    `valid_out` left showing a non-zero value, asserting reset for a
    single clock edge (no lookup performed) already reads back all-`0`.
    This isolates the *other* reset mechanism from test 1: the output
-   register is forced to `0` the instant reset is asserted, not only
-   once a subsequent read happens to return a cleared entry.
+   register is forced to `0` on the first clock edge that samples reset
+   asserted, not only once a subsequent read happens to return a
+   cleared entry.

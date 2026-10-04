@@ -19,7 +19,8 @@
 //      burst.
 //
 // These two responsibilities are implemented as two independent engines
-// that share the same AXI port:
+// on the same AXI interface, each owning its own channels (no channel is
+// shared or muxed between them):
 //   - Fill engine   : one small FSM per entry, arbitrated onto the AR
 //                     channel; reassembles R beats into a full line.
 //   - Writeback engine: a FIFO of evicted lines, drained one at a time
@@ -94,8 +95,9 @@ module mshr #(
     localparam logic [1:0]      BURST_INCR     = 2'b01;
 
     // Fixed-priority encoder: returns the lowest set bit index in `vec`.
-    // Used both to pick a free/matching MSHR entry and, elsewhere, as the
-    // fallback path of the AR arbiter. Result is meaningless when `vec`
+    // Used to pick a free/matching MSHR entry, inside the AR arbiter (both
+    // the above-last-grant scan and the wrap-around scan), and as the
+    // fill-completion mux. Result is meaningless when `vec`
     // is all zero; callers always gate on a separate "any bit set" signal.
     function automatic logic [ID_WIDTH-1:0] pick_lowest(input logic [NUM_ENTRIES-1:0] vec);
         pick_lowest = '0;

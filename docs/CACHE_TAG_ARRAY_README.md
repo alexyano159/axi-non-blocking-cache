@@ -23,14 +23,16 @@ with matching latency.
 Cache Controller  <---->  Cache Tag Array
 ```
 
-The cache controller (not yet built) is the **only** client. It is
-responsible for:
+The cache controller (`rtl/cache_controller.sv`) is the **only**
+client; it reaches this module through its `tag_`-prefixed port group.
+It is responsible for:
 - ANDing this module's raw `tag_match` with the (separate) valid
   array's output to obtain the real hit/hit_way -- `tag_match` alone
   is meaningless for an entry that was never validly filled.
-- Merging its two write sources (hit-write, fill-write) onto this
-  module's single write port -- this module has no arbitration logic
-  of its own.
+- Merging its two write sources onto this module's single write port:
+  the hit-write (dirty only) is implemented; the fill-write (tag +
+  dirty) is added with miss handling. This module has no arbitration
+  logic of its own.
 - No direct connection to the MSHR -- fill data reaches this module
   only via the controller.
 
@@ -52,6 +54,9 @@ responsible for:
 | `wr_dirty_en` | 1 | in | Gates the dirty field write independently of the tag field. |
 
 ## Two write sources, one port
+
+The controller currently drives only the hit write; the fill write is
+added with miss handling.
 
 | Source | `wr_tag_en` | `wr_dirty_en` | When |
 |---|---|---|---|
