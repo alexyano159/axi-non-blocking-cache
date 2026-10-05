@@ -441,7 +441,7 @@ module mshr_tb;
         end
 
         // ---------------------------------------------------------------
-        // Test 4: hit-under-miss merge.
+        // Test 4: secondary-miss merge.
         // A second miss to the same in-flight address must merge into the
         // existing MSHR entry instead of opening a new one (mshr.sv
         // fe_match_vec / fe_is_write OR-in). The primary access is a load
@@ -478,7 +478,7 @@ module mshr_tb;
                 else if (got_is_write !== 1'b1)
                     $error("[FAIL] test 4: fill_is_write = %0d, expected 1 (merged store must dirty the line)", got_is_write);
                 else
-                    $display("[PASS] test 4: hit-under-miss merge preserved id and dirty flag");
+                    $display("[PASS] test 4: secondary-miss merge preserved id and dirty flag");
             end
         end
 

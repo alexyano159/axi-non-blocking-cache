@@ -26,7 +26,7 @@ miss. From there:
 2. MSHR checks: does any occupied entry (still fetching, or finished but
    not yet handed back) already hold this exact address?
    - **Yes** → merge into it (`alloc_id` = that entry's index). No new
-     AXI traffic — this is the hit-under-miss case.
+     AXI traffic — this is a secondary miss (also called an MSHR hit).
    - **No, and a slot is free** → open a new entry, issue an AXI read
      burst (`AR`/`R`) for the line.
    - **No slot free either** → `alloc_ready = 0`, controller stalls.

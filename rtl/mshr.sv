@@ -10,7 +10,7 @@
 //      MSHR fetches the line over an AXI read burst and, if a second
 //      miss to the same in-flight address arrives before the first
 //      completes, merges it into the same entry rather than issuing a
-//      redundant request ("hit-under-miss"). Up to NUM_ENTRIES misses
+//      redundant request (secondary-miss merging). Up to NUM_ENTRIES misses
 //      can be outstanding simultaneously, one per AXI transaction ID.
 //
 //   2. Victim writeback: when the controller evicts a dirty line to make
@@ -150,7 +150,7 @@ module mshr #(
     assign fe_free_idx  = pick_lowest(fe_free_vec);
 
     // Allocation decision, combinational: a merge into an in-flight entry
-    // is always preferred over opening a new one (hit-under-miss). The
+    // is always preferred over opening a new one (secondary-miss merge). The
     // controller stalls only when there is neither a match nor a free
     // entry.
     assign alloc_ready = fe_any_match | fe_any_free;

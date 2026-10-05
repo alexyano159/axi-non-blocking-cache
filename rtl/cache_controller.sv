@@ -16,10 +16,11 @@
 //
 // CPU-facing interface: tagged, multi-outstanding. req_id/resp_id let
 // several CPU requests be in flight at once and be answered out of
-// order -- this is what actually exercises the MSHR's hit-under-miss /
-// 16-entry non-blocking design; a single-outstanding interface would
-// leave that capability unused, since the CPU would stall on every miss
-// regardless of how many MSHR entries exist.
+// order -- this is what enables hit-under-miss (later hits served while
+// a miss is pending) and exercises the MSHR's 16-entry non-blocking
+// design; a single-outstanding interface would leave that capability
+// unused, since the CPU would stall on every miss regardless of how
+// many MSHR entries exist.
 //
 // Work in progress: address decomposition, the lookup shadow register,
 // hit/miss detection and the hit completion path (load-hit response,

@@ -1,7 +1,7 @@
 # axi-non-blocking-cache
 
 A non-blocking L1 data cache with AXI4 memory access, built around a
-Miss Status Holding Register (MSHR) that supports hit-under-miss
+Miss Status Holding Register (MSHR) that supports secondary-miss
 merging and out-of-order fill completion. SystemVerilog RTL, with a
 self-checking testbench per module (directed tests, plus a
 constrained-random test for the cache controller).
@@ -13,7 +13,7 @@ constrained-random test for the cache controller).
 | Associativity | 4-way set-associative |
 | Line size | 4 words (128 bits), matching the AXI burst length |
 | Write policy | Write-back, write-allocate |
-| Miss handling | Non-blocking via a fully-associative MSHR, up to 16 outstanding misses, with hit-under-miss merging |
+| Miss handling | Non-blocking via a fully-associative MSHR, up to 16 outstanding misses, with secondary-miss merging |
 | Replacement policy | True LRU (2-bit age per way, 8 bits per set); invalid ways filled first; victim chosen at fill time |
 
 The cache and the MSHR use two different addressing schemes on purpose:
@@ -59,7 +59,7 @@ and the data SRAM — conceptual, not cycle-accurate).
 | `cache_controller.sv` — lookup, hit path, true-LRU state | Hit path + LRU done; miss handling (MSHR allocation, replay, fill/eviction) in progress | 10 tests (9 directed + 1 constrained-random), all passing |
 | Top-level cache integration | Not started | — |
 
-`mshr.sv` currently covers: single read/write miss fill, hit-under-miss
+`mshr.sv` currently covers: single read/write miss fill, secondary-miss
 merge, single victim writeback, MSHR-full stall and recovery,
 round-robin fairness of the AXI read-address arbiter, writeback-queue-full
 stall and recovery, fixed-priority ordering of the fill-completion mux,
