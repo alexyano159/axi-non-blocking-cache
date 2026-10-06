@@ -56,7 +56,7 @@ and the data SRAM — conceptual, not cycle-accurate).
 | `cache_tag_array.sv` — tag + dirty bit, 4-way | Done | 8 directed tests, all passing |
 | `cache_valid_array.sv` — valid bit, 4-way, sync reset | Done | 8 directed tests, all passing |
 | `cache_data_sram.sv` — line data, 4-way | Done | 6 directed tests, all passing |
-| `cache_controller.sv` — lookup, hit path, true-LRU state | Hit path + LRU done; miss handling (MSHR allocation, replay, fill/eviction) in progress | 10 tests (9 directed + 1 constrained-random), all passing |
+| `cache_controller.sv` — lookup, hit path, true-LRU state, miss allocation + waiting table | Hit path + LRU done; miss side (MSHR allocation, waiting table, back-pressure) done; fill/eviction + replay in progress | 10 tests (9 directed + 1 constrained-random), all passing |
 | Top-level cache integration | Not started | — |
 
 `mshr.sv` currently covers: single read/write miss fill, secondary-miss
@@ -85,17 +85,21 @@ register directly without a lookup.
 a same-cycle read/write collision, a fill-write overwriting stale data
 across all four words, way isolation, `wr_en` gating, and set isolation.
 
-`cache_controller.sv` currently covers (hit path; the three real arrays
-are instantiated, lines are installed through a TB preload mux, and the
-MSHR ports are tied idle): reset idle state, a single load hit with
+`cache_controller.sv` currently covers (hit path and miss allocation; the
+three real arrays are instantiated, lines are installed through a TB
+preload mux, and the MSHR inputs are tied to an MSHR that accepts every
+miss and never fills): reset idle state, a single load hit with
 exact 2-cycle latency, a load hit on every way x word of a full set,
-valid gating (matching tag with valid = 0 misses), a store hit with a
+valid gating (matching tag with valid = 0 misses, reported to the MSHR
+as one line-aligned allocation), a store hit with a
 single masked word write and dirty 0 -> 1, the 1-cycle same-set
 read-after-write stall (and its absence otherwise), full one-per-cycle
 throughput, response back-pressure filling the 3-entry FIFO with a
 stable held response, a 500-request constrained-random load/store mix
-under random back-pressure (scoreboard-checked, with a read-after-write
-coverage floor and a reproducible `+seed`), and the true-LRU recency
+under random back-pressure (scoreboard-checked, every miss's MSHR
+allocation checked, with a read-after-write coverage floor and a
+reproducible `+seed`; misses temporarily capped at 14 until fills
+release waiting-table slots), and the true-LRU recency
 order after every kind of hit, including back-to-back same-set hits
 and the reported victim.
 
