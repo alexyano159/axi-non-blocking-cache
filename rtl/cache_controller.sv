@@ -24,10 +24,11 @@
 //
 // Work in progress: address decomposition, the lookup shadow register,
 // hit/miss detection and the hit completion path (load-hit response,
-// store-hit write, read-after-write stall, response FIFO) and the
-// true-LRU replacement state (updated on hits) are implemented; miss
-// handling via the MSHR and fill/eviction sequencing are added in later
-// steps.
+// store-hit write, read-after-write stall, response FIFO), the true-LRU
+// replacement state (updated on hits), and the miss side of miss
+// handling (MSHR allocation, waiting table with age-ordered slots,
+// waiting-table back-pressure) are implemented; fill/eviction
+// sequencing and replay of waiting requests are added in later steps.
 // -----------------------------------------------------------------------
 `default_nettype none
 
@@ -45,7 +46,9 @@ module cache_controller #(
                                     - WORD_OFF_WIDTH - BYTE_OFF_WIDTH, // 22
     parameter int LINE_WIDTH     = DATA_WIDTH * WORDS_PER_LINE, // 128
     parameter int MSHR_ID_WIDTH  = 4,                          // matches mshr.sv ID_WIDTH
-    parameter int TXN_ID_WIDTH   = 4                           // width of the CPU-side transaction tag
+    parameter int TXN_ID_WIDTH   = 4,                          // width of the CPU-side transaction tag
+    parameter int WAIT_DEPTH     = 2 ** TXN_ID_WIDTH,          // 16 -- waiting-table slots (one per possible CPU id)
+    parameter int WAIT_IDX_WIDTH = $clog2(WAIT_DEPTH)          // 4
 ) (
     input  wire logic clk,
     input  wire logic rst_n,  // active-low, synchronous reset
@@ -475,29 +478,183 @@ module cache_controller #(
     assign resp_we    = resp_mem[resp_rd_ptr].we;
 
     // -------------------------------------------------------------------
-    // Request acceptance
-    // Accept only when (a) the FIFO is guaranteed a free slot for this
-    // request's result, assuming no pops occur in the meantime, and
-    // (b) the request does not collide with a same-cycle array write.
-    // (a) counts the stored entries plus the one result already in the
-    // lookup stage; the new request needs one further slot.
+    // Miss allocation (lookup stage, cycle N+1)
+    // A miss is reported to the MSHR in the same cycle it is detected.
+    // The MSHR tracks whole lines, so the address is line-aligned (word
+    // and byte offset cleared): two misses to different words of one
+    // line then present identical addresses and merge into one entry.
+    //
+    // The lookup stage cannot hold a request -- the arrays overwrite
+    // their outputs on the next cycle -- so the allocation must succeed
+    // in the cycle it is issued. alloc_ready is therefore not waited on
+    // but guaranteed by the acceptance rule (req_ready), and asserted
+    // below. alloc_id is returned combinationally in the same cycle and
+    // is recorded together with the missed request.
     // -------------------------------------------------------------------
-    logic resp_space;
+    localparam int LINE_OFF_WIDTH = WORD_OFF_WIDTH + BYTE_OFF_WIDTH;   // 4 -- byte-within-line offset
+
+    assign mshr_alloc_valid    = lookup_miss;
+    assign mshr_alloc_addr     = {lookup_q.addr[ADDR_WIDTH-1:LINE_OFF_WIDTH], LINE_OFF_WIDTH'(0)};
+    assign mshr_alloc_is_write = lookup_q.we;
+
+`ifndef SYNTHESIS
+    // The acceptance rule must guarantee that a miss is always accepted
+    // by the MSHR; a violation would silently lose the miss.
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     mshr_alloc_valid |-> mshr_alloc_ready)
+        else $error("cache_controller: MSHR could not accept miss to 0x%08h (no free or matching entry)",
+                    mshr_alloc_addr);
+`endif
+
+    // -------------------------------------------------------------------
+    // Waiting table (lookup stage, cycle N+1)
+    // The MSHR tracks lines, not requests: on a merge it retains only the
+    // line address and an OR-ed store flag. Every missed request is
+    // therefore parked here with everything needed to re-run it through
+    // the hit path once its line is installed (replay): the full address,
+    // load/store, store data, CPU id, and the MSHR entry it waits on.
+    //
+    // Storage is in flip-flops: on a fill, every slot must be compared
+    // against the filling MSHR id in parallel, and several slots may
+    // match (merged requests). A new miss takes the lowest-indexed free
+    // slot. Slots are released by the replay logic (added with the fill
+    // path); until then a slot, once taken, stays occupied.
+    //
+    // WAIT_DEPTH defaults to 2**TXN_ID_WIDTH, the maximum number of
+    // distinct CPU requests that can be outstanding, so the table never
+    // limits the CPU in normal operation.
+    // -------------------------------------------------------------------
+    typedef struct packed {
+        logic [ADDR_WIDTH-1:0]    addr;      // full request address (tag, set, word offset)
+        logic                     we;        // 1 = store
+        logic [DATA_WIDTH-1:0]    wdata;     // store data (don't-care for a load)
+        logic [TXN_ID_WIDTH-1:0]  id;        // CPU transaction id, echoed in the response
+        logic [MSHR_ID_WIDTH-1:0] mshr_id;   // MSHR entry whose fill this request waits on
+    } wait_entry_t;
+
+    wait_entry_t               wait_mem   [WAIT_DEPTH];
+    logic [WAIT_DEPTH-1:0]     wait_valid;              // slot occupied
+    logic                      wait_alloc;              // park the request in the lookup stage this cycle
+    logic                      wait_any_free;
+    logic [WAIT_IDX_WIDTH-1:0] wait_free_idx;           // lowest-indexed free slot
+
+    assign wait_alloc    = lookup_miss;
+    assign wait_any_free = !(&wait_valid);
+
+    // Lowest-index free-slot encoder. The result is meaningless when no
+    // slot is free; the acceptance rule guarantees that a miss never
+    // finds the table full (asserted below).
+    always_comb begin
+        wait_free_idx = '0;
+        for (int i = WAIT_DEPTH - 1; i >= 0; i--) begin
+            if (!wait_valid[i]) wait_free_idx = WAIT_IDX_WIDTH'(i);
+        end
+    end
+
+    // -------------------------------------------------------------------
+    // Age matrix (replay ordering)
+    // Requests merged onto one line must replay in arrival order: a load
+    // behind a store to the same word must observe that store. Slot
+    // indices do not encode age, since slots are released and reused out
+    // of order; a per-slot timestamp would wrap, as a slot may wait for
+    // an unbounded time while others turn over.
+    //
+    // wait_older[i][j] = 1 means slot j was allocated before slot i. Only
+    // the relative order of live slots is stored, so nothing can wrap:
+    //   - on allocating slot i, row i <- wait_valid: every slot occupied
+    //     now is older than the new request;
+    //   - column i is cleared in every row at the same time: whatever an
+    //     earlier occupant of slot i was older than, the new occupant is
+    //     younger than all of them.
+    // Bits involving a free slot are stale but harmless, since every
+    // reader masks with wait_valid. The replay selector (fill step) picks
+    // the matching slot whose row has no matching older slot.
+    // Cost: WAIT_DEPTH x WAIT_DEPTH = 256 flip-flops at the default.
+    // -------------------------------------------------------------------
+    logic [WAIT_DEPTH-1:0] wait_older [WAIT_DEPTH];
+
+    // Payload and age matrix: no reset, since every bit is written at
+    // allocation before it can be observed through wait_valid.
+    always_ff @(posedge clk) begin
+        if (wait_alloc) begin
+            wait_mem[wait_free_idx] <= '{addr:    lookup_q.addr,
+                                         we:      lookup_q.we,
+                                         wdata:   lookup_q.wdata,
+                                         id:      lookup_q.id,
+                                         mshr_id: mshr_alloc_id};
+            for (int k = 0; k < WAIT_DEPTH; k++)
+                wait_older[k][wait_free_idx] <= 1'b0;
+            wait_older[wait_free_idx] <= wait_valid;   // the slot itself is free, so its own bit is 0
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            wait_valid <= '0;
+        end else if (wait_alloc) begin
+            wait_valid[wait_free_idx] <= 1'b1;
+        end
+    end
+
+`ifndef SYNTHESIS
+    // Elaboration check: the MSHR-acceptance argument (see Request
+    // acceptance) requires at least as many MSHR entries as slots.
+    initial begin
+        if (WAIT_DEPTH > 2 ** MSHR_ID_WIDTH)
+            $fatal(1, "cache_controller: WAIT_DEPTH (%0d) exceeds the MSHR entry count (%0d)",
+                   WAIT_DEPTH, 2 ** MSHR_ID_WIDTH);
+    end
+
+    // The acceptance rule must guarantee a free slot for every miss; a
+    // violation would overwrite a waiting request.
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     wait_alloc |-> wait_any_free)
+        else $error("cache_controller: waiting table full on miss to 0x%08h (id %0d)",
+                    lookup_q.addr, lookup_q.id);
+`endif
+
+    // -------------------------------------------------------------------
+    // Request acceptance
+    // Accept only when
+    //   (a) the FIFO is guaranteed a free slot for this request's result,
+    //       assuming no pops occur in the meantime;
+    //   (b) the waiting table is guaranteed a free slot, should this
+    //       request miss;
+    //   (c) the request does not collide with a same-cycle array write.
+    // (a) and (b) both count the occupied entries plus the one request
+    // already in the lookup stage, whose outcome is not yet known and is
+    // therefore assumed to consume an entry; the new request needs one
+    // further entry. The rule is conservative: with WAIT_DEPTH-1 slots
+    // occupied, a request behind an in-flight lookup waits one cycle even
+    // if that lookup turns out to hit.
+    //
+    // (b) also guarantees that the MSHR can accept every miss: an MSHR
+    // entry stays busy only while at least one waiting-table slot refers
+    // to it, so busy MSHR entries never outnumber occupied slots. When a
+    // miss is allocated, at most WAIT_DEPTH-1 other slots are occupied,
+    // leaving an MSHR entry free (WAIT_DEPTH <= 2**MSHR_ID_WIDTH).
+    // -------------------------------------------------------------------
+    logic                    resp_space;
+    logic [WAIT_IDX_WIDTH:0] wait_count;   // occupied slots, 0..WAIT_DEPTH
+    logic                    wait_space;
 
     // Evaluated one bit wider than resp_count so the sum cannot wrap.
     assign resp_space = ({1'b0, resp_count} + (RESP_CNT_WIDTH+1)'(lookup_q.valid))
                         < (RESP_CNT_WIDTH+1)'(RESP_FIFO_DEPTH);
-    assign req_ready  = resp_space && !raw_hazard;
+
+    // wait_count is one bit wider than a slot index, so it holds
+    // WAIT_DEPTH itself; the sum with lookup_q.valid is widened once more.
+    assign wait_count = (WAIT_IDX_WIDTH+1)'($countones(wait_valid));
+    assign wait_space = ({1'b0, wait_count} + (WAIT_IDX_WIDTH+2)'(lookup_q.valid))
+                        < (WAIT_IDX_WIDTH+2)'(WAIT_DEPTH);
+
+    assign req_ready  = resp_space && wait_space && !raw_hazard;
 
     // -------------------------------------------------------------------
     // MSHR port tie-offs
-    // Miss allocation, writeback and fill handling are added in the next
-    // steps; until then the controller issues nothing to the MSHR and
-    // accepts no fills (none can occur, since no miss is allocated).
+    // Writeback and fill handling are added in later steps; until then
+    // the controller issues no writebacks and accepts no fills.
     // -------------------------------------------------------------------
-    assign mshr_alloc_valid    = 1'b0;
-    assign mshr_alloc_addr     = '0;
-    assign mshr_alloc_is_write = 1'b0;
     assign mshr_wb_valid       = 1'b0;
     assign mshr_wb_addr        = '0;
     assign mshr_wb_data        = '0;
@@ -514,17 +671,12 @@ module cache_controller #(
     // -------------------------------------------------------------------
     // PROGRESS MARKER -- steps 1-4 implemented and verified (tests 1-9);
     // true-LRU replacement state implemented and verified (test 10),
-    // 2026-10-04.
+    // 2026-10-04. Miss side implemented (MSHR allocation, waiting table +
+    // age matrix, waiting-table back-pressure); tests 4, 9, 10 updated to
+    // check allocations, 2026-10-06.
     //
-    // Next RTL step, miss handling (approved: 16-entry table, replay):
-    //   - on lookup_miss: drive mshr_alloc_* with the line-aligned address
-    //     and is_write; record the returned mshr_alloc_id.
-    //   - pending-request (replay) table, 16 entries (bounded by the 4-bit
-    //     CPU id): each holds the missed request (addr, we, wdata, id)
-    //     and the MSHR entry it waits on.
-    //   - req_ready additionally requires (pending count + lookup_q.valid)
-    //     < 16, which also guarantees mshr_alloc_ready (every busy MSHR
-    //     entry has at least one waiting request); assert this.
+    // Next: a dedicated waiting-table test (slot contents, age matrix,
+    // back-pressure at WAIT_DEPTH, hit-under-miss), then fill/replay:
     //   - corner case to handle: a miss that merges into an MSHR entry in
     //     the same cycle that entry's fill is handed off (FE_DONE ->
     //     FE_IDLE, mshr.sv) receives an alloc_id whose fill has already
