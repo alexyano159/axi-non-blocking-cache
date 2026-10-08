@@ -2305,6 +2305,144 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
+        // Test 12: hit-under-miss.
+        // The defining property of a non-blocking cache: while misses are
+        // outstanding, requests to resident lines complete as if no miss
+        // were pending -- accepted on consecutive edges, answered with the
+        // usual fixed latency and correct data, and therefore out of order
+        // with respect to the earlier, still-pending misses.
+        //
+        // Stimulus: twelve back-to-back requests interleaving four misses
+        // (three lines, one secondary miss) with eight hits:
+        //   - a hit directly behind a miss to the same set;
+        //   - a hit directly behind a store miss to the same set, which
+        //     must not stall: a store miss writes no array, so it creates
+        //     no read-after-write hazard (only a store hit does);
+        //   - a store hit while misses are pending, and a later load of
+        //     the same word, which must observe the stored value;
+        //   - CPU ids non-sequential, so a response carrying a pending
+        //     miss's id would be detected.
+        // The order is chosen so that no request directly follows a store
+        // hit to its own set: every gap must be exactly one edge.
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned T12_N      = 12;
+            localparam int unsigned T12_HITS   = 8;
+            localparam int unsigned T12_MISSES = T12_N - T12_HITS;
+
+            logic [SET_IDX_WIDTH-1:0] set_a, set_b, set_c;
+            logic [TAG_WIDTH-1:0]     tag_h0, tag_h1, tag_h2;      // resident lines
+            logic [TAG_WIDTH-1:0]     tag_m1, tag_m2, tag_m3;      // missing lines
+            int unsigned              acc [T12_N];
+            int unsigned              miss_base;
+            int unsigned              errors;
+
+            logic [ADDR_WIDTH-1:0]    rq_addr  [T12_N];
+            logic                     rq_we    [T12_N];
+            logic [DATA_WIDTH-1:0]    rq_wdata [T12_N];
+            logic [TXN_ID_WIDTH-1:0]  rq_id    [T12_N];
+            logic [TXN_ID_WIDTH-1:0]  miss_ids [$];                // CPU ids of the misses, in issue order
+
+            reset_dut_and_model();
+
+            set_a  = 6'd30;
+            set_b  = 6'd31;
+            set_c  = 6'd32;
+            tag_h0 = 22'h0D0000;   // resident: set A, way 0
+            tag_h1 = 22'h0D1111;   // resident: set A, way 1
+            tag_h2 = 22'h0D2222;   // resident: set B, way 2
+            tag_m1 = 22'h0E1111;   // missing:  set A
+            tag_m2 = 22'h0E2222;   // missing:  set B
+            tag_m3 = 22'h0E3333;   // missing:  set C (empty set)
+            errors = 0;
+
+            //            address                              we    wdata                 CPU id
+            rq_addr[ 0] = make_addr(tag_m1, set_a, 2'd0); rq_we[ 0] = 1'b0; rq_wdata[ 0] = '0;            rq_id[ 0] = 4'd2;   // miss M1
+            rq_addr[ 1] = make_addr(tag_h0, set_a, 2'd1); rq_we[ 1] = 1'b0; rq_wdata[ 1] = '0;            rq_id[ 1] = 4'd5;   // hit, same set as pending M1
+            rq_addr[ 2] = make_addr(tag_h2, set_b, 2'd3); rq_we[ 2] = 1'b0; rq_wdata[ 2] = '0;            rq_id[ 2] = 4'd8;   // hit
+            rq_addr[ 3] = make_addr(tag_m2, set_b, 2'd1); rq_we[ 3] = 1'b1; rq_wdata[ 3] = 32'hDA7A_1203; rq_id[ 3] = 4'd11;  // store miss M2
+            rq_addr[ 4] = make_addr(tag_h2, set_b, 2'd0); rq_we[ 4] = 1'b0; rq_wdata[ 4] = '0;            rq_id[ 4] = 4'd1;   // hit, same set behind store miss: no stall
+            rq_addr[ 5] = make_addr(tag_h1, set_a, 2'd2); rq_we[ 5] = 1'b1; rq_wdata[ 5] = 32'hDA7A_1205; rq_id[ 5] = 4'd14;  // store hit under miss
+            rq_addr[ 6] = make_addr(tag_h2, set_b, 2'd2); rq_we[ 6] = 1'b0; rq_wdata[ 6] = '0;            rq_id[ 6] = 4'd6;   // hit, other set than the store
+            rq_addr[ 7] = make_addr(tag_h1, set_a, 2'd2); rq_we[ 7] = 1'b0; rq_wdata[ 7] = '0;            rq_id[ 7] = 4'd9;   // hit, reads the word stored by request 5
+            rq_addr[ 8] = make_addr(tag_m1, set_a, 2'd3); rq_we[ 8] = 1'b0; rq_wdata[ 8] = '0;            rq_id[ 8] = 4'd0;   // secondary miss on M1
+            rq_addr[ 9] = make_addr(tag_h0, set_a, 2'd0); rq_we[ 9] = 1'b0; rq_wdata[ 9] = '0;            rq_id[ 9] = 4'd13;  // hit
+            rq_addr[10] = make_addr(tag_m3, set_c, 2'd2); rq_we[10] = 1'b0; rq_wdata[10] = '0;            rq_id[10] = 4'd4;   // miss M3
+            rq_addr[11] = make_addr(tag_h2, set_b, 2'd1); rq_we[11] = 1'b0; rq_wdata[11] = '0;            rq_id[11] = 4'd15;  // hit, last: behind three pending lines
+
+            preload_line(set_a, 2'd0, tag_h0, {32'hA0A0_0003, 32'hA0A0_0002, 32'hA0A0_0001, 32'hA0A0_0000});
+            preload_line(set_a, 2'd1, tag_h1, {32'hA1A1_0003, 32'hA1A1_0002, 32'hA1A1_0001, 32'hA1A1_0000});
+            preload_line(set_b, 2'd2, tag_h2, {32'hB2B2_0003, 32'hB2B2_0002, 32'hB2B2_0001, 32'hB2B2_0000});
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            wb_req_cnt = 0;
+            miss_base  = miss_cnt;
+            resp_ready = 1'b1;
+
+            // Issue all twelve on consecutive edges. The scoreboard decides
+            // hit/miss; the misses' ids are recorded for the slot check.
+            for (int i = 0; i < T12_N; i++) begin
+                if (!model_hit(rq_addr[i]))
+                    miss_ids.push_back(rq_id[i]);
+                sb_access(rq_addr[i], rq_we[i], rq_wdata[i], rq_id[i], acc[i]);
+            end
+            for (int i = 1; i < T12_N; i++)
+                check_gap($sformatf("test 12 request %0d -> %0d", i - 1, i), acc[i-1], acc[i], 1, errors);
+
+            repeat (HIT_LATENCY + 2) @(posedge clk);
+            #1;
+
+            // Guard on the stimulus itself: the scoreboard must have
+            // classified the requests as intended, or the checks below
+            // would verify a different scenario.
+            if (exp_log.size() != T12_HITS || miss_ids.size() != T12_MISSES) begin
+                $error("[FAIL] test 12: stimulus classified as %0d hits / %0d misses, intended %0d / %0d",
+                       exp_log.size(), miss_ids.size(), T12_HITS, T12_MISSES);
+                errors++;
+            end
+
+            // Every hit answered with exact latency and correct data, in
+            // issue order among hits; no response for any pending miss.
+            check_responses("test 12", errors);
+
+            // The misses are parked, in issue order, in slots 0..3.
+            if (dut.wait_valid !== WAIT_DEPTH'((1 << T12_MISSES) - 1)) begin
+                $error("[FAIL] test 12: wait_valid = %b, expected %b",
+                       dut.wait_valid, WAIT_DEPTH'((1 << T12_MISSES) - 1));
+                errors++;
+            end
+            foreach (miss_ids[i]) begin
+                if (dut.wait_mem[i].id !== miss_ids[i]) begin
+                    $error("[FAIL] test 12: slot %0d holds CPU id %0d, expected %0d",
+                           i, dut.wait_mem[i].id, miss_ids[i]);
+                    errors++;
+                end
+            end
+
+            // Side effects: one array write (the store hit; a store miss
+            // writes nothing), one MSHR allocation per miss.
+            if (wr_log.size() != 1) begin
+                $error("[FAIL] test 12: %0d cycles with array writes, expected 1 (the store hit)",
+                       wr_log.size());
+                errors++;
+            end
+            if (miss_cnt - miss_base != T12_MISSES) begin
+                $error("[FAIL] test 12: %0d lookups classified as miss, expected %0d",
+                       miss_cnt - miss_base, T12_MISSES);
+                errors++;
+            end
+            check_allocs("test 12", errors);
+
+            if (errors == 0)
+                $display("[PASS] test 12: %0d hits served under %0d pending misses -- no stall (incl. same-set hits behind a miss and a store miss), exact 2-cycle latency, correct data incl. store hit readback, misses parked",
+                         T12_HITS, T12_MISSES);
+        end
+
+        // ---------------------------------------------------------------
         // PROGRESS MARKER -- tests 1-10 implemented and passing (2026-10-04);
         // tests 4, 9, 10 updated for MSHR allocation on miss (2026-10-06).
         // Test infrastructure now available: make_addr, preload_line,
@@ -2318,8 +2456,9 @@ module cache_controller_tb;
         // Test 11 (waiting-table contents + age matrix) added 2026-10-08,
         // with the MSHR allocation stub (per-line ids, merges).
         //
-        // Next: test 12 (hit-under-miss), test 13 (waiting table full /
-        // back-pressure). Test 9's miss cap (T9_MAX_MISSES) is temporary
+        // Test 12 (hit-under-miss) added 2026-10-08.
+        //
+        // Next: test 13 (waiting table full / back-pressure). Test 9's miss cap (T9_MAX_MISSES) is temporary
         // and is removed once fills release waiting slots.
         // ---------------------------------------------------------------
 
