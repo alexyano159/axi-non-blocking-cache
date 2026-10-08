@@ -1,13 +1,16 @@
 // -----------------------------------------------------------------------
 // Testbench for the cache controller (rtl/cache_controller.sv) --
-// hit-path and replacement-state (LRU) scope.
+// hit path, replacement state (LRU) and miss side (waiting table).
 //
 // The DUT is the controller wired to the real, already-verified
 // cache_tag_array, cache_valid_array and cache_data_sram, so any failure
 // here is attributable to the controller itself. The MSHR is not
-// instantiated: miss handling is not yet implemented, so its inputs are
-// tied to an idle MSHR's values, except mshr_fill_addr, which test 10
-// drives to probe the LRU victim.
+// instantiated: only the miss side of miss handling exists so far, so
+// its inputs are tied to an MSHR that accepts every allocation and never
+// fills, except mshr_fill_addr, which test 10 drives to probe the LRU
+// victim, and mshr_alloc_id, which a small stub assigns per line as the
+// real MSHR would. Allocations the controller issues are logged and
+// checked.
 //
 // Preload mode: with no fill path yet, lines can only become valid if
 // the TB installs them. While tb_preload = 1, a mux in front of each
@@ -35,11 +38,13 @@ module cache_controller_tb;
     localparam int WAY_WIDTH      = $clog2(NUM_WAYS);                         // 2
     localparam int WORD_OFF_WIDTH = $clog2(WORDS_PER_LINE);                   // 2
     localparam int BYTE_OFF_WIDTH = $clog2(DATA_WIDTH / 8);                   // 2
+    localparam int LINE_OFF_WIDTH = WORD_OFF_WIDTH + BYTE_OFF_WIDTH;          // 4
     localparam int TAG_WIDTH      = ADDR_WIDTH - SET_IDX_WIDTH
                                      - WORD_OFF_WIDTH - BYTE_OFF_WIDTH;        // 22
     localparam int LINE_WIDTH     = DATA_WIDTH * WORDS_PER_LINE;              // 128
     localparam int MSHR_ID_WIDTH  = 4;
     localparam int TXN_ID_WIDTH   = 4;
+    localparam int WAIT_DEPTH     = 2 ** TXN_ID_WIDTH;                        // 16 -- waiting-table slots
 
     localparam time CLK_PERIOD = 10ns;
 
@@ -139,6 +144,7 @@ module cache_controller_tb;
     // mshr_fill_addr is a variable rather than a constant: with
     // mshr_fill_valid = 0 it carries no fill, but it selects the set whose
     // LRU victim the controller computes, which test 10 probes.
+    // mshr_alloc_id is driven by the allocation stub below.
     // -------------------------------------------------------------------
     logic                     mshr_alloc_valid;
     logic [ADDR_WIDTH-1:0]    mshr_alloc_addr;
@@ -149,7 +155,7 @@ module cache_controller_tb;
     logic                     mshr_fill_ready;
 
     wire logic                     mshr_alloc_ready  = 1'b1;
-    wire logic [MSHR_ID_WIDTH-1:0] mshr_alloc_id     = '0;
+    logic      [MSHR_ID_WIDTH-1:0] mshr_alloc_id;            // driven by the allocation stub
     wire logic                     mshr_wb_ready     = 1'b1;
     wire logic                     mshr_wb_done      = 1'b0;
     wire logic                     mshr_fill_valid   = 1'b0;
@@ -157,6 +163,43 @@ module cache_controller_tb;
     logic      [ADDR_WIDTH-1:0]    mshr_fill_addr    = '0;   // TB-driven: selects the set for the LRU victim probe (test 10)
     wire logic [LINE_WIDTH-1:0]    mshr_fill_data    = '0;
     wire logic                     mshr_fill_is_write = 1'b0;
+
+    // -------------------------------------------------------------------
+    // MSHR allocation stub.
+    // Reproduces the entry ids the real MSHR would return, without its
+    // fill machinery: the first miss to a line is given the next unused
+    // id; a further miss to a line already allocated (secondary miss) is
+    // given that line's id, as the MSHR's merge path does. Ids start at
+    // MSHR_STUB_ID_BASE rather than 0, so that an id recorded by the
+    // controller cannot coincide with its waiting-table slot index by
+    // construction. Entries are never released (no fills); the stub is
+    // cleared by reset, as the waiting table is.
+    //
+    // The id the controller samples on an allocation edge must be the
+    // pre-edge value. stub_next_id is updated non-blockingly for that
+    // reason. The line table is written blockingly (Questa does not
+    // support non-blocking writes to associative-array elements); this is
+    // race-free, since the entry written equals the id already being
+    // driven for that line, so mshr_alloc_id does not change on the edge.
+    // -------------------------------------------------------------------
+    localparam logic [MSHR_ID_WIDTH-1:0] MSHR_STUB_ID_BASE = 4'd5;
+
+    logic [MSHR_ID_WIDTH-1:0] stub_line_id [logic [ADDR_WIDTH-1:0]];   // line address -> MSHR id
+    logic [MSHR_ID_WIDTH-1:0] stub_next_id = MSHR_STUB_ID_BASE;
+
+    always_comb
+        mshr_alloc_id = stub_line_id.exists(mshr_alloc_addr) ? stub_line_id[mshr_alloc_addr]
+                                                              : stub_next_id;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            stub_line_id.delete();
+            stub_next_id <= MSHR_STUB_ID_BASE;
+        end else if (mshr_alloc_valid && !stub_line_id.exists(mshr_alloc_addr)) begin
+            stub_line_id[mshr_alloc_addr] =  stub_next_id;
+            stub_next_id                  <= stub_next_id + 1'b1;
+        end
+    end
 
     // -------------------------------------------------------------------
     // DUT: cache controller.
@@ -345,12 +388,11 @@ module cache_controller_tb;
 
     // -------------------------------------------------------------------
     // Miss counter (white-box).
-    // Until miss handling is implemented, a miss has no externally
-    // visible effect: the request is accepted and never answered. The
-    // absence of a response alone cannot distinguish a correct miss from
-    // a lost request, so the controller's internal lookup classification
-    // is probed directly. Once misses allocate MSHR entries, this is
-    // replaced by a check on the MSHR allocation port.
+    // Counts the controller's internal miss classifications. A miss is
+    // never answered until fills exist, so the absence of a response
+    // alone cannot distinguish a correct miss from a lost request. The
+    // count is cross-checked against the externally visible MSHR
+    // allocations (check_allocs), so the two must agree.
     // -------------------------------------------------------------------
     int unsigned miss_cnt = 0;
 
@@ -419,15 +461,19 @@ module cache_controller_tb;
     // Side-effect watcher.
     // While chk_no_side_effects = 1, any array write or MSHR request
     // issued by the controller is counted. Used by tests whose stimulus
-    // must leave the cache contents and the MSHR untouched.
+    // must leave the cache contents and the MSHR untouched. A test whose
+    // stimulus includes a miss sets chk_allow_alloc = 1, exempting MSHR
+    // allocations (checked separately, via alloc_log) while every other
+    // side effect remains forbidden.
     // -------------------------------------------------------------------
     logic        chk_no_side_effects = 1'b0;
+    logic        chk_allow_alloc     = 1'b0;
     int unsigned side_effect_cnt     = 0;
 
     always @(posedge clk) begin
         if (chk_no_side_effects &&
             (ctrl_tag_wr_en || ctrl_valid_wr_en || ctrl_data_wr_en ||
-             mshr_alloc_valid || mshr_wb_valid)) begin
+             (mshr_alloc_valid && !chk_allow_alloc) || mshr_wb_valid)) begin
             $error("side-effect watcher: unexpected write/request at cycle %0d (tag=%b valid=%b data=%b alloc=%b wb=%b)",
                    cycle_cnt, ctrl_tag_wr_en, ctrl_valid_wr_en, ctrl_data_wr_en,
                    mshr_alloc_valid, mshr_wb_valid);
@@ -483,6 +529,30 @@ module cache_controller_tb;
     end
 
     // -------------------------------------------------------------------
+    // MSHR allocation logger.
+    // Records every miss the controller reports to the MSHR (one per
+    // cycle at most), together with the writeback count, which must stay
+    // zero until evictions exist. sb_access queues the allocation it
+    // predicts for each miss in exp_alloc_log; check_allocs compares the
+    // two in order.
+    // -------------------------------------------------------------------
+    typedef struct {
+        logic [ADDR_WIDTH-1:0] addr;
+        logic                  is_write;
+    } alloc_rec_t;
+
+    alloc_rec_t  alloc_log     [$];
+    alloc_rec_t  exp_alloc_log [$];
+    int unsigned wb_req_cnt = 0;
+
+    always @(posedge clk) begin
+        if (rst_n && mshr_alloc_valid)
+            alloc_log.push_back('{addr: mshr_alloc_addr, is_write: mshr_alloc_is_write});
+        if (rst_n && mshr_wb_valid)
+            wb_req_cnt++;
+    end
+
+    // -------------------------------------------------------------------
     // Scoreboard: reference model of the cache contents.
     // Mirrors what every (set, way) should hold. preload_line and
     // set_valid keep it in step with the TB's direct array writes;
@@ -532,6 +602,42 @@ module cache_controller_tb;
         #1;
         rst_n = 1'b1;
     endtask
+
+    // Mid-simulation reset: resets the DUT and brings the scoreboard back
+    // in step with it -- no line valid, LRU in reset order. Used by tests
+    // that need an empty waiting table: until fills exist, a waiting-table
+    // slot, once taken, is released only by reset. Tag and data contents
+    // are not modelled after reset, since they are unobservable while
+    // their valid bit is clear. Called #1 after an edge, with no request
+    // in flight.
+    task automatic reset_dut_and_model();
+        apply_reset();
+        foreach (model_valid[s, w]) begin
+            model_valid[s][w] = 1'b0;
+            model_dirty[s][w] = 1'b0;
+            model_age  [s][w] = WAY_WIDTH'(w);
+        end
+    endtask
+
+    // Line-aligned form of an address: the address the controller must
+    // report to the MSHR on a miss.
+    function automatic logic [ADDR_WIDTH-1:0] line_addr(input logic [ADDR_WIDTH-1:0] addr);
+        return {addr[ADDR_WIDTH-1:LINE_OFF_WIDTH], LINE_OFF_WIDTH'(0)};
+    endfunction
+
+    // Scoreboard lookup without side effects: 1 if the model holds the
+    // line of addr. Lets a stimulus generator know in advance whether a
+    // request will miss.
+    function automatic logic model_hit(input logic [ADDR_WIDTH-1:0] addr);
+        logic [SET_IDX_WIDTH-1:0]  s;
+        logic [TAG_WIDTH-1:0]      t;
+        logic [WORD_OFF_WIDTH-1:0] d;
+        {t, s, d} = addr[ADDR_WIDTH-1:BYTE_OFF_WIDTH];
+        for (int w = 0; w < NUM_WAYS; w++)
+            if (model_valid[s][w] && model_tag[s][w] == t)
+                return 1'b1;
+        return 1'b0;
+    endfunction
 
     // Builds a word-aligned request address from its cache fields.
     function automatic logic [ADDR_WIDTH-1:0] make_addr(
@@ -719,6 +825,35 @@ module cache_controller_tb;
         if (hit) begin
             exp.cycle = accept_cycle + HIT_LATENCY;
             exp_log.push_back(exp);
+        end else begin
+            exp_alloc_log.push_back('{addr: line_addr(addr), is_write: we});
+        end
+    endtask
+
+    // Compares the logged MSHR allocations against the ones sb_access
+    // predicted, in order, and requires that no writeback was requested.
+    task automatic check_allocs(
+        input  string       what,
+        inout  int unsigned errors
+    );
+        if (alloc_log.size() != exp_alloc_log.size()) begin
+            $error("[FAIL] %s: %0d MSHR allocations, expected %0d (one per miss)",
+                   what, alloc_log.size(), exp_alloc_log.size());
+            errors++;
+        end else begin
+            foreach (alloc_log[i]) begin
+                if (alloc_log[i].addr !== exp_alloc_log[i].addr ||
+                    alloc_log[i].is_write !== exp_alloc_log[i].is_write) begin
+                    $error("[FAIL] %s: allocation %0d = (0x%08h, is_write %b), expected (0x%08h, is_write %b)",
+                           what, i, alloc_log[i].addr, alloc_log[i].is_write,
+                           exp_alloc_log[i].addr, exp_alloc_log[i].is_write);
+                    errors++;
+                end
+            end
+        end
+        if (wb_req_cnt != 0) begin
+            $error("[FAIL] %s: %0d writeback requests, expected none", what, wb_req_cnt);
+            errors++;
         end
     endtask
 
@@ -1058,8 +1193,10 @@ module cache_controller_tb;
         //   4. re-validate  -> load hits with the original data, proving
         //                      tag and data were intact throughout, so
         //                      the miss in phase 3 was due to valid alone
-        // A miss is evidenced by the absence of a response together with
-        // exactly one internal miss classification (miss counter).
+        // A miss is evidenced by the absence of a response, exactly one
+        // internal miss classification (miss counter), and exactly one
+        // MSHR allocation carrying line A's line-aligned address as a
+        // load. Allocation is the only side effect permitted.
         // ---------------------------------------------------------------
         begin
             logic [SET_IDX_WIDTH-1:0] t_set;
@@ -1088,9 +1225,14 @@ module cache_controller_tb;
             preload_line(t_set, way_b, tag_b, line_b);
 
             resp_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            exp_alloc_log.push_back('{addr: line_addr(make_addr(tag_a, t_set, 2'd2)), is_write: 1'b0});
+            wb_req_cnt          = 0;
             miss_cnt            = 0;
             side_effect_cnt     = 0;
             chk_no_side_effects = 1'b1;
+            chk_allow_alloc     = 1'b1;
 
             // Phase 1: line A valid -> hit (id 1).
             cpu_send(make_addr(tag_a, t_set, 2'd2), 1'b0, '0, 4'd1, acc[0]);
@@ -1115,6 +1257,7 @@ module cache_controller_tb;
             repeat (3) @(posedge clk);
             #1;
             chk_no_side_effects = 1'b0;
+            chk_allow_alloc     = 1'b0;
 
             // Expected: ids 1, 3, 4 answered in that order; id 2 never.
             exp_id  = '{4'd1, 4'd3, 4'd4};
@@ -1158,13 +1301,14 @@ module cache_controller_tb;
                 errors++;
             end
             if (side_effect_cnt != 0) begin
-                $error("[FAIL] test 4: %0d cycles with an array write or MSHR request, expected none",
+                $error("[FAIL] test 4: %0d cycles with an array write or writeback request, expected none",
                        side_effect_cnt);
                 errors++;
             end
+            check_allocs("test 4", errors);
 
             if (errors == 0)
-                $display("[PASS] test 4: matching tag with valid = 0 misses; neighbour way and re-validated line hit with original data");
+                $display("[PASS] test 4: matching tag with valid = 0 misses (one MSHR alloc, line-aligned, load); neighbour way and re-validated line hit with original data");
         end
 
         // ---------------------------------------------------------------
@@ -1693,6 +1837,17 @@ module cache_controller_tb;
         // the hazard.
         // The hold checker runs throughout. The seed is printed and can be
         // overridden with +seed=<n> to reproduce a failure.
+        //
+        // Temporary miss cap: every miss now occupies a waiting-table slot,
+        // and no fill path exists yet to release one, so unrestricted
+        // misses would fill the table and stall the request port for good.
+        // The test therefore starts from reset (empty table) and, once
+        // T9_MAX_MISSES misses have been generated, substitutes a resident
+        // line for any further would-be miss. The cap is WAIT_DEPTH - 2,
+        // not - 1: at WAIT_DEPTH - 1 occupied slots the acceptance rule
+        // inserts a bubble behind every lookup (see cache_controller,
+        // Request acceptance), which would change the traffic this test
+        // was tuned for. To be removed once fills release slots.
         // ---------------------------------------------------------------
         begin
             localparam int unsigned T9_N          = 500;
@@ -1701,6 +1856,7 @@ module cache_controller_tb;
             localparam int unsigned T9_READY_PCT  = 70;
             localparam int unsigned T9_REUSE_PCT  = 30;
             localparam int unsigned T9_MIN_RAW    = 20;   // coverage floor for read-after-write stalls
+            localparam int unsigned T9_MAX_MISSES = (1 << TXN_ID_WIDTH) - 2;   // 14 -- temporary, see above
 
             logic [SET_IDX_WIDTH-1:0] set_a, set_b, s;
             logic [TAG_WIDTH-1:0]     tags_a [NUM_WAYS];   // set_a: all four ways resident
@@ -1713,7 +1869,10 @@ module cache_controller_tb;
             int unsigned              acc;
             int unsigned              miss_base, raw_base, exp_misses, exp_store_hits;
             int unsigned              errors;
+            int unsigned              t9_misses;   // misses generated so far, against T9_MAX_MISSES
             bit                       t9_running;
+
+            reset_dut_and_model();
 
             if (!$value$plusargs("seed=%d", seed))
                 seed = 1;
@@ -1724,8 +1883,9 @@ module cache_controller_tb;
             set_b    = 6'd61;
             tags_a   = '{22'h300000, 22'h311111, 22'h322222, 22'h333333};
             tags_b   = '{22'h344444, 22'h355555};
-            tag_miss = 22'h3FFFFF;
-            errors   = 0;
+            tag_miss  = 22'h3FFFFF;
+            errors    = 0;
+            t9_misses = 0;
 
             foreach (tags_a[w])
                 preload_line(set_a, WAY_WIDTH'(w), tags_a[w], {$urandom(), $urandom(), $urandom(), $urandom()});
@@ -1735,7 +1895,9 @@ module cache_controller_tb;
             resp_log.delete();
             exp_log.delete();
             wr_log.delete();
-            mshr_req_cnt  = 0;
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            wb_req_cnt    = 0;
             resp_peak     = 0;
             resp_hold_err = 0;
             miss_base     = miss_cnt;
@@ -1768,6 +1930,15 @@ module cache_controller_tb;
                     else
                         t = tags_b[$urandom_range(1)];
                     addr = make_addr(t, s, WORD_OFF_WIDTH'($urandom_range(WORDS_PER_LINE - 1)));
+                end
+                // Miss cap (temporary): past the cap, a would-be miss is
+                // redirected to a resident line of set_a.
+                if (!model_hit(addr)) begin
+                    if (t9_misses == T9_MAX_MISSES)
+                        addr = make_addr(tags_a[$urandom_range(NUM_WAYS - 1)], set_a,
+                                         WORD_OFF_WIDTH'($urandom_range(WORDS_PER_LINE - 1)));
+                    else
+                        t9_misses++;
                 end
                 prev_addr = addr;
                 we = ($urandom_range(99) < T9_STORE_PCT);
@@ -1830,11 +2001,12 @@ module cache_controller_tb;
                        raw_stall_cnt - raw_base, T9_MIN_RAW);
                 errors++;
             end
-            if (mshr_req_cnt != 0) begin
-                $error("[FAIL] test 9: %0d cycles with an MSHR request, expected none",
-                       mshr_req_cnt);
+            if (exp_misses != t9_misses) begin
+                $error("[FAIL] test 9: scoreboard predicted %0d misses, generator produced %0d",
+                       exp_misses, t9_misses);
                 errors++;
             end
+            check_allocs("test 9", errors);
 
             // Final recency order of both sets after ~450 random hits,
             // against the scoreboard's independently maintained ages.
@@ -1883,7 +2055,11 @@ module cache_controller_tb;
             // Back-to-back burst: ways accessed (all loads).
             int                       burst_way [T10_BURST];
 
-            set_t    = 6'd12;   // untouched by tests 1-9: still in reset order
+            // Starts from reset: every set in reset order, and the waiting
+            // table empty for this test's miss (test 9 leaves slots taken).
+            reset_dut_and_model();
+
+            set_t    = 6'd12;
             set_o    = 6'd13;
             tags     = '{22'h0A0000, 22'h0A1111, 22'h0A2222, 22'h0A3333};
             tag_o    = 22'h0B0000;
@@ -1906,7 +2082,9 @@ module cache_controller_tb;
             resp_log.delete();
             exp_log.delete();
             wr_log.delete();
-            mshr_req_cnt = 0;
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            wb_req_cnt   = 0;
             miss_base    = miss_cnt;
             resp_ready   = 1'b1;
 
@@ -1971,7 +2149,7 @@ module cache_controller_tb;
 
             // The LRU addition must leave the visible behaviour unchanged:
             // every hit answered correctly on time, one write (the store),
-            // exactly one miss, no MSHR traffic.
+            // exactly one miss, reported to the MSHR as one allocation.
             repeat (HIT_LATENCY + 2) @(posedge clk);
             #1;
             check_responses("test 10", errors);
@@ -1985,26 +2163,465 @@ module cache_controller_tb;
                        miss_cnt - miss_base);
                 errors++;
             end
-            if (mshr_req_cnt != 0) begin
-                $error("[FAIL] test 10: %0d cycles with an MSHR request, expected none",
-                       mshr_req_cnt);
-                errors++;
-            end
+            check_allocs("test 10", errors);
 
             if (errors == 0)
                 $display("[PASS] test 10: LRU order correct after every hit (oldest/newest/middle/store), back-to-back burst without stall, unchanged by miss and other-set hit, victim = oldest way");
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-10 implemented and passing (2026-10-04).
+        // Test 11: waiting-table contents and arrival order.
+        // A missed request is parked in the waiting table until its line
+        // is filled, then replayed through the hit path, so the table must
+        // retain everything the replay needs. With no fill path yet, this
+        // is checked white-box: after a burst of misses, every occupied
+        // slot is compared field by field against the request that took
+        // it, and the age matrix against the issue order.
+        //
+        // Stimulus: six back-to-back misses to three lines, mixing loads
+        // and stores, with non-sequential CPU ids:
+        //   - two misses merge onto a line already missing and must record
+        //     that line's MSHR id (secondary miss);
+        //   - a load follows a store to the same word of the same line --
+        //     the case the age matrix exists for, since the load must
+        //     replay after the store;
+        //   - one missing line shares its set with a resident line, which
+        //     must not turn the miss into a hit.
+        // Slots are expected in allocation order (lowest free slot first,
+        // from an empty table). Slot release and reuse require fills and
+        // are covered with the fill path.
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned T11_N = 6;
+
+            logic [SET_IDX_WIDTH-1:0] set_a, set_b;
+            logic [TAG_WIDTH-1:0]     tag_x, tag_y, tag_z, tag_res;
+            int unsigned              acc [T11_N];
+            int unsigned              miss_base;
+            int unsigned              errors;
+
+            // Requests in issue order; exp_mshr is the stub id of the
+            // request's line (lines numbered in order of first miss).
+            logic [ADDR_WIDTH-1:0]    rq_addr     [T11_N];
+            logic                     rq_we       [T11_N];
+            logic [DATA_WIDTH-1:0]    rq_wdata    [T11_N];
+            logic [TXN_ID_WIDTH-1:0]  rq_id       [T11_N];
+            logic [MSHR_ID_WIDTH-1:0] rq_exp_mshr [T11_N];
+
+            reset_dut_and_model();
+
+            set_a   = 6'd20;
+            set_b   = 6'd21;
+            tag_x   = 22'h0C0000;   // line X, set A -- first miss
+            tag_y   = 22'h0C1111;   // line Y, set B
+            tag_z   = 22'h0C2222;   // line Z, set A (shares the set with X and the resident line)
+            tag_res = 22'h0C9999;   // resident line in set A
+            errors  = 0;
+
+            //           address                         we    wdata          CPU id   MSHR id (line)
+            rq_addr[0] = make_addr(tag_x, set_a, 2'd1); rq_we[0] = 1'b0; rq_wdata[0] = 32'h1111_1111; rq_id[0] = 4'd3;  rq_exp_mshr[0] = MSHR_STUB_ID_BASE;        // X: new line
+            rq_addr[1] = make_addr(tag_y, set_b, 2'd2); rq_we[1] = 1'b1; rq_wdata[1] = 32'hDA7A_0001; rq_id[1] = 4'd7;  rq_exp_mshr[1] = MSHR_STUB_ID_BASE + 4'd1; // Y: new line, store
+            rq_addr[2] = make_addr(tag_x, set_a, 2'd3); rq_we[2] = 1'b0; rq_wdata[2] = 32'h2222_2222; rq_id[2] = 4'd12; rq_exp_mshr[2] = MSHR_STUB_ID_BASE;        // X: merge
+            rq_addr[3] = make_addr(tag_z, set_a, 2'd0); rq_we[3] = 1'b1; rq_wdata[3] = 32'hDA7A_0003; rq_id[3] = 4'd0;  rq_exp_mshr[3] = MSHR_STUB_ID_BASE + 4'd2; // Z: new line, store
+            rq_addr[4] = make_addr(tag_y, set_b, 2'd2); rq_we[4] = 1'b0; rq_wdata[4] = 32'h3333_3333; rq_id[4] = 4'd9;  rq_exp_mshr[4] = MSHR_STUB_ID_BASE + 4'd1; // Y: merge, load after store, same word
+            rq_addr[5] = make_addr(tag_x, set_a, 2'd0); rq_we[5] = 1'b1; rq_wdata[5] = 32'hDA7A_0005; rq_id[5] = 4'd15; rq_exp_mshr[5] = MSHR_STUB_ID_BASE;        // X: merge, store
+
+            preload_line(set_a, 2'd0, tag_res, {32'hC000_0003, 32'hC000_0002, 32'hC000_0001, 32'hC000_0000});
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            wb_req_cnt = 0;
+            miss_base  = miss_cnt;
+            resp_ready = 1'b1;
+
+            // Six misses on consecutive edges: far below WAIT_DEPTH, so
+            // none may be held off.
+            for (int i = 0; i < T11_N; i++)
+                sb_access(rq_addr[i], rq_we[i], rq_wdata[i], rq_id[i], acc[i]);
+            for (int i = 1; i < T11_N; i++)
+                check_gap($sformatf("test 11 miss %0d -> %0d", i - 1, i), acc[i-1], acc[i], 1, errors);
+
+            // The last miss is parked on the edge after its acceptance.
+            repeat (2) @(posedge clk);
+            #1;
+
+            // Occupancy: exactly slots 0 .. T11_N-1.
+            if (dut.wait_valid !== WAIT_DEPTH'((1 << T11_N) - 1)) begin
+                $error("[FAIL] test 11: wait_valid = %b, expected %b",
+                       dut.wait_valid, WAIT_DEPTH'((1 << T11_N) - 1));
+                errors++;
+            end
+
+            // Slot contents. Store data is compared for stores only; a
+            // load's data field is don't-care.
+            for (int i = 0; i < T11_N; i++) begin
+                if (dut.wait_mem[i].addr    !== rq_addr[i]     ||
+                    dut.wait_mem[i].we      !== rq_we[i]       ||
+                    dut.wait_mem[i].id      !== rq_id[i]       ||
+                    dut.wait_mem[i].mshr_id !== rq_exp_mshr[i] ||
+                    (rq_we[i] && dut.wait_mem[i].wdata !== rq_wdata[i])) begin
+                    $error("[FAIL] test 11: slot %0d = (addr 0x%08h we %b wdata 0x%08h id %0d mshr %0d), expected (addr 0x%08h we %b wdata 0x%08h id %0d mshr %0d)",
+                           i, dut.wait_mem[i].addr, dut.wait_mem[i].we, dut.wait_mem[i].wdata,
+                           dut.wait_mem[i].id, dut.wait_mem[i].mshr_id,
+                           rq_addr[i], rq_we[i], rq_wdata[i], rq_id[i], rq_exp_mshr[i]);
+                    errors++;
+                end
+            end
+
+            // Age matrix: slot j is older than slot i exactly when it was
+            // allocated first, i.e. j < i. Checked for every ordered pair
+            // of occupied slots, including the diagonal (never older than
+            // itself).
+            for (int i = 0; i < T11_N; i++) begin
+                for (int j = 0; j < T11_N; j++) begin
+                    if (dut.wait_older[i][j] !== 1'(j < i)) begin
+                        $error("[FAIL] test 11: wait_older[%0d][%0d] = %b, expected %b",
+                               i, j, dut.wait_older[i][j], 1'(j < i));
+                        errors++;
+                    end
+                end
+            end
+
+            // No response (misses are not answered until fills exist), no
+            // array write, and one MSHR allocation per miss -- merges
+            // included, since the MSHR performs the merge.
+            check_responses("test 11", errors);
+            if (wr_log.size() != 0) begin
+                $error("[FAIL] test 11: %0d cycles with array writes, expected none", wr_log.size());
+                errors++;
+            end
+            if (miss_cnt - miss_base != T11_N) begin
+                $error("[FAIL] test 11: %0d lookups classified as miss, expected %0d",
+                       miss_cnt - miss_base, T11_N);
+                errors++;
+            end
+            check_allocs("test 11", errors);
+
+            if (errors == 0)
+                $display("[PASS] test 11: waiting table holds every missed request (addr, we, store data, CPU id, MSHR id incl. merges) in allocation order, age matrix matches issue order, no stall below capacity");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 12: hit-under-miss.
+        // The defining property of a non-blocking cache: while misses are
+        // outstanding, requests to resident lines complete as if no miss
+        // were pending -- accepted on consecutive edges, answered with the
+        // usual fixed latency and correct data, and therefore out of order
+        // with respect to the earlier, still-pending misses.
+        //
+        // Stimulus: twelve back-to-back requests interleaving four misses
+        // (three lines, one secondary miss) with eight hits:
+        //   - a hit directly behind a miss to the same set;
+        //   - a hit directly behind a store miss to the same set, which
+        //     must not stall: a store miss writes no array, so it creates
+        //     no read-after-write hazard (only a store hit does);
+        //   - a store hit while misses are pending, and a later load of
+        //     the same word, which must observe the stored value;
+        //   - CPU ids non-sequential, so a response carrying a pending
+        //     miss's id would be detected.
+        // The order is chosen so that no request directly follows a store
+        // hit to its own set: every gap must be exactly one edge.
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned T12_N      = 12;
+            localparam int unsigned T12_HITS   = 8;
+            localparam int unsigned T12_MISSES = T12_N - T12_HITS;
+
+            logic [SET_IDX_WIDTH-1:0] set_a, set_b, set_c;
+            logic [TAG_WIDTH-1:0]     tag_h0, tag_h1, tag_h2;      // resident lines
+            logic [TAG_WIDTH-1:0]     tag_m1, tag_m2, tag_m3;      // missing lines
+            int unsigned              acc [T12_N];
+            int unsigned              miss_base;
+            int unsigned              errors;
+
+            logic [ADDR_WIDTH-1:0]    rq_addr  [T12_N];
+            logic                     rq_we    [T12_N];
+            logic [DATA_WIDTH-1:0]    rq_wdata [T12_N];
+            logic [TXN_ID_WIDTH-1:0]  rq_id    [T12_N];
+            logic [TXN_ID_WIDTH-1:0]  miss_ids [$];                // CPU ids of the misses, in issue order
+
+            reset_dut_and_model();
+
+            set_a  = 6'd30;
+            set_b  = 6'd31;
+            set_c  = 6'd32;
+            tag_h0 = 22'h0D0000;   // resident: set A, way 0
+            tag_h1 = 22'h0D1111;   // resident: set A, way 1
+            tag_h2 = 22'h0D2222;   // resident: set B, way 2
+            tag_m1 = 22'h0E1111;   // missing:  set A
+            tag_m2 = 22'h0E2222;   // missing:  set B
+            tag_m3 = 22'h0E3333;   // missing:  set C (empty set)
+            errors = 0;
+
+            //            address                              we    wdata                 CPU id
+            rq_addr[ 0] = make_addr(tag_m1, set_a, 2'd0); rq_we[ 0] = 1'b0; rq_wdata[ 0] = '0;            rq_id[ 0] = 4'd2;   // miss M1
+            rq_addr[ 1] = make_addr(tag_h0, set_a, 2'd1); rq_we[ 1] = 1'b0; rq_wdata[ 1] = '0;            rq_id[ 1] = 4'd5;   // hit, same set as pending M1
+            rq_addr[ 2] = make_addr(tag_h2, set_b, 2'd3); rq_we[ 2] = 1'b0; rq_wdata[ 2] = '0;            rq_id[ 2] = 4'd8;   // hit
+            rq_addr[ 3] = make_addr(tag_m2, set_b, 2'd1); rq_we[ 3] = 1'b1; rq_wdata[ 3] = 32'hDA7A_1203; rq_id[ 3] = 4'd11;  // store miss M2
+            rq_addr[ 4] = make_addr(tag_h2, set_b, 2'd0); rq_we[ 4] = 1'b0; rq_wdata[ 4] = '0;            rq_id[ 4] = 4'd1;   // hit, same set behind store miss: no stall
+            rq_addr[ 5] = make_addr(tag_h1, set_a, 2'd2); rq_we[ 5] = 1'b1; rq_wdata[ 5] = 32'hDA7A_1205; rq_id[ 5] = 4'd14;  // store hit under miss
+            rq_addr[ 6] = make_addr(tag_h2, set_b, 2'd2); rq_we[ 6] = 1'b0; rq_wdata[ 6] = '0;            rq_id[ 6] = 4'd6;   // hit, other set than the store
+            rq_addr[ 7] = make_addr(tag_h1, set_a, 2'd2); rq_we[ 7] = 1'b0; rq_wdata[ 7] = '0;            rq_id[ 7] = 4'd9;   // hit, reads the word stored by request 5
+            rq_addr[ 8] = make_addr(tag_m1, set_a, 2'd3); rq_we[ 8] = 1'b0; rq_wdata[ 8] = '0;            rq_id[ 8] = 4'd0;   // secondary miss on M1
+            rq_addr[ 9] = make_addr(tag_h0, set_a, 2'd0); rq_we[ 9] = 1'b0; rq_wdata[ 9] = '0;            rq_id[ 9] = 4'd13;  // hit
+            rq_addr[10] = make_addr(tag_m3, set_c, 2'd2); rq_we[10] = 1'b0; rq_wdata[10] = '0;            rq_id[10] = 4'd4;   // miss M3
+            rq_addr[11] = make_addr(tag_h2, set_b, 2'd1); rq_we[11] = 1'b0; rq_wdata[11] = '0;            rq_id[11] = 4'd15;  // hit, last: behind three pending lines
+
+            preload_line(set_a, 2'd0, tag_h0, {32'hA0A0_0003, 32'hA0A0_0002, 32'hA0A0_0001, 32'hA0A0_0000});
+            preload_line(set_a, 2'd1, tag_h1, {32'hA1A1_0003, 32'hA1A1_0002, 32'hA1A1_0001, 32'hA1A1_0000});
+            preload_line(set_b, 2'd2, tag_h2, {32'hB2B2_0003, 32'hB2B2_0002, 32'hB2B2_0001, 32'hB2B2_0000});
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            wb_req_cnt = 0;
+            miss_base  = miss_cnt;
+            resp_ready = 1'b1;
+
+            // Issue all twelve on consecutive edges. The scoreboard decides
+            // hit/miss; the misses' ids are recorded for the slot check.
+            for (int i = 0; i < T12_N; i++) begin
+                if (!model_hit(rq_addr[i]))
+                    miss_ids.push_back(rq_id[i]);
+                sb_access(rq_addr[i], rq_we[i], rq_wdata[i], rq_id[i], acc[i]);
+            end
+            for (int i = 1; i < T12_N; i++)
+                check_gap($sformatf("test 12 request %0d -> %0d", i - 1, i), acc[i-1], acc[i], 1, errors);
+
+            repeat (HIT_LATENCY + 2) @(posedge clk);
+            #1;
+
+            // Guard on the stimulus itself: the scoreboard must have
+            // classified the requests as intended, or the checks below
+            // would verify a different scenario.
+            if (exp_log.size() != T12_HITS || miss_ids.size() != T12_MISSES) begin
+                $error("[FAIL] test 12: stimulus classified as %0d hits / %0d misses, intended %0d / %0d",
+                       exp_log.size(), miss_ids.size(), T12_HITS, T12_MISSES);
+                errors++;
+            end
+
+            // Every hit answered with exact latency and correct data, in
+            // issue order among hits; no response for any pending miss.
+            check_responses("test 12", errors);
+
+            // The misses are parked, in issue order, in slots 0..3.
+            if (dut.wait_valid !== WAIT_DEPTH'((1 << T12_MISSES) - 1)) begin
+                $error("[FAIL] test 12: wait_valid = %b, expected %b",
+                       dut.wait_valid, WAIT_DEPTH'((1 << T12_MISSES) - 1));
+                errors++;
+            end
+            foreach (miss_ids[i]) begin
+                if (dut.wait_mem[i].id !== miss_ids[i]) begin
+                    $error("[FAIL] test 12: slot %0d holds CPU id %0d, expected %0d",
+                           i, dut.wait_mem[i].id, miss_ids[i]);
+                    errors++;
+                end
+            end
+
+            // Side effects: one array write (the store hit; a store miss
+            // writes nothing), one MSHR allocation per miss.
+            if (wr_log.size() != 1) begin
+                $error("[FAIL] test 12: %0d cycles with array writes, expected 1 (the store hit)",
+                       wr_log.size());
+                errors++;
+            end
+            if (miss_cnt - miss_base != T12_MISSES) begin
+                $error("[FAIL] test 12: %0d lookups classified as miss, expected %0d",
+                       miss_cnt - miss_base, T12_MISSES);
+                errors++;
+            end
+            check_allocs("test 12", errors);
+
+            if (errors == 0)
+                $display("[PASS] test 12: %0d hits served under %0d pending misses -- no stall (incl. same-set hits behind a miss and a store miss), exact 2-cycle latency, correct data incl. store hit readback, misses parked",
+                         T12_HITS, T12_MISSES);
+        end
+
+        // ---------------------------------------------------------------
+        // Test 13: waiting table full -- back-pressure.
+        // Acceptance requires a guaranteed free waiting-table slot,
+        // counting the request in the lookup stage as a potential miss.
+        // Three consequences are checked:
+        //   - with 15 slots occupied, a request directly behind an
+        //     in-flight lookup waits exactly one cycle, even though that
+        //     lookup turns out to be a hit (the conservative case);
+        //   - the 16th miss is still accepted and parked, filling the table;
+        //   - with the table full, no request is accepted -- not even one
+        //     that would hit, since its outcome is unknown at acceptance --
+        //     and the parked requests are left intact.
+        //
+        // CPU ids: the table holds one slot per CPU id, so a CPU that never
+        // reuses an outstanding id can reach neither case (the request
+        // behind the in-flight hit would need that hit's id, which frees
+        // only when its response returns). The test therefore reuses ids
+        // deliberately; the controller does not interpret them. The
+        // back-pressure is a safety net, and becomes reachable in normal
+        // operation if WAIT_DEPTH is configured below 2**TXN_ID_WIDTH.
+        //
+        // Slots cannot be released until fills exist, so the test ends
+        // with the table full; the next test starts from reset.
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned T13_HOLD = 20;   // cycles the 17th request is held off
+
+            logic [SET_IDX_WIDTH-1:0] set_h;
+            logic [TAG_WIDTH-1:0]     tag_h;
+            logic [ADDR_WIDTH-1:0]    miss_addr [WAIT_DEPTH];
+            int unsigned              acc [WAIT_DEPTH];
+            int unsigned              acc_h1, acc_h2, acc_m16;
+            int unsigned              miss_base, resp_base;
+            int unsigned              accepted_while_full;
+            int unsigned              errors;
+
+            reset_dut_and_model();
+
+            set_h  = 6'd50;
+            tag_h  = 22'h0F_FFFF;
+            errors = 0;
+            preload_line(set_h, 2'd0, tag_h, {32'hF0F0_0003, 32'hF0F0_0002, 32'hF0F0_0001, 32'hF0F0_0000});
+
+            // 16 distinct missing lines spread over four sets (none is set_h).
+            for (int i = 0; i < WAIT_DEPTH; i++)
+                miss_addr[i] = make_addr(22'h0F_0000 + TAG_WIDTH'(i), 6'd40 + SET_IDX_WIDTH'(i % 4),
+                                         WORD_OFF_WIDTH'(i % 4));
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            wb_req_cnt = 0;
+            miss_base  = miss_cnt;
+            resp_ready = 1'b1;
+
+            // Phase 1: 15 misses on consecutive edges. Below capacity, so
+            // none may be held off.
+            for (int i = 0; i < WAIT_DEPTH - 1; i++)
+                sb_access(miss_addr[i], i % 2 == 1, 32'hDA7A_1300 + i, TXN_ID_WIDTH'(i), acc[i]);
+            for (int i = 1; i < WAIT_DEPTH - 1; i++)
+                check_gap($sformatf("test 13 miss %0d -> %0d", i - 1, i), acc[i-1], acc[i], 1, errors);
+            repeat (2) @(posedge clk);
+            #1;
+            if ($countones(dut.wait_valid) != WAIT_DEPTH - 1) begin
+                $error("[FAIL] test 13: %0d slots occupied after 15 misses, expected 15",
+                       $countones(dut.wait_valid));
+                errors++;
+            end
+
+            // Phase 2: the conservative case. Two back-to-back hits: the
+            // first is accepted at once (15 occupied, nothing in lookup);
+            // the second sees 15 + 1 in lookup and waits one cycle, then
+            // is accepted once the first has resolved as a hit. Both are
+            // answered normally, and neither takes a slot.
+            sb_access(make_addr(tag_h, set_h, 2'd1), 1'b0, '0, 4'd15, acc_h1);
+            sb_access(make_addr(tag_h, set_h, 2'd2), 1'b0, '0, 4'd15, acc_h2);
+            check_gap("test 13 hit behind in-flight lookup at 15 occupied", acc_h1, acc_h2, 2, errors);
+
+            // Phase 3: the 16th miss. Issued directly behind the second
+            // hit, so it too waits one cycle; it is then accepted and
+            // parked, and the table is full.
+            sb_access(miss_addr[WAIT_DEPTH-1], 1'b0, '0, 4'd15, acc_m16);
+            check_gap("test 13 16th miss behind in-flight lookup", acc_h2, acc_m16, 2, errors);
+            repeat (2) @(posedge clk);
+            #1;
+            if (dut.wait_valid !== '1) begin
+                $error("[FAIL] test 13: wait_valid = %b after the 16th miss, expected all ones",
+                       dut.wait_valid);
+                errors++;
+            end
+
+            // Phase 4: table full. A request that would hit is presented
+            // and held for T13_HOLD edges. It must never be accepted, and
+            // the reason must be the waiting-table term (white-box), not
+            // another stall condition. req_ready is sampled on the edge,
+            // as the DUT samples it (see cpu_send). Driven directly rather
+            // than through cpu_send, which would time out by design.
+            resp_base           = resp_log.size();
+            accepted_while_full = 0;
+            req_valid = 1'b1;
+            req_addr  = make_addr(tag_h, set_h, 2'd3);
+            req_we    = 1'b0;
+            req_wdata = '0;
+            req_id    = 4'd0;
+            for (int c = 0; c < T13_HOLD; c++) begin
+                @(posedge clk);
+                if (req_ready !== 1'b0 || dut.wait_space !== 1'b0)
+                    accepted_while_full++;
+                #1;
+            end
+            req_valid = 1'b0;
+            if (accepted_while_full != 0) begin
+                $error("[FAIL] test 13: request accepted (or wait_space high) on %0d of %0d edges with the table full",
+                       accepted_while_full, T13_HOLD);
+                errors++;
+            end
+            repeat (HIT_LATENCY + 2) @(posedge clk);
+            #1;
+            if (resp_log.size() != resp_base) begin
+                $error("[FAIL] test 13: %0d response(s) while the table was full, expected none",
+                       resp_log.size() - resp_base);
+                errors++;
+            end
+
+            // The parked requests are intact: still all 16 slots, each
+            // holding the miss that took it (allocation order from empty).
+            if (dut.wait_valid !== '1) begin
+                $error("[FAIL] test 13: wait_valid = %b after the hold, expected all ones",
+                       dut.wait_valid);
+                errors++;
+            end
+            for (int i = 0; i < WAIT_DEPTH; i++) begin
+                if (dut.wait_mem[i].addr !== miss_addr[i]) begin
+                    $error("[FAIL] test 13: slot %0d holds addr 0x%08h, expected 0x%08h",
+                           i, dut.wait_mem[i].addr, miss_addr[i]);
+                    errors++;
+                end
+            end
+
+            // Totals: two hits answered (the held request was never
+            // accepted), 16 misses, 16 allocations, no array write.
+            check_responses("test 13", errors);
+            if (wr_log.size() != 0) begin
+                $error("[FAIL] test 13: %0d cycles with array writes, expected none", wr_log.size());
+                errors++;
+            end
+            if (miss_cnt - miss_base != WAIT_DEPTH) begin
+                $error("[FAIL] test 13: %0d lookups classified as miss, expected %0d",
+                       miss_cnt - miss_base, WAIT_DEPTH);
+                errors++;
+            end
+            check_allocs("test 13", errors);
+
+            if (errors == 0)
+                $display("[PASS] test 13: 15 misses without stall; at 15 occupied a request behind an in-flight hit waits exactly 1 cycle; 16th miss fills the table; full table holds off even a hit for %0d cycles, parked requests intact",
+                         T13_HOLD);
+        end
+
+        // ---------------------------------------------------------------
+        // PROGRESS MARKER -- tests 1-10 implemented and passing (2026-10-04);
+        // tests 4, 9, 10 updated for MSHR allocation on miss (2026-10-06).
         // Test infrastructure now available: make_addr, preload_line,
         // set_valid, cpu_send, sb_access + check_responses (scoreboard),
         // check_gap, response monitor (resp_log), array write logger (wr_log),
-        // miss counter, side-effect watcher, response-FIFO peak monitor
-        // (resp_peak), stalled-response hold checker (resp_hold_err),
-        // LRU checker (check_lru + model_age).
+        // miss counter, side-effect watcher (+ chk_allow_alloc), response-FIFO
+        // peak monitor (resp_peak), stalled-response hold checker
+        // (resp_hold_err), LRU checker (check_lru + model_age), MSHR
+        // allocation logger + check_allocs, reset_dut_and_model, model_hit.
         //
-        // Hit path and LRU state verified. Next: miss handling via the MSHR.
+        // Test 11 (waiting-table contents + age matrix) added 2026-10-08,
+        // with the MSHR allocation stub (per-line ids, merges).
+        //
+        // Test 12 (hit-under-miss) and test 13 (waiting table full /
+        // back-pressure) added 2026-10-08. The miss side is fully covered.
+        //
+        // Next: fill/eviction and replay (RTL), then their tests -- incl.
+        // slot release and reuse (age-matrix column clear) and removal of
+        // test 9's temporary miss cap (T9_MAX_MISSES).
         // ---------------------------------------------------------------
 
         $finish;
