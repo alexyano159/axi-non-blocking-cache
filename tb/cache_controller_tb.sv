@@ -1,6 +1,6 @@
 // -----------------------------------------------------------------------
 // Testbench for the cache controller (rtl/cache_controller.sv) --
-// hit-path and replacement-state (LRU) scope.
+// hit path, replacement state (LRU) and miss side (waiting table).
 //
 // The DUT is the controller wired to the real, already-verified
 // cache_tag_array, cache_valid_array and cache_data_sram, so any failure
@@ -2443,6 +2443,166 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
+        // Test 13: waiting table full -- back-pressure.
+        // Acceptance requires a guaranteed free waiting-table slot,
+        // counting the request in the lookup stage as a potential miss.
+        // Three consequences are checked:
+        //   - with 15 slots occupied, a request directly behind an
+        //     in-flight lookup waits exactly one cycle, even though that
+        //     lookup turns out to be a hit (the conservative case);
+        //   - the 16th miss is still accepted and parked, filling the table;
+        //   - with the table full, no request is accepted -- not even one
+        //     that would hit, since its outcome is unknown at acceptance --
+        //     and the parked requests are left intact.
+        //
+        // CPU ids: the table holds one slot per CPU id, so a CPU that never
+        // reuses an outstanding id can reach neither case (the request
+        // behind the in-flight hit would need that hit's id, which frees
+        // only when its response returns). The test therefore reuses ids
+        // deliberately; the controller does not interpret them. The
+        // back-pressure is a safety net, and becomes reachable in normal
+        // operation if WAIT_DEPTH is configured below 2**TXN_ID_WIDTH.
+        //
+        // Slots cannot be released until fills exist, so the test ends
+        // with the table full; the next test starts from reset.
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned T13_HOLD = 20;   // cycles the 17th request is held off
+
+            logic [SET_IDX_WIDTH-1:0] set_h;
+            logic [TAG_WIDTH-1:0]     tag_h;
+            logic [ADDR_WIDTH-1:0]    miss_addr [WAIT_DEPTH];
+            int unsigned              acc [WAIT_DEPTH];
+            int unsigned              acc_h1, acc_h2, acc_m16;
+            int unsigned              miss_base, resp_base;
+            int unsigned              accepted_while_full;
+            int unsigned              errors;
+
+            reset_dut_and_model();
+
+            set_h  = 6'd50;
+            tag_h  = 22'h0F_FFFF;
+            errors = 0;
+            preload_line(set_h, 2'd0, tag_h, {32'hF0F0_0003, 32'hF0F0_0002, 32'hF0F0_0001, 32'hF0F0_0000});
+
+            // 16 distinct missing lines spread over four sets (none is set_h).
+            for (int i = 0; i < WAIT_DEPTH; i++)
+                miss_addr[i] = make_addr(22'h0F_0000 + TAG_WIDTH'(i), 6'd40 + SET_IDX_WIDTH'(i % 4),
+                                         WORD_OFF_WIDTH'(i % 4));
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            wb_req_cnt = 0;
+            miss_base  = miss_cnt;
+            resp_ready = 1'b1;
+
+            // Phase 1: 15 misses on consecutive edges. Below capacity, so
+            // none may be held off.
+            for (int i = 0; i < WAIT_DEPTH - 1; i++)
+                sb_access(miss_addr[i], i % 2 == 1, 32'hDA7A_1300 + i, TXN_ID_WIDTH'(i), acc[i]);
+            for (int i = 1; i < WAIT_DEPTH - 1; i++)
+                check_gap($sformatf("test 13 miss %0d -> %0d", i - 1, i), acc[i-1], acc[i], 1, errors);
+            repeat (2) @(posedge clk);
+            #1;
+            if ($countones(dut.wait_valid) != WAIT_DEPTH - 1) begin
+                $error("[FAIL] test 13: %0d slots occupied after 15 misses, expected 15",
+                       $countones(dut.wait_valid));
+                errors++;
+            end
+
+            // Phase 2: the conservative case. Two back-to-back hits: the
+            // first is accepted at once (15 occupied, nothing in lookup);
+            // the second sees 15 + 1 in lookup and waits one cycle, then
+            // is accepted once the first has resolved as a hit. Both are
+            // answered normally, and neither takes a slot.
+            sb_access(make_addr(tag_h, set_h, 2'd1), 1'b0, '0, 4'd15, acc_h1);
+            sb_access(make_addr(tag_h, set_h, 2'd2), 1'b0, '0, 4'd15, acc_h2);
+            check_gap("test 13 hit behind in-flight lookup at 15 occupied", acc_h1, acc_h2, 2, errors);
+
+            // Phase 3: the 16th miss. Issued directly behind the second
+            // hit, so it too waits one cycle; it is then accepted and
+            // parked, and the table is full.
+            sb_access(miss_addr[WAIT_DEPTH-1], 1'b0, '0, 4'd15, acc_m16);
+            check_gap("test 13 16th miss behind in-flight lookup", acc_h2, acc_m16, 2, errors);
+            repeat (2) @(posedge clk);
+            #1;
+            if (dut.wait_valid !== '1) begin
+                $error("[FAIL] test 13: wait_valid = %b after the 16th miss, expected all ones",
+                       dut.wait_valid);
+                errors++;
+            end
+
+            // Phase 4: table full. A request that would hit is presented
+            // and held for T13_HOLD edges. It must never be accepted, and
+            // the reason must be the waiting-table term (white-box), not
+            // another stall condition. req_ready is sampled on the edge,
+            // as the DUT samples it (see cpu_send). Driven directly rather
+            // than through cpu_send, which would time out by design.
+            resp_base           = resp_log.size();
+            accepted_while_full = 0;
+            req_valid = 1'b1;
+            req_addr  = make_addr(tag_h, set_h, 2'd3);
+            req_we    = 1'b0;
+            req_wdata = '0;
+            req_id    = 4'd0;
+            for (int c = 0; c < T13_HOLD; c++) begin
+                @(posedge clk);
+                if (req_ready !== 1'b0 || dut.wait_space !== 1'b0)
+                    accepted_while_full++;
+                #1;
+            end
+            req_valid = 1'b0;
+            if (accepted_while_full != 0) begin
+                $error("[FAIL] test 13: request accepted (or wait_space high) on %0d of %0d edges with the table full",
+                       accepted_while_full, T13_HOLD);
+                errors++;
+            end
+            repeat (HIT_LATENCY + 2) @(posedge clk);
+            #1;
+            if (resp_log.size() != resp_base) begin
+                $error("[FAIL] test 13: %0d response(s) while the table was full, expected none",
+                       resp_log.size() - resp_base);
+                errors++;
+            end
+
+            // The parked requests are intact: still all 16 slots, each
+            // holding the miss that took it (allocation order from empty).
+            if (dut.wait_valid !== '1) begin
+                $error("[FAIL] test 13: wait_valid = %b after the hold, expected all ones",
+                       dut.wait_valid);
+                errors++;
+            end
+            for (int i = 0; i < WAIT_DEPTH; i++) begin
+                if (dut.wait_mem[i].addr !== miss_addr[i]) begin
+                    $error("[FAIL] test 13: slot %0d holds addr 0x%08h, expected 0x%08h",
+                           i, dut.wait_mem[i].addr, miss_addr[i]);
+                    errors++;
+                end
+            end
+
+            // Totals: two hits answered (the held request was never
+            // accepted), 16 misses, 16 allocations, no array write.
+            check_responses("test 13", errors);
+            if (wr_log.size() != 0) begin
+                $error("[FAIL] test 13: %0d cycles with array writes, expected none", wr_log.size());
+                errors++;
+            end
+            if (miss_cnt - miss_base != WAIT_DEPTH) begin
+                $error("[FAIL] test 13: %0d lookups classified as miss, expected %0d",
+                       miss_cnt - miss_base, WAIT_DEPTH);
+                errors++;
+            end
+            check_allocs("test 13", errors);
+
+            if (errors == 0)
+                $display("[PASS] test 13: 15 misses without stall; at 15 occupied a request behind an in-flight hit waits exactly 1 cycle; 16th miss fills the table; full table holds off even a hit for %0d cycles, parked requests intact",
+                         T13_HOLD);
+        end
+
+        // ---------------------------------------------------------------
         // PROGRESS MARKER -- tests 1-10 implemented and passing (2026-10-04);
         // tests 4, 9, 10 updated for MSHR allocation on miss (2026-10-06).
         // Test infrastructure now available: make_addr, preload_line,
@@ -2456,10 +2616,12 @@ module cache_controller_tb;
         // Test 11 (waiting-table contents + age matrix) added 2026-10-08,
         // with the MSHR allocation stub (per-line ids, merges).
         //
-        // Test 12 (hit-under-miss) added 2026-10-08.
+        // Test 12 (hit-under-miss) and test 13 (waiting table full /
+        // back-pressure) added 2026-10-08. The miss side is fully covered.
         //
-        // Next: test 13 (waiting table full / back-pressure). Test 9's miss cap (T9_MAX_MISSES) is temporary
-        // and is removed once fills release waiting slots.
+        // Next: fill/eviction and replay (RTL), then their tests -- incl.
+        // slot release and reuse (age-matrix column clear) and removal of
+        // test 9's temporary miss cap (T9_MAX_MISSES).
         // ---------------------------------------------------------------
 
         $finish;
