@@ -675,16 +675,45 @@ module cache_controller #(
     // age matrix, waiting-table back-pressure); tests 4, 9, 10 updated to
     // check allocations, 2026-10-06.
     //
-    // Next: a dedicated waiting-table test (slot contents, age matrix,
-    // back-pressure at WAIT_DEPTH, hit-under-miss), then fill/replay:
-    //   - corner case to handle: a miss that merges into an MSHR entry in
-    //     the same cycle that entry's fill is handed off (FE_DONE ->
-    //     FE_IDLE, mshr.sv) receives an alloc_id whose fill has already
-    //     been presented. Such a request must not wait on that id; it
-    //     should be replayed (it will hit the just-installed line).
-    // Then: fill/eviction (victim = invalid way first, else lru_victim_way;
-    // fills become a second lru_upd_* source), with replay of pending
-    // requests through the hit path (see DESIGN_DECISIONS.txt).
+    // Waiting table verified by cache_controller_tb tests 11-13
+    // (2026-10-08).
+    //
+    // Next: fill/eviction (branch cache_fill, not yet created), then
+    // replay of pending requests through the hit path (see
+    // DESIGN_DECISIONS.txt). Planned fill sequence, 2 cycles:
+    //   F0 (read) : mshr_fill_valid and no same-set store hit in the
+    //               lookup stage -> drive the fill's set onto the array
+    //               read ports instead of the CPU's; req_ready = 0. Fills
+    //               take priority over new CPU requests.
+    //   F1 (write): victim = lowest invalid way, else lru_victim_way. A
+    //               valid dirty victim goes to mshr_wb_*; if
+    //               mshr_wb_ready = 0, stay in F1 with the CPU held off
+    //               and the read port on the fill's set, so the victim's
+    //               data stays on the array outputs. Then write tag
+    //               (dirty = 0 -- a replayed store sets dirty), valid = 1,
+    //               full line (word_en = '1); LRU update from the fill
+    //               (second lru_upd_* source); OR the fill write into
+    //               arr_wr_active; raise mshr_fill_ready.
+    //   Holding off the CPU in F0 leaves the lookup stage empty in F1,
+    //   so the array write port and LRU update port are free for the
+    //   fill, and the "merge in the handoff cycle" corner case (an
+    //   alloc_id whose fill was already presented) cannot arise.
+    //
+    // Open issues found while planning, to be agreed before coding:
+    //   1. Victim writeback address: cache_tag_array outputs only
+    //      tag_match and dirty_out, never a stored tag, so the victim's
+    //      address cannot be formed. Proposed: add a registered tag_out
+    //      [NUM_WAYS] read output to cache_tag_array (+ a test in
+    //      cache_tag_array_tb), as a separate commit before the fill
+    //      logic. Rejected: a shadow tag copy in the controller.
+    //   2. The MSHR's fill-completion mux is fixed-priority (lowest
+    //      entry first, mshr.sv fe_done_sel): if a lower-numbered entry
+    //      completes between F0 and F1, F1 sees a different line than
+    //      the set F0 read. Proposed: latch mshr_fill_id in F0; in F1, if
+    //      it differs, abandon and restart from F0 (rare, bounded by the
+    //      entry count; the MSHR stays untouched). Rejected: changing the
+    //      MSHR to lock its selection once a fill starts.
+    // Both are to be logged in DESIGN_DECISIONS.txt once agreed.
     // -------------------------------------------------------------------
 
 endmodule : cache_controller
