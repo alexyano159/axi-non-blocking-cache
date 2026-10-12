@@ -9,7 +9,9 @@
 // mshr_alloc_id is assigned per line by a small stub, as the real MSHR
 // would, and the fill inputs (mshr_fill_*) are driven by the TB -- by
 // the mshr_fill task, or cycle by cycle where a test needs exact
-// control. Allocations and fills are logged and checked.
+// control, or -- in the end-to-end test 19 -- by an automatic model of
+// the MSHR's fill engine backed by a golden memory image. Allocations,
+// fills and writebacks are logged and checked.
 //
 // Preload mode: lines can also be installed directly by the TB, which
 // tests 2-13 rely on. While tb_preload = 1, a mux in front of each
@@ -772,14 +774,21 @@ module cache_controller_tb;
     logic [LINE_WIDTH-1:0]  afm_data [AFM_ENTRIES];
     int unsigned            afm_wait [AFM_ENTRIES]; // cycles until completion
 
-    bit wb_seen [logic [ADDR_WIDTH-1:0]];           // lines written back at least once
+    // Edge of each line's most recent writeback handoff. A re-miss within
+    // AFM_RECENT_WB cycles of it is the case the real MSHR must order
+    // behind the still-queued write (Read-after-write ordering in
+    // mshr.sv); counted as coverage.
+    localparam int unsigned AFM_RECENT_WB = 32;
+
+    int unsigned wb_cycle [logic [ADDR_WIDTH-1:0]];
 
     // Bookkeeping and coverage (cleared by the test that uses them).
     int unsigned afm_new_cnt       = 0;   // entries opened (primary misses)
     int unsigned afm_merge_cnt     = 0;   // secondary misses merged into an open entry
+    int unsigned afm_merge_done    = 0;   // ... of which into an entry already complete (line returned)
     int unsigned afm_fill_cnt      = 0;   // fills accepted
     int unsigned afm_wb_cnt        = 0;   // dirty victims handed off
-    int unsigned afm_remiss_wb_cnt = 0;   // new entries for a line written back earlier
+    int unsigned afm_remiss_wb_cnt = 0;   // new entries for a line written back within AFM_RECENT_WB cycles
     int unsigned afm_err           = 0;   // model-side check failures (see below)
 
     // Returns a uniformly distributed value in lo..hi from afm_rng.
@@ -800,6 +809,8 @@ module cache_controller_tb;
             if (mshr_alloc_valid) begin
                 if (afm_pend[mshr_alloc_id] || afm_done[mshr_alloc_id]) begin
                     afm_merge_cnt++;
+                    if (afm_done[mshr_alloc_id])
+                        afm_merge_done++;
                     if (afm_addr[mshr_alloc_id] !== mshr_alloc_addr) begin
                         $error("fill model: miss to 0x%08h given id %0d, which is open for line 0x%08h",
                                mshr_alloc_addr, mshr_alloc_id, afm_addr[mshr_alloc_id]);
@@ -812,7 +823,8 @@ module cache_controller_tb;
                     afm_wait[mshr_alloc_id] = (afm_rand(0, 99) < afm_long_pct)
                                               ? afm_rand(afm_short_max + 1, afm_long_max)
                                               : afm_rand(1, afm_short_max);
-                    if (wb_seen.exists(mshr_alloc_addr))
+                    if (wb_cycle.exists(mshr_alloc_addr) &&
+                        cycle_cnt - wb_cycle[mshr_alloc_addr] <= AFM_RECENT_WB)
                         afm_remiss_wb_cnt++;
                 end
             end
@@ -836,7 +848,7 @@ module cache_controller_tb;
                     afm_err++;
                 end
                 golden_mem[mshr_wb_addr] = mshr_wb_data;
-                wb_seen[mshr_wb_addr]    = 1'b1;
+                wb_cycle[mshr_wb_addr]   = cycle_cnt;
             end
 
             #1;
@@ -887,6 +899,7 @@ module cache_controller_tb;
     int unsigned cov_replay_raw   = 0;   // pending replay held by the read-after-write hazard
     int unsigned cov_hit_under    = 0;   // CPU hits while at least one miss is waiting
     int unsigned cov_fill_held    = 0;   // presented fill held while replays are pending
+    int unsigned cov_f0_defer     = 0;   // fill start deferred by a store hit to the fill's set
 
     always @(posedge clk) begin
         if (rst_n && afm_en) begin
@@ -917,6 +930,8 @@ module cache_controller_tb;
             if (dut.replay_pending && dut.replay_hazard)                cov_replay_raw++;
             if (dut.lookup_hit && !dut.lookup_q.replay && |dut.wait_valid) cov_hit_under++;
             if (mshr_fill_valid && dut.replay_pending)                  cov_fill_held++;
+            if (mshr_fill_valid && !dut.fill_busy && !dut.replay_pending &&
+                dut.arr_wr_active && dut.arr_wr_set_idx == dut.fill_set_idx) cov_f0_defer++;
         end
     end
 
@@ -1257,6 +1272,43 @@ module cache_controller_tb;
         if (we)
             ref_mem[word_addr] = wdata;
         ooo_busy[id] = 1'b1;
+    endtask
+
+    // Issues one request through ooo_issue under a randomly chosen id that
+    // is not outstanding, as a CPU with NUM_TXN_IDS tags would. With every
+    // id outstanding, the CPU waits for a response first. Both waits are
+    // bounded by max_wait edges; ok = 0 reports a timeout and its cause.
+    task automatic ooo_issue_free_id(
+        input  logic [ADDR_WIDTH-1:0] addr,
+        input  logic                  we,
+        input  logic [DATA_WIDTH-1:0] wdata,
+        input  int unsigned           max_wait,
+        output bit                    ok
+    );
+        logic [TXN_ID_WIDTH-1:0] free_ids [$];
+        int unsigned             waited;
+
+        waited = 0;
+        forever begin
+            free_ids.delete();
+            for (int i = 0; i < NUM_TXN_IDS; i++)
+                if (!ooo_busy[i]) free_ids.push_back(TXN_ID_WIDTH'(i));
+            if (free_ids.size() != 0)
+                break;
+            if (waited++ >= max_wait) begin
+                $display("         ooo_issue_free_id: no id freed within %0d cycles (all %0d outstanding)",
+                         max_wait, NUM_TXN_IDS);
+                ok = 1'b0;
+                return;
+            end
+            @(posedge clk);
+            #1;
+        end
+
+        ooo_issue(addr, we, wdata, free_ids[$urandom_range(free_ids.size() - 1)], max_wait, ok);
+        if (!ok)
+            $display("         ooo_issue_free_id: request to 0x%08h not accepted within %0d cycles",
+                     addr, max_wait);
     endtask
 
     // Scoreboard prediction of one access, as the hit path performs it:
@@ -2461,15 +2513,18 @@ module cache_controller_tb;
         // back-pressure.
         // Tests 2-8 each target one mechanism in isolation; this test
         // exercises their interactions (read-after-write stalls while
-        // the FIFO is full, back-pressure released mid-stall, misses
-        // interleaved with hits, ...) under traffic no directed test
-        // enumerates.
+        // the FIFO is full, back-pressure released mid-stall, LRU updates
+        // from back-to-back same-set hits, ...) under traffic no directed
+        // test enumerates.
         //
         // Constraints:
         // - Addresses are drawn from a small pool (two sets, six resident
         //   lines) so that same-set collisions and store -> load reuse
-        //   occur frequently. About 10% of requests use a non-resident
-        //   tag and must miss without disturbing the hits around them.
+        //   occur frequently. Every request hits: this test isolates the
+        //   hit path, whose exact properties (responses in acceptance
+        //   order, one array write per store hit, LRU order) hold only
+        //   while no fill or replay intervenes. Random misses, fills,
+        //   evictions and replays are covered end to end by test 19.
         // - About 30% of requests repeat the previous address. Without this
         //   locality a store followed at once by a load of the same word --
         //   the only pairing in which a missing read-after-write stall
@@ -2487,38 +2542,28 @@ module cache_controller_tb;
         // The hold checker runs throughout. The seed is printed and can be
         // overridden with +seed=<n> to reproduce a failure.
         //
-        // Temporary miss cap: every miss now occupies a waiting-table slot,
-        // and no fill path exists yet to release one, so unrestricted
-        // misses would fill the table and stall the request port for good.
-        // The test therefore starts from reset (empty table) and, once
-        // T9_MAX_MISSES misses have been generated, substitutes a resident
-        // line for any further would-be miss. The cap is WAIT_DEPTH - 2,
-        // not - 1: at WAIT_DEPTH - 1 occupied slots the acceptance rule
-        // inserts a bubble behind every lookup (see cache_controller,
-        // Request acceptance), which would change the traffic this test
-        // was tuned for. To be removed once fills release slots.
+        // History: until fills existed this test also generated misses,
+        // capped at WAIT_DEPTH - 2 because nothing released a waiting-table
+        // slot. With fills and replays in place, misses belong to the
+        // end-to-end test 19, and the cap is gone.
         // ---------------------------------------------------------------
         begin
             localparam int unsigned T9_N          = 500;
             localparam int unsigned T9_STORE_PCT  = 40;
-            localparam int unsigned T9_MISS_PCT   = 10;
             localparam int unsigned T9_READY_PCT  = 70;
             localparam int unsigned T9_REUSE_PCT  = 30;
             localparam int unsigned T9_MIN_RAW    = 20;   // coverage floor for read-after-write stalls
-            localparam int unsigned T9_MAX_MISSES = (1 << TXN_ID_WIDTH) - 2;   // 14 -- temporary, see above
 
             logic [SET_IDX_WIDTH-1:0] set_a, set_b, s;
             logic [TAG_WIDTH-1:0]     tags_a [NUM_WAYS];   // set_a: all four ways resident
             logic [TAG_WIDTH-1:0]     tags_b [2];          // set_b: ways 0 and 1 resident
             logic [TAG_WIDTH-1:0]     t;
-            logic [TAG_WIDTH-1:0]     tag_miss;
             logic                     we;
             logic [ADDR_WIDTH-1:0]    addr, prev_addr;
             int unsigned              seed;
             int unsigned              acc;
-            int unsigned              miss_base, raw_base, exp_misses, exp_store_hits;
+            int unsigned              miss_base, raw_base, exp_store_hits;
             int unsigned              errors;
-            int unsigned              t9_misses;   // misses generated so far, against T9_MAX_MISSES
             bit                       t9_running;
 
             reset_dut_and_model();
@@ -2532,9 +2577,7 @@ module cache_controller_tb;
             set_b    = 6'd61;
             tags_a   = '{22'h300000, 22'h311111, 22'h322222, 22'h333333};
             tags_b   = '{22'h344444, 22'h355555};
-            tag_miss  = 22'h3FFFFF;
-            errors    = 0;
-            t9_misses = 0;
+            errors   = 0;
 
             foreach (tags_a[w])
                 preload_line(set_a, WAY_WIDTH'(w), tags_a[w], {$urandom(), $urandom(), $urandom(), $urandom()});
@@ -2566,28 +2609,16 @@ module cache_controller_tb;
             for (int i = 0; i < T9_N; i++) begin
                 // Address: either the previous request's address (locality,
                 // which makes same-word store -> load pairs common), or a
-                // resident line of set_a or set_b, or (rarely) a non-resident
-                // tag in either set.
+                // resident line of set_a or set_b.
                 if ($urandom_range(99) < T9_REUSE_PCT) begin
                     addr = prev_addr;
                 end else begin
                     s = $urandom_range(1) ? set_a : set_b;
-                    if ($urandom_range(99) < T9_MISS_PCT)
-                        t = tag_miss;
-                    else if (s == set_a)
+                    if (s == set_a)
                         t = tags_a[$urandom_range(NUM_WAYS - 1)];
                     else
                         t = tags_b[$urandom_range(1)];
                     addr = make_addr(t, s, WORD_OFF_WIDTH'($urandom_range(WORDS_PER_LINE - 1)));
-                end
-                // Miss cap (temporary): past the cap, a would-be miss is
-                // redirected to a resident line of set_a.
-                if (!model_hit(addr)) begin
-                    if (t9_misses == T9_MAX_MISSES)
-                        addr = make_addr(tags_a[$urandom_range(NUM_WAYS - 1)], set_a,
-                                         WORD_OFF_WIDTH'($urandom_range(WORDS_PER_LINE - 1)));
-                    else
-                        t9_misses++;
                 end
                 prev_addr = addr;
                 we = ($urandom_range(99) < T9_STORE_PCT);
@@ -2613,18 +2644,22 @@ module cache_controller_tb;
             repeat (6) @(posedge clk);
             #1;
 
-            // Predicted outcome counts, from the scoreboard: every hit
-            // queued one expected response; the rest were misses.
-            exp_misses     = T9_N - exp_log.size();
+            // Predicted outcome counts, from the scoreboard: every request
+            // must have queued one expected response (all hits).
             exp_store_hits = 0;
             foreach (exp_log[i])
                 if (exp_log[i].we) exp_store_hits++;
 
+            if (exp_log.size() != T9_N) begin
+                $error("[FAIL] test 9: scoreboard predicted %0d hits of %0d requests, expected all (TB stimulus error)",
+                       exp_log.size(), T9_N);
+                errors++;
+            end
             check_responses("test 9", errors, 1'b0);
 
-            if (miss_cnt - miss_base != exp_misses) begin
-                $error("[FAIL] test 9: %0d lookups classified as miss, expected %0d",
-                       miss_cnt - miss_base, exp_misses);
+            if (miss_cnt - miss_base != 0) begin
+                $error("[FAIL] test 9: %0d lookups classified as miss, expected none",
+                       miss_cnt - miss_base);
                 errors++;
             end
             if (resp_hold_err != 0) begin
@@ -2650,21 +2685,16 @@ module cache_controller_tb;
                        raw_stall_cnt - raw_base, T9_MIN_RAW);
                 errors++;
             end
-            if (exp_misses != t9_misses) begin
-                $error("[FAIL] test 9: scoreboard predicted %0d misses, generator produced %0d",
-                       exp_misses, t9_misses);
-                errors++;
-            end
             check_allocs("test 9", errors);
 
-            // Final recency order of both sets after ~450 random hits,
+            // Final recency order of both sets after 500 random hits,
             // against the scoreboard's independently maintained ages.
             check_lru("test 9 set_a", set_a, model_age[set_a], errors);
             check_lru("test 9 set_b", set_b, model_age[set_b], errors);
 
             if (errors == 0)
-                $display("[PASS] test 9: %0d random requests (%0d hits, %0d store hits, %0d misses) under random back-pressure -- all responses correct and in order, FIFO peak %0d, %0d RAW stalls, no hold violations",
-                         T9_N, exp_log.size(), exp_store_hits, exp_misses, resp_peak, raw_stall_cnt - raw_base);
+                $display("[PASS] test 9: %0d random hits (%0d stores) under random back-pressure -- all responses correct and in order, FIFO peak %0d, %0d RAW stalls, no hold violations, LRU order matches the model",
+                         T9_N, exp_store_hits, resp_peak, raw_stall_cnt - raw_base);
         end
 
         // ---------------------------------------------------------------
@@ -2705,7 +2735,7 @@ module cache_controller_tb;
             int                       burst_way [T10_BURST];
 
             // Starts from reset: every set in reset order, and the waiting
-            // table empty for this test's miss (test 9 leaves slots taken).
+            // table empty for this test's miss.
             reset_dut_and_model();
 
             set_t    = 6'd12;
@@ -4063,6 +4093,336 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
+        // Test 19: end-to-end constrained-random traffic with automatic
+        // fills.
+        // Tests 14-18 verify fills, evictions, writebacks and replays one
+        // scenario at a time, with every fill placed by hand. Here they all
+        // run concurrently under random traffic: the automatic fill model
+        // completes each miss after a random delay, so hits, misses,
+        // secondary misses, fills (including restarts), clean and dirty
+        // evictions, writebacks against an intermittently full queue,
+        // replays and response back-pressure overlap freely.
+        //
+        // Specification checked: the cache behaves as a flat memory to
+        // which requests are applied in acceptance order (see ooo_issue
+        // for why this is exact for this design). Every response is
+        // matched by CPU id against the outcome predicted at acceptance;
+        // every evicted line, clean or dirty, against its reference
+        // contents; every writeback against the reference line.
+        //
+        // Constraints:
+        // - Footprint: T19_TAGS lines in each of T19_SETS sets, i.e. six
+        //   lines competing for four ways, so lines are evicted and
+        //   re-missed continually, often while dirty, and a re-miss to a
+        //   line just written back is common.
+        // - About 25% of requests repeat the previous address (same-word
+        //   store -> load pairs, merges onto a pending line); about 40%
+        //   are stores.
+        // - CPU ids: a random id among those not outstanding, up to all
+        //   16 in flight; the CPU waits only when none is free.
+        // - 0-3 idle cycles between requests; resp_ready high 75% and
+        //   mshr_wb_ready high 70% of cycles, re-drawn every cycle.
+        // - Finally every word of the footprint is loaded once (readback
+        //   sweep), so the final contents of cache and memory together are
+        //   compared against the reference, including lines that were
+        //   only ever written.
+        //
+        // Termination: every wait -- acceptance of a request, a free id,
+        // the final drain -- is bounded by T19_WAIT edges, so a deadlock
+        // is reported as [FAIL] and the remaining checks still run.
+        // Completeness: at the end no id is outstanding (every request
+        // answered exactly once), the waiting table and the fill model are
+        // empty, every miss was replayed exactly once, every opened entry
+        // filled once, and every dirty eviction written back once.
+        // Coverage: a floor for each interesting event, so that a pass
+        // cannot come from traffic that never reached it.
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned T19_N            = 3000;
+            localparam int unsigned T19_SETS         = 2;
+            localparam int unsigned T19_TAGS         = 6;      // lines per set, competing for NUM_WAYS ways
+            localparam int unsigned T19_STORE_PCT    = 40;
+            localparam int unsigned T19_REUSE_PCT    = 25;
+            localparam int unsigned T19_READY_PCT    = 75;
+            localparam int unsigned T19_WB_READY_PCT = 70;
+            localparam int unsigned T19_WAIT         = 2000;   // watchdog bound, in edges, for every wait
+
+            // Coverage floors, set at roughly 40-50% of the lowest count
+            // observed over seeds 1-30 (in brackets), so that they hold for
+            // any seed with margin yet fail if a constraint change stops
+            // the traffic from reaching an event.
+            localparam int unsigned T19_MIN_FILLS        = 250;   // [512]
+            localparam int unsigned T19_MIN_MERGES       = 200;   // [414] secondary misses
+            localparam int unsigned T19_MIN_MERGE_DONE   = 5;     // [19]  merge into an entry already complete
+            localparam int unsigned T19_MIN_DIRTY_EVICT  = 200;   // [411]
+            localparam int unsigned T19_MIN_CLEAN_EVICT  = 40;    // [84]
+            localparam int unsigned T19_MIN_REPLAYS      = 450;   // [954]
+            localparam int unsigned T19_MIN_RESTARTS     = 3;     // [7]   fill displaced between F0 and F1
+            localparam int unsigned T19_MIN_WB_STALLS    = 80;    // [164] F1 cycles against a full queue
+            localparam int unsigned T19_MIN_REMISS_WB    = 80;    // [192] re-miss shortly after the writeback
+            localparam int unsigned T19_MIN_RAW          = 200;   // [398] CPU read-after-write stalls
+            localparam int unsigned T19_MIN_REPLAY_RAW   = 60;    // [152] replay held by a same-set store
+            localparam int unsigned T19_MIN_F0_DEFER     = 10;    // [22]  fill start held by a same-set store
+            localparam int unsigned T19_MIN_HIT_UNDER    = 600;   // [1342]
+            localparam int unsigned T19_MIN_FILL_HELD    = 80;    // [177] fill held by pending replays
+
+            logic [SET_IDX_WIDTH-1:0] t_sets [T19_SETS];
+            logic [TAG_WIDTH-1:0]     t_tags [T19_TAGS];
+            logic [ADDR_WIDTH-1:0]    addr, prev_addr;
+            logic                     we;
+            int unsigned              seed;
+            int unsigned              n_issued, waited, misses;
+            int unsigned              miss_base, raw_base;
+            int unsigned              errors;
+            bit                       ok, aborted, drained, t19_running;
+
+            reset_dut_and_model();
+
+            if (!$value$plusargs("seed=%d", seed))
+                seed = 1;
+            process::self().srandom(seed);
+            afm_rng = seed;
+            $display("         test 19: seed = %0d", seed);
+
+            t_sets = '{6'd44, 6'd45};
+            foreach (t_tags[k])
+                t_tags[k] = 22'h19_0000 + TAG_WIDTH'(k * 22'h00_1111);
+            errors   = 0;
+            n_issued = 0;
+            aborted  = 1'b0;
+
+            // Memory images, scoreboard and every log and counter start
+            // empty; the cache starts empty (reset), so every line it ever
+            // holds arrives through a fill.
+            golden_mem.delete();
+            ref_mem.delete();
+            wb_cycle.delete();
+            resp_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            fill_log.delete();
+            wb_log.delete();
+            ooo_busy          = '0;
+            ooo_resp_cnt      = 0;
+            ooo_err           = 0;
+            afm_new_cnt       = 0;
+            afm_merge_cnt     = 0;
+            afm_merge_done    = 0;
+            afm_fill_cnt      = 0;
+            afm_wb_cnt        = 0;
+            afm_remiss_wb_cnt = 0;
+            afm_err           = 0;
+            cov_clean_evict   = 0;
+            cov_dirty_evict   = 0;
+            cov_replay        = 0;
+            cov_restart       = 0;
+            cov_wb_stall      = 0;
+            cov_replay_raw    = 0;
+            cov_hit_under     = 0;
+            cov_fill_held     = 0;
+            cov_f0_defer      = 0;
+            wb_req_cnt        = 0;
+            fill_rule_err     = 0;
+            wb_hold_err       = 0;
+            resp_hold_err     = 0;
+            resp_peak         = 0;
+            miss_base         = miss_cnt;
+            raw_base          = raw_stall_cnt;
+            prev_addr         = make_addr(t_tags[0], t_sets[0], 2'd0);
+
+            afm_wb_ready_pct = T19_WB_READY_PCT;
+            afm_en           = 1'b1;
+            ooo_chk_en       = 1'b1;
+
+            // Random response back-pressure, re-drawn #1 after every edge.
+            t19_running = 1'b1;
+            fork
+                while (t19_running) begin
+                    @(posedge clk);
+                    #1;
+                    resp_ready = ($urandom_range(99) < T19_READY_PCT);
+                end
+            join_none
+
+            // Random traffic.
+            for (int i = 0; i < T19_N && !aborted; i++) begin
+                if ($urandom_range(99) < T19_REUSE_PCT)
+                    addr = prev_addr;
+                else
+                    addr = make_addr(t_tags[$urandom_range(T19_TAGS - 1)],
+                                     t_sets[$urandom_range(T19_SETS - 1)],
+                                     WORD_OFF_WIDTH'($urandom_range(WORDS_PER_LINE - 1)));
+                prev_addr = addr;
+                we = ($urandom_range(99) < T19_STORE_PCT);
+
+                ooo_issue_free_id(addr, we, $urandom(), T19_WAIT, ok);
+                if (!ok) begin
+                    $error("[FAIL] test 19: request %0d (0x%08h) stalled -- wait_valid %b, wait_ready %b, fill_valid %b (id %0d), fill model pend %b done %b",
+                           i, addr, dut.wait_valid, dut.wait_ready, mshr_fill_valid, mshr_fill_id,
+                           afm_pend, afm_done);
+                    aborted = 1'b1;
+                end else begin
+                    n_issued++;
+                end
+
+                // Idle gap: none in half the cases, otherwise 1-3 edges.
+                if ($urandom_range(1)) begin
+                    repeat ($urandom_range(3, 1)) @(posedge clk);
+                    #1;
+                end
+            end
+
+            // Readback sweep: one load of every word of the footprint.
+            foreach (t_sets[s])
+                foreach (t_tags[k])
+                    for (int d = 0; d < WORDS_PER_LINE && !aborted; d++) begin
+                        ooo_issue_free_id(make_addr(t_tags[k], t_sets[s], WORD_OFF_WIDTH'(d)),
+                                          1'b0, '0, T19_WAIT, ok);
+                        if (!ok) begin
+                            $error("[FAIL] test 19: readback sweep stalled at set %0d tag 0x%06h word %0d",
+                                   t_sets[s], t_tags[k], d);
+                            aborted = 1'b1;
+                        end else begin
+                            n_issued++;
+                        end
+                    end
+
+            // Stop the back-pressure thread (it makes one final draw #1
+            // after the next edge), then drain with resp_ready = 1 until no
+            // id is outstanding and nothing is left in the waiting table or
+            // the fill model -- bounded by the watchdog.
+            t19_running = 1'b0;
+            repeat (2) @(posedge clk);
+            #1;
+            resp_ready = 1'b1;
+            drained = 1'b0;
+            waited  = 0;
+            while (!drained && waited < T19_WAIT) begin
+                @(posedge clk);
+                #1;
+                waited++;
+                drained = (ooo_busy == '0) && (afm_pend == '0) && (afm_done == '0) &&
+                          (dut.wait_valid == '0) && !resp_valid;
+            end
+            repeat (4) @(posedge clk);
+            #1;
+
+            // Return the MSHR inputs to their idle values. The fill model
+            // drives them until the edge after afm_en falls.
+            afm_en     = 1'b0;
+            ooo_chk_en = 1'b0;
+            @(posedge clk);
+            #1;
+            mshr_fill_valid  = 1'b0;
+            mshr_wb_ready    = 1'b1;
+            afm_wb_ready_pct = 100;
+
+            misses = miss_cnt - miss_base;
+
+            // Coverage summary, printed on every run (pass or fail).
+            $display("         test 19: %0d requests (%0d misses: %0d primary, %0d merged, %0d of them into a completed entry), %0d fills, %0d restarts, %0d clean / %0d dirty evictions, %0d writeback-stall cycles, %0d re-misses within %0d cycles of the line's writeback",
+                     n_issued, misses, afm_new_cnt, afm_merge_cnt, afm_merge_done, afm_fill_cnt, cov_restart,
+                     cov_clean_evict, cov_dirty_evict, cov_wb_stall, afm_remiss_wb_cnt, AFM_RECENT_WB);
+            $display("         test 19: %0d replays, %0d replay RAW holds, %0d CPU RAW stalls, %0d fill starts deferred by a same-set store, %0d hits under miss, %0d fill cycles held by replays, FIFO peak %0d",
+                     cov_replay, cov_replay_raw, raw_stall_cnt - raw_base, cov_f0_defer, cov_hit_under, cov_fill_held, resp_peak);
+
+            // Termination.
+            if (aborted) begin
+                $error("[FAIL] test 19: traffic aborted by the watchdog after %0d requests", n_issued);
+                errors++;
+            end
+            if (!drained) begin
+                $error("[FAIL] test 19: not drained within %0d cycles -- outstanding ids %b, waiting slots %b (ready %b), fill model pend %b done %b",
+                       T19_WAIT, ooo_busy, dut.wait_valid, dut.wait_ready, afm_pend, afm_done);
+                errors++;
+            end
+
+            // Data and protocol checks performed on the fly.
+            if (ooo_err != 0) begin
+                $error("[FAIL] test 19: %0d response mismatches (data, we, id or timing)", ooo_err);
+                errors++;
+            end
+            if (afm_err != 0) begin
+                $error("[FAIL] test 19: %0d eviction / writeback / allocation mismatches", afm_err);
+                errors++;
+            end
+            if (fill_rule_err != 0 || wb_hold_err != 0 || resp_hold_err != 0) begin
+                $error("[FAIL] test 19: %0d fill-handshake, %0d writeback-hold, %0d response-hold rule violations",
+                       fill_rule_err, wb_hold_err, resp_hold_err);
+                errors++;
+            end
+            if (resp_peak > 3) begin
+                $error("[FAIL] test 19: response FIFO peaked at %0d entries, exceeds depth 3", resp_peak);
+                errors++;
+            end
+
+            // Completeness: every request answered exactly once (a second
+            // answer would have been flagged as spurious by the checker).
+            if (ooo_resp_cnt != n_issued || ooo_busy != '0) begin
+                $error("[FAIL] test 19: %0d responses for %0d accepted requests, ids still outstanding %b",
+                       ooo_resp_cnt, n_issued, ooo_busy);
+                errors++;
+            end
+
+            // Bookkeeping consistency between the controller's miss
+            // classification, its MSHR traffic and the fill model.
+            if (alloc_log.size() != misses || afm_new_cnt + afm_merge_cnt != misses) begin
+                $error("[FAIL] test 19: %0d misses, %0d MSHR allocations, %0d + %0d entries opened / merged -- expected all equal",
+                       misses, alloc_log.size(), afm_new_cnt, afm_merge_cnt);
+                errors++;
+            end
+            if (cov_replay != misses) begin
+                $error("[FAIL] test 19: %0d replays for %0d misses, expected exactly one each", cov_replay, misses);
+                errors++;
+            end
+            if (afm_fill_cnt != afm_new_cnt || fill_log.size() != afm_new_cnt) begin
+                $error("[FAIL] test 19: %0d fills accepted (%0d logged) for %0d entries opened, expected one each",
+                       afm_fill_cnt, fill_log.size(), afm_new_cnt);
+                errors++;
+            end
+            if (afm_wb_cnt != cov_dirty_evict || wb_req_cnt != cov_dirty_evict) begin
+                $error("[FAIL] test 19: %0d writebacks handed off (%0d counted by the logger) for %0d dirty evictions, expected one each",
+                       afm_wb_cnt, wb_req_cnt, cov_dirty_evict);
+                errors++;
+            end
+
+            // Final state: everything idle.
+            if (dut.wait_valid !== '0 || dut.wait_ready !== '0 || dut.resp_count != 0 ||
+                stub_line_id.num() != 0) begin
+                $error("[FAIL] test 19: not idle at the end -- wait_valid %b, wait_ready %b, resp_count %0d, %0d stub entries open",
+                       dut.wait_valid, dut.wait_ready, dut.resp_count, stub_line_id.num());
+                errors++;
+            end
+
+            // Coverage floors.
+            if (afm_fill_cnt        < T19_MIN_FILLS       ||
+                afm_merge_cnt       < T19_MIN_MERGES      ||
+                afm_merge_done      < T19_MIN_MERGE_DONE  ||
+                cov_dirty_evict     < T19_MIN_DIRTY_EVICT ||
+                cov_clean_evict     < T19_MIN_CLEAN_EVICT ||
+                cov_replay          < T19_MIN_REPLAYS     ||
+                cov_restart         < T19_MIN_RESTARTS    ||
+                cov_wb_stall        < T19_MIN_WB_STALLS   ||
+                afm_remiss_wb_cnt   < T19_MIN_REMISS_WB   ||
+                raw_stall_cnt - raw_base < T19_MIN_RAW    ||
+                cov_replay_raw      < T19_MIN_REPLAY_RAW  ||
+                cov_f0_defer        < T19_MIN_F0_DEFER    ||
+                cov_hit_under       < T19_MIN_HIT_UNDER   ||
+                cov_fill_held       < T19_MIN_FILL_HELD) begin
+                $error("[FAIL] test 19: coverage below floor (see the summary above; floors: fills %0d, merges %0d (%0d into a completed entry), dirty %0d, clean %0d, replays %0d, restarts %0d, wb stalls %0d, re-miss after wb %0d, RAW %0d, replay RAW %0d, F0 deferrals %0d, hit-under-miss %0d, fill held %0d)",
+                       T19_MIN_FILLS, T19_MIN_MERGES, T19_MIN_MERGE_DONE, T19_MIN_DIRTY_EVICT,
+                       T19_MIN_CLEAN_EVICT, T19_MIN_REPLAYS, T19_MIN_RESTARTS, T19_MIN_WB_STALLS,
+                       T19_MIN_REMISS_WB, T19_MIN_RAW, T19_MIN_REPLAY_RAW, T19_MIN_F0_DEFER,
+                       T19_MIN_HIT_UNDER, T19_MIN_FILL_HELD);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 19: %0d random requests end to end with automatic fills -- every response matched by id against the flat-memory reference, every eviction and writeback checked, all answered exactly once, coverage floors met",
+                         n_issued);
+        end
+
+        // ---------------------------------------------------------------
         // PROGRESS MARKER -- tests 1-10 implemented and passing (2026-10-04);
         // tests 4, 9, 10 updated for MSHR allocation on miss (2026-10-06).
         // Test infrastructure now available: make_addr, preload_line,
@@ -4094,9 +4454,25 @@ module cache_controller_tb;
         // by sb_access and the replay predictions, and stub release on
         // fill.
         //
-        // Next (R2): an automatic MSHR fill model, so that test 9 runs
-        // end to end with fills, evictions and replays, and removal of
-        // test 9's temporary miss cap (T9_MAX_MISSES).
+        // R2 (branch tb_auto_fill, 2026-10-12): automatic MSHR fill model
+        // (afm_en: random completion delays, lowest-id-first presentation
+        // held until accepted, writebacks into golden_mem, random
+        // mshr_wb_ready), allocation stub with id recycling, flat reference
+        // memory (ref_mem) applied in acceptance order, out-of-order
+        // response checker matched by id (ooo_issue, ooo_issue_free_id),
+        // eviction / writeback data checker, cpu_send_bounded, end-to-end
+        // coverage counters. Test 9 is now hit-only (miss cap removed);
+        // test 19 runs hits, misses, merges, fills, restarts, clean and
+        // dirty evictions, writebacks, replays and back-pressure together
+        // (30 seeds clean; 9 of 10 RTL mutants fail it. The tenth, which
+        // removes the F0 deferral behind a same-set store hit, is
+        // functionally equivalent: the stale read affects only the stored
+        // way, which the store has just made most recently used, so it is
+        // never the victim and its stale copy is never consumed).
+        //
+        // Next: the controller README, then the top level (controller +
+        // arrays + real MSHR), where test 19's traffic can be reused
+        // against the real fill engine and an AXI memory model.
         // ---------------------------------------------------------------
 
         $finish;
