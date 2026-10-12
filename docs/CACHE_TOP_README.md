@@ -218,9 +218,136 @@ the MSHR has entries (`2**TXN_ID_WIDTH ≤ 2**MSHR_ID_WIDTH`). That check
 lives inside `cache_controller`, next to the argument that depends on it
 (every miss is guaranteed a free or matching MSHR entry).
 
-## Verification status
+## Verification
 
-Compiles and elaborates under ModelSim 18.1 with no warnings other than
-the known "SVA only supported in Questa" notes, and a smoke run (one
-load miss reaching the `AR` channel) behaves as expected. A system-level
-testbench with an AXI memory model is the next step.
+System testbench: [`tb/cache_top_tb.sv`](../tb/cache_top_tb.sv). It
+drives the real `cache_top` (nothing stubbed) from a CPU model and
+serves its AXI port from a memory model; internal signals are only
+*read* (white-box checks and coverage).
+
+### Methodology
+
+- **Pass criterion — the cache must look like plain memory.** Every
+  request takes effect at the moment it is accepted
+  (`req_valid && req_ready`), in acceptance order. The scoreboard keeps a
+  reference memory image: a store updates it at acceptance, a load's
+  expected data is read from it at acceptance. Responses may come back in
+  any order; each is matched by `resp_id`, exactly once, and `resp_we`
+  is checked.
+- **AXI memory model (TB only).** Random, independent back-pressure on
+  `arready`, `awready`, `wready`; random read latency and gaps between
+  `R` beats; random `B` delay. Reads with different IDs complete **out of
+  order** and their beats may **interleave**. A write lands in memory
+  only at its `B` response, and reads are never ordered against writes —
+  so a read that overtook the writeback of the same line would return
+  stale data. Directed tests can freeze any channel or script the exact
+  order of `R` beats.
+- **Protocol checks on the master side.** Every burst is INCR, 4 beats,
+  full width, line-aligned; `wstrb` all ones; `wlast` exactly on beat 4;
+  `arvalid`/`awvalid`/`wvalid` and their payload stay stable until
+  accepted; no ID reused while outstanding; no second read of a line
+  already being read (a missed merge); no read of a line whose writeback
+  has not yet received `B`; every `W` burst carries exactly the victim the
+  controller handed to the MSHR, in hand-off order.
+- **White-box checks.** Every victim handed to the writeback queue must
+  equal the reference image of that line. ModelSim 18.1 does not evaluate
+  `assert property`, so the controller's assertions are re-checked
+  procedurally every cycle (MSHR never refuses an allocation, a replay
+  never misses, no duplicate line after a fill, no multi-way hit, waiting
+  table and response FIFO never overflow, fill/replay/lookup exclusion,
+  one-hot replay selection, LRU ages stay a permutation).
+- **End-of-test consistency.** For every line ever touched: dirty copy
+  in the cache, or else memory, must equal the reference; then every
+  touched word is read back through the cache.
+- **No hangs.** Every wait is bounded; a timeout prints a diagnostic dump
+  (outstanding ids, MSHR entries, queues) and a `[FAIL]`, then ends the
+  run. A global watchdog backs this up.
+
+### Tests
+
+| # | Test | What it shows |
+|---|---|---|
+| 1 | Reset idle | Ready, no response, no AXI traffic after reset |
+| 2 | Load miss → fill → hit | One line-aligned `AR`, memory data returned; next word hits in 2 cycles with no traffic |
+| 3 | Store miss, then load | Write-allocate (one `AR`), stored word and neighbour read back, no `AW` before eviction |
+| 4 | Hit-under-miss | 8 hits complete in 2 cycles each while a miss is frozen in memory |
+| 5 | Secondary-miss merge | 8 requests to one missing line → 1 `AR`, 7 merges; loads after stores to the same word see the stores |
+| 6 | Dirty victim | Full set, LRU line dirty → exactly one writeback, to its own address, with its full modified data |
+| 7 | Re-miss during delayed `B` | Re-read of a just-evicted dirty line is held until `B`, then returns the written data |
+| 8 | Writeback queue full | `awready` held low: 4 victims queue up, the 5th eviction stalls with the CPU held off, then 5 writebacks drain in order |
+| 9 | Fill restart (F0/F1) | Scripted `R` beats: higher-ID line finishes one cycle before a lower-ID line → exactly one restart, both installed once |
+| 10 | CPU back-pressure | 400 random requests with `resp_ready` 20 % and long stalls: no response lost, duplicated, or changed while held |
+| 11 | Constrained random | 5000 requests (`+nreq`), `+seed`, 4 sets × 8 lines, timing profile redrawn every 250 requests; coverage floors |
+| 12 | Consistency | Memory + dirty lines equal the reference; every touched word reads back correctly |
+
+### Coverage (test 11, seed 1, 5000 requests)
+
+| Event | Count | Floor |
+|---|---|---|
+| Dirty writebacks | 1038 | 300 |
+| Merged misses | 931 | 250 |
+| Re-misses held by the read-after-write rule | 208 | 50 |
+| Fill restarts (F0/F1 selection change) | 100 | 25 |
+| Replays | 2375 | 750 |
+| Hit-under-miss responses | 1921 | 500 |
+| Out-of-order `R` completions | 261 | 75 |
+| Interleaved `R` beats | 461 | 125 |
+| Cycles stalled on a full writeback queue | 15464 | > 0 |
+
+Floors are about one third of the lowest value seen over seeds 1–30.
+All 30 seeds pass, as do two 50 000-request runs.
+
+### Mutation testing — can the testbench fail?
+
+Each mutant is a copy of the RTL with one deliberate bug, simulated in a
+scratch directory. All 12 are caught; none hangs the simulator.
+
+| Mutant | Caught by |
+|---|---|
+| MSHR without the read-after-write hold | `AR` before `B` check (test 7), stale data in tests 7/10/11/12 |
+| Replay by slot index instead of age | Scoreboard data mismatches (test 11) |
+| Wrong victim data (neighbouring way) | Victim-vs-reference check (test 6 on), `W` data, memory consistency |
+| Fill ignores `wb_ready` | Test 8 (no stall), scoreboard and consistency in test 11 |
+| Merge disabled in the MSHR | "second read of a line" `AR` check (test 5 on) |
+| No `AR` grant lock (the bug fixed below) | `AR` payload stability check (test 11) |
+| Fill restart ignored (`fill_id` not compared) | Test 9 restart count, victim checks in test 11 |
+| `wlast` one beat early | `wlast` check, then idle watchdog (test 6) |
+| No same-set read-after-write stall | Scoreboard data mismatches (tests 10, 11) |
+| LRU victim always way 0 | Writeback order in test 8 |
+| Fill allowed while replays are pending | Duplicate-line and lookup-during-F1 mirrors (test 9), driver watchdog |
+| Store hit does not set the dirty bit | No writeback in test 6, stale data in test 7, test 8 watchdog |
+
+### Bug found
+
+`mshr.sv`: the `AR` arbiter re-arbitrated every cycle, so when a new
+entry started requesting while a request was waiting for `arready`,
+`arid`/`araddr` switched to the newcomer — forbidden by AXI. Found by
+the stability check in test 11; fixed with a grant lock (see
+[`MSHR_README.md`](MSHR_README.md#the-ar-arbiter-why-round-robin-not-fixed-priority)).
+
+### Known limitations
+
+- AXI error responses (`SLVERR`/`DECERR`) are never generated; the cache
+  ignores `rresp`/`bresp`.
+- The memory model always takes write data after its `AW` (AXI also
+  allows `W` first); the MSHR never sends `W` first, so this is not
+  exercised.
+- One configuration only (the default parameters).
+- No reset in the middle of traffic at system level (covered for the
+  MSHR alone in `mshr_tb` test 13).
+- LRU order is checked only indirectly (test 8 and the permutation
+  invariant), not against a reference model of recency.
+
+### Running
+
+```bash
+vlib work
+vlog -sv rtl/axi_if.sv rtl/cache_controller.sv rtl/cache_data_sram.sv \
+     rtl/cache_tag_array.sv rtl/cache_valid_array.sv rtl/cache_top.sv rtl/mshr.sv \
+     tb/cache_top_tb.sv
+vsim -c cache_top_tb +seed=7 +nreq=5000 -do "run -all; quit -f"
+```
+
+`./tools/sim/run.sh cache_top_tb` also works (default seed 1, 5000
+requests). Each test prints `[PASS]`/`[FAIL]`; the last line is a
+`[SUMMARY]`.
