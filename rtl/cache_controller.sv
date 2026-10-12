@@ -27,9 +27,9 @@
 // store-hit write, read-after-write stall, response FIFO), the true-LRU
 // replacement state (updated on hits and fills), the miss side of miss
 // handling (MSHR allocation, waiting table with age-ordered slots,
-// waiting-table back-pressure), and fill installation into an invalid
-// or LRU way with dirty-victim writeback are implemented; replay of
-// waiting requests is added in a later step.
+// waiting-table back-pressure), fill installation into an invalid or
+// LRU way with dirty-victim writeback, and replay of waiting requests
+// through the hit path are implemented.
 // -----------------------------------------------------------------------
 `default_nettype none
 
@@ -138,18 +138,16 @@ module cache_controller #(
 
     // -------------------------------------------------------------------
     // Address decomposition
-    // Splits an incoming request address into the fields the tag array
-    // was built to index on. Word/byte offset are not needed for the
-    // lookup itself, but are decomposed here since the word offset is
-    // needed later to select/mask the correct word within the hit line.
+    // An address is split into tag, set index and word offset: the set
+    // indexes the arrays, the tag is compared, and the word offset
+    // selects/masks the word within the line. The lookup itself uses the
+    // decomposed issue source (CPU or replay, see below); the CPU's own
+    // set index is also needed on its own, for the read-after-write
+    // hazard check on an incoming request.
     // -------------------------------------------------------------------
     logic [SET_IDX_WIDTH-1:0]  req_set_idx;
-    logic [TAG_WIDTH-1:0]      req_tag;
-    logic [WORD_OFF_WIDTH-1:0] req_word_off;
 
-    assign req_word_off = req_addr[BYTE_OFF_WIDTH +: WORD_OFF_WIDTH];
     assign req_set_idx  = req_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH +: SET_IDX_WIDTH];
-    assign req_tag      = req_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH + SET_IDX_WIDTH +: TAG_WIDTH];
 
     // The line presented by the MSHR for installation is decomposed the
     // same way. The fill signals declared here are driven in the Fill
@@ -164,17 +162,54 @@ module cache_controller #(
     assign fill_set_idx = mshr_fill_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH +: SET_IDX_WIDTH];
     assign fill_tag     = mshr_fill_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH + SET_IDX_WIDTH +: TAG_WIDTH];
 
+    // Issue source: a request enters the lookup stage either from the CPU
+    // or as a replay of a waiting request whose line has been installed.
+    // The replay signals declared here are driven in the Replay section
+    // below. While a replay is pending the CPU is held off (see Request
+    // acceptance), so the replay's fields can be selected on
+    // replay_pending alone.
+    logic                      replay_pending;   // a waiting request is ready to replay
+    logic                      replay_issue;     // a replay enters the lookup stage this cycle
+    logic [WAIT_IDX_WIDTH-1:0] replay_idx;       // waiting-table slot being replayed
+    logic [ADDR_WIDTH-1:0]     replay_addr;
+    logic                      replay_we;
+    logic [DATA_WIDTH-1:0]     replay_wdata;
+    logic [TXN_ID_WIDTH-1:0]   replay_id;
+
+    logic [ADDR_WIDTH-1:0]     src_addr;
+    logic                      src_we;
+    logic [DATA_WIDTH-1:0]     src_wdata;
+    logic [TXN_ID_WIDTH-1:0]   src_id;
+    logic [SET_IDX_WIDTH-1:0]  src_set_idx;
+    logic [TAG_WIDTH-1:0]      src_tag;
+    logic [WORD_OFF_WIDTH-1:0] src_word_off;
+
+    assign src_addr     = replay_pending ? replay_addr  : req_addr;
+    assign src_we       = replay_pending ? replay_we    : req_we;
+    assign src_wdata    = replay_pending ? replay_wdata : req_wdata;
+    assign src_id       = replay_pending ? replay_id    : req_id;
+    assign src_word_off = src_addr[BYTE_OFF_WIDTH +: WORD_OFF_WIDTH];
+    assign src_set_idx  = src_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH +: SET_IDX_WIDTH];
+    assign src_tag      = src_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH + SET_IDX_WIDTH +: TAG_WIDTH];
+
     // Array read ports: all three arrays receive the same address every
     // cycle, and their registered outputs return together one cycle
-    // later. While the MSHR presents a fill, the read port belongs to the
-    // fill's set; the CPU is held off at the same time (see Request
-    // acceptance), so no accepted request is ever looked up at the wrong
-    // address. Otherwise the CPU's address is driven, and the result is
-    // consumed only for an accepted request (marked by lookup_q.valid).
-    // During a fill, the lookup tag is the fill's own tag, which lets the
-    // duplicate-line invariant below be checked on tag_match.
-    assign tag_rd_set_idx   = mshr_fill_valid ? fill_set_idx : req_set_idx;
-    assign tag_lookup_tag   = mshr_fill_valid ? fill_tag     : req_tag;
+    // later. Priority follows the issue priority, replay > fill > CPU:
+    //   - a pending replay drives its own address;
+    //   - otherwise, while the MSHR presents a fill, the read port belongs
+    //     to the fill's set; during a fill the lookup tag is the fill's
+    //     own tag, which lets the duplicate-line invariant below be
+    //     checked on tag_match;
+    //   - otherwise the CPU's address is driven.
+    // The CPU is held off whenever a replay or fill owns the port (see
+    // Request acceptance), so no accepted request is ever looked up at
+    // the wrong address; a result is consumed only for a request marked
+    // by lookup_q.valid.
+    logic fill_owns_rd;
+
+    assign fill_owns_rd     = mshr_fill_valid && !replay_pending;
+    assign tag_rd_set_idx   = fill_owns_rd ? fill_set_idx : src_set_idx;
+    assign tag_lookup_tag   = fill_owns_rd ? fill_tag     : src_tag;
     assign valid_rd_set_idx = tag_rd_set_idx;
     assign data_rd_set_idx  = tag_rd_set_idx;
 
@@ -187,6 +222,7 @@ module cache_controller #(
     // -------------------------------------------------------------------
     typedef struct packed {
         logic                      valid;     // this slot holds a real request looked up last cycle
+        logic                      replay;    // the request is a replay from the waiting table
         logic [ADDR_WIDTH-1:0]     addr;
         logic [SET_IDX_WIDTH-1:0]  set_idx;
         logic [TAG_WIDTH-1:0]      tag;
@@ -200,16 +236,18 @@ module cache_controller #(
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            lookup_q.valid <= 1'b0;
+            lookup_q.valid  <= 1'b0;
+            lookup_q.replay <= 1'b0;
         end else begin
-            lookup_q.valid    <= req_valid && req_ready;
-            lookup_q.addr     <= req_addr;
-            lookup_q.set_idx  <= req_set_idx;
-            lookup_q.tag      <= req_tag;
-            lookup_q.word_off <= req_word_off;
-            lookup_q.we       <= req_we;
-            lookup_q.wdata    <= req_wdata;
-            lookup_q.id       <= req_id;
+            lookup_q.valid    <= (req_valid && req_ready) || replay_issue;
+            lookup_q.replay   <= replay_issue;
+            lookup_q.addr     <= src_addr;
+            lookup_q.set_idx  <= src_set_idx;
+            lookup_q.tag      <= src_tag;
+            lookup_q.word_off <= src_word_off;
+            lookup_q.we       <= src_we;
+            lookup_q.wdata    <= src_wdata;
+            lookup_q.id       <= src_id;
         end
     end
 
@@ -228,7 +266,12 @@ module cache_controller #(
     assign hit_vec     = tag_match & valid_out;
     assign hit_any     = |hit_vec;
     assign lookup_hit  = lookup_q.valid &&  hit_any;
-    assign lookup_miss = lookup_q.valid && !hit_any;
+
+    // A replay always hits (its line was installed just before, and no
+    // fill can evict it first -- see Replay); it is excluded here so that
+    // a violation, caught by the assertion in Replay, cannot also corrupt
+    // the MSHR or the waiting table.
+    assign lookup_miss = lookup_q.valid && !hit_any && !lookup_q.replay;
 
     // One-hot to binary encoder. The allocation policy never places the
     // same tag in two ways of one set, so at most one bit of hit_vec is
@@ -552,8 +595,7 @@ module cache_controller #(
     // Storage is in flip-flops: on a fill, every slot must be compared
     // against the filling MSHR id in parallel, and several slots may
     // match (merged requests). A new miss takes the lowest-indexed free
-    // slot. Slots are released by the replay logic (added with the fill
-    // path); until then a slot, once taken, stays occupied.
+    // slot. A slot is released when its request is replayed (see Replay).
     //
     // WAIT_DEPTH defaults to 2**TXN_ID_WIDTH, the maximum number of
     // distinct CPU requests that can be outstanding, so the table never
@@ -602,8 +644,9 @@ module cache_controller #(
     //     earlier occupant of slot i was older than, the new occupant is
     //     younger than all of them.
     // Bits involving a free slot are stale but harmless, since every
-    // reader masks with wait_valid. The replay selector (fill step) picks
-    // the matching slot whose row has no matching older slot.
+    // reader masks with wait_valid (or with wait_ready, a subset of it).
+    // The replay selector picks the ready slot whose row has no ready
+    // older slot.
     // Cost: WAIT_DEPTH x WAIT_DEPTH = 256 flip-flops at the default.
     // -------------------------------------------------------------------
     logic [WAIT_DEPTH-1:0] wait_older [WAIT_DEPTH];
@@ -623,11 +666,16 @@ module cache_controller #(
         end
     end
 
+    // Allocation and release never target the same slot (allocation takes
+    // a free slot, release an occupied one), so both may apply on one edge.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             wait_valid <= '0;
-        end else if (wait_alloc) begin
-            wait_valid[wait_free_idx] <= 1'b1;
+        end else begin
+            if (wait_alloc)
+                wait_valid[wait_free_idx] <= 1'b1;
+            if (replay_issue)
+                wait_valid[replay_idx] <= 1'b0;
         end
     end
 
@@ -688,7 +736,10 @@ module cache_controller #(
     logic [WAY_WIDTH-1:0]     fill_inv_way;    // lowest-indexed invalid way
     logic                     victim_dirty;    // victim holds modified data that must be written back
 
-    assign fill_start   = mshr_fill_valid && !fill_busy
+    // A fill does not start while a replay is pending (replay > fill):
+    // the waiters of the line just installed replay before any other line
+    // can evict it.
+    assign fill_start   = mshr_fill_valid && !fill_busy && !replay_pending
                           && !(arr_wr_active && (arr_wr_set_idx == fill_set_idx));
     assign fill_id_same = (mshr_fill_id == fill_id_q);
 
@@ -784,7 +835,9 @@ module cache_controller #(
     //       request miss;
     //   (c) the request does not collide with a same-cycle array write;
     //   (d) the MSHR is not presenting a fill, which owns the array read
-    //       ports and, in F1, the array write and LRU update ports.
+    //       ports and, in F1, the array write and LRU update ports;
+    //   (e) no replay is pending, since replays own the issue slot
+    //       (priority replay > fill > CPU).
     // (a) and (b) both count the occupied entries plus the one request
     // already in the lookup stage, whose outcome is not yet known and is
     // therefore assumed to consume an entry; the new request needs one
@@ -816,7 +869,9 @@ module cache_controller #(
     // derives from its entry state alone, so no combinational loop forms.
     // Since a fill write occurs only while mshr_fill_valid is high, (d)
     // also prevents any request from reading a set during its fill write.
-    assign req_ready  = resp_space && wait_space && !raw_hazard && !mshr_fill_valid;
+    // (e) depends on registered state only (wait_ready).
+    assign req_ready  = resp_space && wait_space && !raw_hazard && !mshr_fill_valid
+                        && !replay_pending;
 
 `ifndef SYNTHESIS
     // The acceptance rule must guarantee that a lookup result never finds
@@ -824,6 +879,102 @@ module cache_controller #(
     assert property (@(posedge clk) disable iff (!rst_n)
                      resp_push |-> (resp_count < RESP_CNT_WIDTH'(RESP_FIFO_DEPTH)))
         else $error("cache_controller: response FIFO overflow");
+`endif
+
+    // -------------------------------------------------------------------
+    // Replay
+    // Re-runs each waiting request through the hit path once its line has
+    // been installed. The request then hits: a load returns its word, a
+    // store writes its word and marks the line dirty, the LRU order is
+    // updated, and the response carries the request's own CPU id.
+    //
+    // Ready marking: on the fill's write cycle, every occupied slot that
+    // waits on the filled MSHR entry is marked ready. The mark is taken at
+    // fill time, not by comparing ids later, because the MSHR frees the
+    // entry on that same edge and may hand its id to a new miss at once;
+    // a later comparison could not tell the old waiters from the new one.
+    // A request merged into the entry during F0 is already recorded (the
+    // waiting table is written at the end of F0), and none can arrive in
+    // F1, since the lookup stage is empty then.
+    //
+    // Selection: the oldest ready slot, i.e. the one with no older ready
+    // slot in the age matrix. The ready slots always belong to a single
+    // line (a fill cannot start while any are pending), so this is
+    // exactly the line's arrival order, and a load behind a store to the
+    // same word observes the store.
+    //
+    // Issue: a replay takes the lookup stage when the response FIFO has
+    // room for its result, and not in a cycle in which a store hit writes
+    // its set (the same read-after-write rule as for CPU requests -- a
+    // replayed store followed by a further replay to the line costs one
+    // bubble). Its slot is released at issue: the replay is guaranteed to
+    // hit, so the request cannot return to the table.
+    //
+    // Priority replay > fill > CPU: while any replay is pending, neither
+    // a new fill (fill_start) nor a CPU request (req_ready) is accepted.
+    // Between a fill and its replays nothing can therefore evict the
+    // installed line, which is why a replay always hits (asserted).
+    // -------------------------------------------------------------------
+    logic [WAIT_DEPTH-1:0] wait_ready;      // slot's line is installed; request awaits replay
+    logic [WAIT_DEPTH-1:0] replay_oldest;   // one-hot: oldest ready slot
+    logic                  replay_hazard;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            wait_ready <= '0;
+        end else begin
+            if (fill_wr) begin
+                for (int i = 0; i < WAIT_DEPTH; i++)
+                    if (wait_valid[i] && wait_mem[i].mshr_id == mshr_fill_id)
+                        wait_ready[i] <= 1'b1;
+            end
+            if (replay_issue)
+                wait_ready[replay_idx] <= 1'b0;
+        end
+    end
+
+    assign replay_pending = |wait_ready;
+
+    // Oldest ready slot. The age matrix orders all occupied slots totally,
+    // so exactly one ready slot has no ready slot older than itself.
+    always_comb begin
+        for (int i = 0; i < WAIT_DEPTH; i++)
+            replay_oldest[i] = wait_ready[i] && !(|(wait_older[i] & wait_ready));
+    end
+
+    always_comb begin
+        replay_idx = '0;
+        for (int i = 0; i < WAIT_DEPTH; i++)
+            if (replay_oldest[i]) replay_idx = WAIT_IDX_WIDTH'(i);
+    end
+
+    assign replay_addr  = wait_mem[replay_idx].addr;
+    assign replay_we    = wait_mem[replay_idx].we;
+    assign replay_wdata = wait_mem[replay_idx].wdata;
+    assign replay_id    = wait_mem[replay_idx].id;
+
+    assign replay_hazard = arr_wr_active && (src_set_idx == arr_wr_set_idx);
+    assign replay_issue  = replay_pending && resp_space && !replay_hazard;
+
+`ifndef SYNTHESIS
+    // A pending replay always has exactly one oldest candidate.
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     replay_pending |-> $onehot(replay_oldest))
+        else $error("cache_controller: replay selection not one-hot (ready %b, oldest %b)",
+                    wait_ready, replay_oldest);
+
+    // A replay must hit: its line was installed just before, and nothing
+    // can evict it before the replay (priority replay > fill > CPU).
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     (lookup_q.valid && lookup_q.replay) |-> hit_any)
+        else $error("cache_controller: replay of 0x%08h (id %0d) missed",
+                    lookup_q.addr, lookup_q.id);
+
+    // Ready marks are only taken at a fill's completion, which cannot
+    // coincide with a pending replay.
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     fill_busy |-> !replay_pending)
+        else $error("cache_controller: replay pending during fill F1");
 `endif
 
     // -------------------------------------------------------------------
@@ -844,7 +995,14 @@ module cache_controller #(
     //   - Resolved in mshr.sv (2026-10-12, mshr_tb test 14): a miss to a
     //     line still queued for writeback holds its AR until that write's
     //     B response (see "Read-after-write ordering" there).
-    //   - Replay of waiting requests through the hit path.
+    //
+    // Replay R1 (branch cache_replay, 2026-10-12): ready marking at fill,
+    // oldest-first selection via the age matrix, issue into the lookup
+    // stage, slot release at issue, priority replay > fill > CPU (see
+    // Replay). Tests 17-18 pending.
+    //
+    // Next: R2 -- automatic MSHR fill model in the TB and test 9 without
+    // its miss cap; then the controller README and the top level.
     // -------------------------------------------------------------------
 
 endmodule : cache_controller
