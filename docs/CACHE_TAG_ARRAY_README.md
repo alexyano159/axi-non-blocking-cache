@@ -33,6 +33,9 @@ It is responsible for:
   the hit-write (dirty only) is implemented; the fill-write (tag +
   dirty) is added with miss handling. This module has no arbitration
   logic of its own.
+- Reading `tag_out` when it evicts a dirty line: the victim's
+  writeback address is `{stored tag, set index, zero offset}`, and
+  this array is the only place that tag is kept.
 - No direct connection to the MSHR -- fill data reaches this module
   only via the controller.
 
@@ -45,6 +48,7 @@ It is responsible for:
 | `lookup_tag` | `TAG_WIDTH` (22) | in | Tag to compare against all `NUM_WAYS` ways of the addressed set. |
 | `tag_match` | `NUM_WAYS` (4), one bit per way | out | Raw, valid-agnostic per-way compare result, registered -- valid one cycle after `rd_set_idx`/`lookup_tag`. |
 | `dirty_out` | `NUM_WAYS` (4), one bit per way | out | Each way's dirty bit, registered alongside `tag_match`. |
+| `tag_out` | `TAG_WIDTH` (22) x `NUM_WAYS` (4), unpacked | out | Each way's stored tag, registered alongside `tag_match`. Used to form a dirty victim's writeback address. |
 | `wr_en` | 1 | in | Master write enable. With this low, nothing changes regardless of the other write signals. |
 | `wr_set_idx` | `SET_IDX_WIDTH` (6) | in | Set to write. |
 | `wr_way_sel` | `WAY_WIDTH` (2) | in | Way to write. |
@@ -67,7 +71,7 @@ added with miss handling.
 
 Both the compare and write ports are synchronous (`always_ff`):
 - **Compare:** `rd_set_idx`/`lookup_tag` are sampled on the clock edge;
-  `tag_match`/`dirty_out` are valid the *following* edge -- matching
+  `tag_match`/`dirty_out`/`tag_out` are valid the *following* edge -- matching
   `cache_data_sram`'s `rd_line` latency, so the controller can combine
   both arrays' results in the same cycle.
 - **Collision:** a write to the same (way, set) on the same edge as a
@@ -99,8 +103,7 @@ written -- correctness after reset is that array's job, not this one's.
 
 ## Verification
 
-See `tb/cache_tag_array_tb.sv` -- 8 directed tests, verified with
-`iverilog`:
+See `tb/cache_tag_array_tb.sv` -- 9 directed tests:
 
 1. **Fill-write, matching lookup** -- the basic contract: a filled way
    reports a match with the correct dirty bit.
@@ -129,6 +132,11 @@ See `tb/cache_tag_array_tb.sv` -- 8 directed tests, verified with
    `wr_en=0` leaves the target location completely unchanged, closing
    the coverage hole every other test leaves open by always asserting
    `wr_en` when writing.
+9. **Stored-tag read-out (`tag_out`)** -- all four ways of two adjacent
+   sets hold distinct, full-width tags; reading the sets back-to-back
+   must return each way's own tag for whichever set was addressed.
+   Catches way-ordering, off-by-one set index and truncation errors,
+   any of which would send an evicted dirty line to the wrong address.
 
 See `private_notes/VERIFICATION_PROBLEMS.txt` for a same-edge
 `wr_en`-deassertion race hit while bringing test 1 up, and how it was

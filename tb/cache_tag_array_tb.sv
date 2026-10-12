@@ -54,6 +54,7 @@ module cache_tag_array_tb;
     logic [TAG_WIDTH-1:0]     lookup_tag;
     logic [NUM_WAYS-1:0]      tag_match;
     logic [NUM_WAYS-1:0]      dirty_out;
+    logic [TAG_WIDTH-1:0]     tag_out [NUM_WAYS];
 
     logic                     wr_en;
     logic [SET_IDX_WIDTH-1:0] wr_set_idx;
@@ -79,6 +80,7 @@ module cache_tag_array_tb;
         .lookup_tag (lookup_tag),
         .tag_match  (tag_match),
         .dirty_out  (dirty_out),
+        .tag_out    (tag_out),
 
         .wr_en      (wr_en),
         .wr_set_idx (wr_set_idx),
@@ -528,6 +530,56 @@ module cache_tag_array_tb;
                 $error("[FAIL] test 8: dirty_out[%0d] = %b, expected %b (write with wr_en=0 must not change dirty)", test_way, got_dirty[test_way], original_dirty);
             else
                 $display("[PASS] test 8: write request with wr_en low did not modify memory");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 9: stored-tag read-out. Fills all four ways of two
+        // adjacent sets with distinct tags, then looks the two sets up
+        // on consecutive cycles. tag_out must return every way's own
+        // tag, in way order, for whichever set was addressed. Distinct
+        // per-way tags catch a way-ordering or bank-wiring error;
+        // adjacent sets read back-to-back catch an off-by-one on the
+        // read index and a read register that fails to update. Tags
+        // span the full TAG_WIDTH (MSB set) so a truncated output is
+        // also detected. tag_out is the only source of a dirty victim's
+        // writeback address, so any of these errors would write a line
+        // back to the wrong memory location.
+        // ---------------------------------------------------------------
+        begin
+            logic [SET_IDX_WIDTH-1:0] test_sets [2];
+            logic [TAG_WIDTH-1:0]     exp_tag   [2][NUM_WAYS];
+            logic [NUM_WAYS-1:0]      got_match;
+            logic [NUM_WAYS-1:0]      got_dirty;
+            logic                     readout_ok;
+
+            test_sets[0] = 6'd40;
+            test_sets[1] = 6'd41;
+
+            // Preload: tag = {MSB pattern, set number, way number}, so
+            // every (set, way) pair holds a unique, full-width value.
+            for (int s = 0; s < 2; s++) begin
+                for (int w = 0; w < NUM_WAYS; w++) begin
+                    exp_tag[s][w] = 22'h20_0000 | (22'(s) << 8) | 22'(w);
+                    tag_write(test_sets[s], w[WAY_WIDTH-1:0], exp_tag[s][w], 1'b1, 1'b0, 1'b1);
+                end
+            end
+
+            // Look the two sets up on consecutive cycles. The lookup tag
+            // is irrelevant here: tag_out does not depend on the compare.
+            readout_ok = 1'b1;
+            for (int s = 0; s < 2; s++) begin
+                tag_lookup(test_sets[s], '0, got_match, got_dirty);
+
+                for (int w = 0; w < NUM_WAYS; w++) begin
+                    if (tag_out[w] !== exp_tag[s][w]) begin
+                        readout_ok = 1'b0;
+                        $error("[FAIL] test 9: set %0d tag_out[%0d] = %h, expected %h", test_sets[s], w, tag_out[w], exp_tag[s][w]);
+                    end
+                end
+            end
+
+            if (readout_ok)
+                $display("[PASS] test 9: tag_out returned every way's stored tag for each addressed set");
         end
 
         $finish;

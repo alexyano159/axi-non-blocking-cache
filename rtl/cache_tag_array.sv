@@ -35,6 +35,12 @@
 // are presented -- so the controller can combine this array's hit
 // information with the data array's line contents in the same cycle.
 //
+// The stored tags of the addressed set are also read out (tag_out),
+// with the same one-cycle latency. The compare alone is sufficient for
+// hit detection, but eviction requires the victim's actual tag: a dirty
+// victim's writeback address is {stored tag, set index, zero offset},
+// and no other structure retains that tag.
+//
 // No reset: see rationale above. Garbage tag/dirty content in an entry
 // that has never been filled is harmless, because the valid array's
 // reset guarantees that entry is never trusted until it is written.
@@ -60,14 +66,16 @@ module cache_tag_array #(
     // Read / compare port (cache controller -> tag array)
     // Driven every cycle a lookup is performed (load or store). Compares
     // lookup_tag against all NUM_WAYS tags of the addressed set and
-    // returns a raw per-way match vector plus each way's dirty bit, one
-    // cycle later; the controller ANDs tag_match with the valid array's
-    // output to determine the real hit/hit_way.
+    // returns a raw per-way match vector plus each way's dirty bit and
+    // stored tag, one cycle later; the controller ANDs tag_match with
+    // the valid array's output to determine the real hit/hit_way, and
+    // uses tag_out to form a dirty victim's writeback address.
     // -----------------------------------------------------------------
     input  wire logic [SET_IDX_WIDTH-1:0] rd_set_idx,
     input  wire logic [TAG_WIDTH-1:0]     lookup_tag,
     output      logic [NUM_WAYS-1:0]      tag_match,
     output      logic [NUM_WAYS-1:0]      dirty_out,
+    output      logic [TAG_WIDTH-1:0]     tag_out [NUM_WAYS],
 
     // -----------------------------------------------------------------
     // Write port (cache controller -> tag array)
@@ -94,16 +102,17 @@ module cache_tag_array #(
     logic [TAG_WIDTH-1:0] tag_mem   [NUM_WAYS][NUM_SETS];
     logic                 dirty_mem [NUM_WAYS][NUM_SETS];
 
-    // Registered compare: the tag stored at the addressed set is
-    // compared against lookup_tag combinationally, and only the
-    // 1-bit result (not the tag itself) is registered. This keeps
-    // tag_match/dirty_out latency identical to cache_data_sram's
-    // rd_line -- both are valid the cycle after the address is
-    // presented.
+    // Registered compare and read-out: the tag stored at the addressed
+    // set is compared against lookup_tag combinationally and the 1-bit
+    // result is registered; the stored tag itself is registered in
+    // parallel for eviction. This keeps tag_match/dirty_out/tag_out
+    // latency identical to cache_data_sram's rd_line -- all are valid
+    // the cycle after the address is presented.
     always_ff @(posedge clk) begin
         for (int w = 0; w < NUM_WAYS; w++) begin
             tag_match[w] <= (tag_mem[w][rd_set_idx] == lookup_tag);
             dirty_out[w] <= dirty_mem[w][rd_set_idx];
+            tag_out[w]   <= tag_mem[w][rd_set_idx];
         end
     end
 
