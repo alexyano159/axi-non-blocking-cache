@@ -185,27 +185,50 @@ module cache_controller_tb;
     // support non-blocking writes to associative-array elements); this is
     // race-free, since the entry written equals the id already being
     // driven for that line, so mshr_alloc_id does not change on the edge.
+    //
+    // Id recycling: once fills release entries, the id after the last one
+    // issued may still be held by an older, unfilled line. A new line is
+    // therefore given the first id at or after stub_next_id (cyclically)
+    // that no line currently holds (stub_id_busy). While no id has been
+    // released this reduces to the plain sequence BASE, BASE+1, ..., which
+    // tests 11-18 rely on. The real MSHR picks the lowest free entry
+    // instead; the controller must work with any assignment, and the
+    // rotating one spreads ids more widely, which varies the order in
+    // which completed entries are presented (lowest id first).
     // -------------------------------------------------------------------
     localparam logic [MSHR_ID_WIDTH-1:0] MSHR_STUB_ID_BASE = 4'd5;
 
-    logic [MSHR_ID_WIDTH-1:0] stub_line_id [logic [ADDR_WIDTH-1:0]];   // line address -> MSHR id
-    logic [MSHR_ID_WIDTH-1:0] stub_next_id = MSHR_STUB_ID_BASE;
+    logic [MSHR_ID_WIDTH-1:0]    stub_line_id [logic [ADDR_WIDTH-1:0]];   // line address -> MSHR id
+    logic [MSHR_ID_WIDTH-1:0]    stub_next_id = MSHR_STUB_ID_BASE;
+    logic [2**MSHR_ID_WIDTH-1:0] stub_id_busy = '0;                       // id held by an unfilled line
+    logic [MSHR_ID_WIDTH-1:0]    stub_free_id;                            // id a new line would receive
+
+    always_comb begin
+        stub_free_id = stub_next_id;
+        for (int k = 2**MSHR_ID_WIDTH - 1; k >= 0; k--)
+            if (!stub_id_busy[MSHR_ID_WIDTH'(stub_next_id + k)])
+                stub_free_id = MSHR_ID_WIDTH'(stub_next_id + k);
+    end
 
     always_comb
         mshr_alloc_id = stub_line_id.exists(mshr_alloc_addr) ? stub_line_id[mshr_alloc_addr]
-                                                              : stub_next_id;
+                                                              : stub_free_id;
 
     always @(posedge clk) begin
         if (!rst_n) begin
             stub_line_id.delete();
             stub_next_id <= MSHR_STUB_ID_BASE;
+            stub_id_busy <= '0;
         end else begin
             if (mshr_alloc_valid && !stub_line_id.exists(mshr_alloc_addr)) begin
-                stub_line_id[mshr_alloc_addr] =  stub_next_id;
-                stub_next_id                  <= stub_next_id + 1'b1;
+                stub_line_id[mshr_alloc_addr] =  stub_free_id;
+                stub_next_id                  <= stub_free_id + 1'b1;
+                stub_id_busy[stub_free_id]    <= 1'b1;
             end
-            if (mshr_fill_valid && mshr_fill_ready && stub_line_id.exists(mshr_fill_addr))
+            if (mshr_fill_valid && mshr_fill_ready && stub_line_id.exists(mshr_fill_addr)) begin
+                stub_id_busy[stub_line_id[mshr_fill_addr]] <= 1'b0;
                 stub_line_id.delete(mshr_fill_addr);
+            end
         end
     end
 
@@ -663,6 +686,309 @@ module cache_controller_tb;
     localparam int unsigned HIT_LATENCY = 2;   // accept edge -> response edge
 
     // -------------------------------------------------------------------
+    // Memory images (end-to-end tests).
+    // golden_mem is the memory below the cache, as the MSHR sees it: the
+    // automatic fill model reads whole lines from it, and every dirty
+    // victim handed off for writeback is written into it. ref_mem is the
+    // flat-memory reference model: the CPU-side scoreboard applies every
+    // accepted request to it, in acceptance order, and predicts each
+    // load from it (see ooo_issue). Both start from the same pattern,
+    // mem_init_word, and are materialised lazily: an address never
+    // written reads its initial pattern. The multiplier is odd, so the
+    // pattern is a bijection on word addresses -- a word returned from the
+    // wrong line, word or way never equals the expected one by accident.
+    // -------------------------------------------------------------------
+    logic [LINE_WIDTH-1:0] golden_mem [logic [ADDR_WIDTH-1:0]];   // line address -> line
+    logic [DATA_WIDTH-1:0] ref_mem    [logic [ADDR_WIDTH-1:0]];   // word address -> word
+
+    function automatic logic [DATA_WIDTH-1:0] mem_init_word(input logic [ADDR_WIDTH-1:0] word_addr);
+        return (word_addr * 32'h9E37_79B1) ^ 32'h5A5A_0000;
+    endfunction
+
+    function automatic logic [DATA_WIDTH-1:0] ref_read(input logic [ADDR_WIDTH-1:0] word_addr);
+        return ref_mem.exists(word_addr) ? ref_mem[word_addr] : mem_init_word(word_addr);
+    endfunction
+
+    // Reference contents of a whole line (word 0 in the least-significant
+    // bits, as in the data SRAM).
+    function automatic logic [LINE_WIDTH-1:0] ref_read_line(input logic [ADDR_WIDTH-1:0] line_address);
+        logic [LINE_WIDTH-1:0] line;
+        for (int w = 0; w < WORDS_PER_LINE; w++)
+            line[w * DATA_WIDTH +: DATA_WIDTH] = ref_read(line_address + ADDR_WIDTH'(w * (DATA_WIDTH / 8)));
+        return line;
+    endfunction
+
+    function automatic logic [LINE_WIDTH-1:0] golden_read(input logic [ADDR_WIDTH-1:0] line_address);
+        logic [LINE_WIDTH-1:0] line;
+        if (golden_mem.exists(line_address))
+            return golden_mem[line_address];
+        for (int w = 0; w < WORDS_PER_LINE; w++)
+            line[w * DATA_WIDTH +: DATA_WIDTH] = mem_init_word(line_address + ADDR_WIDTH'(w * (DATA_WIDTH / 8)));
+        return line;
+    endfunction
+
+    // -------------------------------------------------------------------
+    // Automatic MSHR fill model (enabled by afm_en).
+    // Tests 1-18 leave it disabled and drive the fill inputs themselves;
+    // the end-to-end test enables it. Seen from the controller, it behaves
+    // as the fill engine of rtl/mshr.sv:
+    //   - every new entry (a miss to a line without an entry; its id comes
+    //     from the allocation stub) completes after a random delay, and
+    //     its line is read from golden_mem at completion. A further miss
+    //     to the line merges and changes nothing here;
+    //   - mshr_fill_valid is high while any entry is complete, presenting
+    //     the lowest-numbered complete entry (fe_done_sel in mshr.sv) and
+    //     holding it until mshr_fill_ready, which retires it. An entry
+    //     that completes with a lower id than the one being installed
+    //     displaces it, which exercises the controller's fill restart;
+    //   - a dirty victim handed off (mshr_wb_valid && mshr_wb_ready) is
+    //     written into golden_mem on that edge. The real MSHR delays a
+    //     re-miss's read of that line until the write has completed
+    //     ("Read-after-write ordering" in mshr.sv), so an immediate update
+    //     is the equivalent behaviour at this interface;
+    //   - mshr_wb_ready is re-drawn every cycle (high afm_wb_ready_pct %
+    //     of the time): a writeback queue that is intermittently full.
+    // Delays: afm_long_pct % of entries draw from the long range (slow
+    // memory, many entries outstanding at once), the rest from the short
+    // range (entries completing close together, which produces restarts).
+    // Randomisation uses a private seed (afm_rng), set by the test from
+    // +seed, so a run is reproducible.
+    //
+    // Timing: inputs are sampled on the edge (pre-edge values, as the
+    // MSHR samples them); outputs are driven #1 after it.
+    // -------------------------------------------------------------------
+    localparam int unsigned AFM_ENTRIES = 2 ** MSHR_ID_WIDTH;
+
+    bit          afm_en           = 1'b0;
+    int          afm_rng          = 1;     // $random state
+    int unsigned afm_wb_ready_pct = 100;
+    int unsigned afm_short_max    = 12;    // short delay range: 1 .. afm_short_max cycles
+    int unsigned afm_long_max     = 80;    // long delay range: afm_short_max+1 .. afm_long_max
+    int unsigned afm_long_pct     = 25;
+
+    logic [AFM_ENTRIES-1:0] afm_pend = '0;          // allocated, line not yet returned
+    logic [AFM_ENTRIES-1:0] afm_done = '0;          // line returned, awaiting acceptance
+    logic [ADDR_WIDTH-1:0]  afm_addr [AFM_ENTRIES];
+    logic [LINE_WIDTH-1:0]  afm_data [AFM_ENTRIES];
+    int unsigned            afm_wait [AFM_ENTRIES]; // cycles until completion
+
+    bit wb_seen [logic [ADDR_WIDTH-1:0]];           // lines written back at least once
+
+    // Bookkeeping and coverage (cleared by the test that uses them).
+    int unsigned afm_new_cnt       = 0;   // entries opened (primary misses)
+    int unsigned afm_merge_cnt     = 0;   // secondary misses merged into an open entry
+    int unsigned afm_fill_cnt      = 0;   // fills accepted
+    int unsigned afm_wb_cnt        = 0;   // dirty victims handed off
+    int unsigned afm_remiss_wb_cnt = 0;   // new entries for a line written back earlier
+    int unsigned afm_err           = 0;   // model-side check failures (see below)
+
+    // Returns a uniformly distributed value in lo..hi from afm_rng.
+    function automatic int unsigned afm_rand(input int unsigned lo, input int unsigned hi);
+        int unsigned r;
+        r = $unsigned($random(afm_rng));
+        return lo + (r % (hi - lo + 1));
+    endfunction
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            afm_pend = '0;
+            afm_done = '0;
+        end else if (afm_en) begin
+            // Allocation. The stub returns a line's existing id on a
+            // secondary miss, so an id already open means a merge, which
+            // must be for the same line.
+            if (mshr_alloc_valid) begin
+                if (afm_pend[mshr_alloc_id] || afm_done[mshr_alloc_id]) begin
+                    afm_merge_cnt++;
+                    if (afm_addr[mshr_alloc_id] !== mshr_alloc_addr) begin
+                        $error("fill model: miss to 0x%08h given id %0d, which is open for line 0x%08h",
+                               mshr_alloc_addr, mshr_alloc_id, afm_addr[mshr_alloc_id]);
+                        afm_err++;
+                    end
+                end else begin
+                    afm_new_cnt++;
+                    afm_pend[mshr_alloc_id] = 1'b1;
+                    afm_addr[mshr_alloc_id] = mshr_alloc_addr;
+                    afm_wait[mshr_alloc_id] = (afm_rand(0, 99) < afm_long_pct)
+                                              ? afm_rand(afm_short_max + 1, afm_long_max)
+                                              : afm_rand(1, afm_short_max);
+                    if (wb_seen.exists(mshr_alloc_addr))
+                        afm_remiss_wb_cnt++;
+                end
+            end
+
+            // Fill handoff: the presented entry is retired.
+            if (mshr_fill_valid && mshr_fill_ready) begin
+                afm_done[mshr_fill_id] = 1'b0;
+                afm_fill_cnt++;
+            end
+
+            // Writeback handoff: memory takes the victim's data. The data
+            // must be the line's reference contents -- every store accepted
+            // to a resident line has been applied by the time it is evicted
+            // (see ooo_issue) -- and the address must be line-aligned.
+            if (mshr_wb_valid && mshr_wb_ready) begin
+                afm_wb_cnt++;
+                if (mshr_wb_addr[LINE_OFF_WIDTH-1:0] !== '0 ||
+                    mshr_wb_data !== ref_read_line(mshr_wb_addr)) begin
+                    $error("fill model: writeback of 0x%08h at cycle %0d carries 0x%032h, reference line is 0x%032h",
+                           mshr_wb_addr, cycle_cnt, mshr_wb_data, ref_read_line(mshr_wb_addr));
+                    afm_err++;
+                end
+                golden_mem[mshr_wb_addr] = mshr_wb_data;
+                wb_seen[mshr_wb_addr]    = 1'b1;
+            end
+
+            #1;
+
+            // Completion: an entry whose delay has elapsed returns its line.
+            for (int i = 0; i < AFM_ENTRIES; i++) begin
+                if (afm_pend[i]) begin
+                    if (afm_wait[i] > 0)
+                        afm_wait[i]--;
+                    if (afm_wait[i] == 0) begin
+                        afm_pend[i] = 1'b0;
+                        afm_done[i] = 1'b1;
+                        afm_data[i] = golden_read(afm_addr[i]);
+                    end
+                end
+            end
+
+            // Presentation: the lowest-numbered complete entry.
+            mshr_fill_valid = |afm_done;
+            for (int i = AFM_ENTRIES - 1; i >= 0; i--) begin
+                if (afm_done[i]) begin
+                    mshr_fill_id   = MSHR_ID_WIDTH'(i);
+                    mshr_fill_addr = afm_addr[i];
+                    mshr_fill_data = afm_data[i];
+                end
+            end
+
+            mshr_wb_ready = (afm_rand(0, 99) < afm_wb_ready_pct);
+        end
+    end
+
+    // -------------------------------------------------------------------
+    // Eviction checker and end-to-end coverage (white-box, while afm_en).
+    // On every fill write that displaces a valid line, the displaced line
+    // in the arrays must equal its reference contents, and:
+    //   - a dirty victim is handed off for writeback on the same edge
+    //     (fill_wr requires mshr_wb_ready; data checked above);
+    //   - a clean victim must already be up to date in memory -- a line
+    //     modified in the cache but not marked dirty would be lost here.
+    // The coverage counters record that the interesting cases occurred;
+    // the end-to-end test bounds each from below.
+    // -------------------------------------------------------------------
+    int unsigned cov_clean_evict  = 0;   // valid, clean victim replaced
+    int unsigned cov_dirty_evict  = 0;   // valid, dirty victim replaced (written back)
+    int unsigned cov_replay       = 0;   // replays issued
+    int unsigned cov_restart      = 0;   // F1 cycles in which the presented fill changed
+    int unsigned cov_wb_stall     = 0;   // F1 cycles held by a full writeback queue
+    int unsigned cov_replay_raw   = 0;   // pending replay held by the read-after-write hazard
+    int unsigned cov_hit_under    = 0;   // CPU hits while at least one miss is waiting
+    int unsigned cov_fill_held    = 0;   // presented fill held while replays are pending
+
+    always @(posedge clk) begin
+        if (rst_n && afm_en) begin
+            if (dut.fill_wr && valid_out[dut.fill_way]) begin
+                logic [ADDR_WIDTH-1:0] v_addr;
+                logic [LINE_WIDTH-1:0] v_line;
+                v_addr = {tag_tag_out[dut.fill_way], dut.fill_set_idx, LINE_OFF_WIDTH'(0)};
+                v_line = data_rd_line[dut.fill_way];
+                if (v_line !== ref_read_line(v_addr)) begin
+                    $error("eviction checker: victim 0x%08h (way %0d) holds 0x%032h at cycle %0d, reference line is 0x%032h",
+                           v_addr, dut.fill_way, v_line, cycle_cnt, ref_read_line(v_addr));
+                    afm_err++;
+                end
+                if (tag_dirty_out[dut.fill_way]) begin
+                    cov_dirty_evict++;
+                end else begin
+                    cov_clean_evict++;
+                    if (golden_read(v_addr) !== v_line) begin
+                        $error("eviction checker: clean victim 0x%08h at cycle %0d differs from memory (cache 0x%032h, memory 0x%032h) -- modified line not marked dirty",
+                               v_addr, cycle_cnt, v_line, golden_read(v_addr));
+                        afm_err++;
+                    end
+                end
+            end
+            if (dut.replay_issue)                                       cov_replay++;
+            if (dut.fill_busy && !dut.fill_id_same)                     cov_restart++;
+            if (mshr_wb_valid && !mshr_wb_ready)                        cov_wb_stall++;
+            if (dut.replay_pending && dut.replay_hazard)                cov_replay_raw++;
+            if (dut.lookup_hit && !dut.lookup_q.replay && |dut.wait_valid) cov_hit_under++;
+            if (mshr_fill_valid && dut.replay_pending)                  cov_fill_held++;
+        end
+    end
+
+    // -------------------------------------------------------------------
+    // Out-of-order response checker (end-to-end tests, while ooo_chk_en).
+    // With misses answered by replays, responses no longer return in
+    // acceptance order, so they are matched by CPU id: ooo_issue records
+    // the expected outcome of each accepted request under its id and
+    // marks the id outstanding; each response must carry an outstanding
+    // id, match its expectation (we; data for loads), and arrive no
+    // earlier than HIT_LATENCY edges after acceptance. It then frees the
+    // id. A response with no outstanding id -- spurious, or a duplicate of
+    // one already answered -- is an error, so together with the final
+    // "no id outstanding" check every request is answered exactly once.
+    // -------------------------------------------------------------------
+    typedef struct {
+        logic [ADDR_WIDTH-1:0] addr;
+        logic                  we;
+        logic [DATA_WIDTH-1:0] data;    // expected load data
+        int unsigned           cycle;   // acceptance edge
+    } ooo_exp_t;
+
+    localparam int unsigned NUM_TXN_IDS = 2 ** TXN_ID_WIDTH;
+
+    bit                     ooo_chk_en   = 1'b0;
+    ooo_exp_t               ooo_exp [NUM_TXN_IDS];
+    logic [NUM_TXN_IDS-1:0] ooo_busy     = '0;   // id outstanding (accepted, not yet answered)
+    int unsigned            ooo_resp_cnt = 0;    // responses matched
+    int unsigned            ooo_err      = 0;
+
+    // The handshake is sampled on the edge (pre-edge values) and evaluated
+    // #1 later, once cycle_cnt -- incremented by another process on the
+    // same edge -- holds this edge's index, as cpu_send's accept_cycle
+    // does. The id is therefore freed #1 after the edge, the same instant
+    // at which ooo_issue may claim ids; ooo_issue only claims free ids, so
+    // the order of the two within that instant does not matter.
+    always @(posedge clk) begin
+        if (rst_n && ooo_chk_en && resp_valid && resp_ready) begin
+            logic [TXN_ID_WIDTH-1:0] r_id;
+            logic [DATA_WIDTH-1:0]   r_data;
+            logic                    r_we;
+            r_id   = resp_id;
+            r_data = resp_data;
+            r_we   = resp_we;
+            #1;
+            if (!ooo_busy[r_id]) begin
+                $error("ooo checker: response with id %0d at cycle %0d, but no request with that id is outstanding (spurious or duplicate)",
+                       r_id, cycle_cnt);
+                ooo_err++;
+            end else begin
+                if (r_we !== ooo_exp[r_id].we) begin
+                    $error("ooo checker: id %0d (0x%08h): resp_we = %b, expected %b",
+                           r_id, ooo_exp[r_id].addr, r_we, ooo_exp[r_id].we);
+                    ooo_err++;
+                end
+                if (!ooo_exp[r_id].we && r_data !== ooo_exp[r_id].data) begin
+                    $error("ooo checker: id %0d (load 0x%08h accepted at cycle %0d): resp_data = 0x%08h at cycle %0d, expected 0x%08h",
+                           r_id, ooo_exp[r_id].addr, ooo_exp[r_id].cycle, r_data, cycle_cnt, ooo_exp[r_id].data);
+                    ooo_err++;
+                end
+                if (cycle_cnt < ooo_exp[r_id].cycle + HIT_LATENCY) begin
+                    $error("ooo checker: id %0d answered at cycle %0d, accepted at %0d -- earlier than the %0d-cycle hit latency",
+                           r_id, cycle_cnt, ooo_exp[r_id].cycle, HIT_LATENCY);
+                    ooo_err++;
+                end
+                ooo_busy[r_id] = 1'b0;
+                ooo_resp_cnt++;
+            end
+        end
+    end
+
+    // -------------------------------------------------------------------
     // Helper tasks.
     // -------------------------------------------------------------------
 
@@ -835,6 +1161,102 @@ module cache_controller_tb;
 
         accept_cycle = cycle_cnt;
         req_valid    = 1'b0;
+    endtask
+
+    // Variant of cpu_send for long random runs: the wait for acceptance is
+    // bounded by max_wait edges, and a timeout is reported through ok = 0
+    // (request withdrawn) instead of ending the simulation, so the calling
+    // test can report a [FAIL] and still run its final checks.
+    task automatic cpu_send_bounded(
+        input  logic [ADDR_WIDTH-1:0]   addr,
+        input  logic                    we,
+        input  logic [DATA_WIDTH-1:0]   wdata,
+        input  logic [TXN_ID_WIDTH-1:0] id,
+        input  int unsigned             max_wait,
+        output int unsigned             accept_cycle,
+        output bit                      ok
+    );
+        logic        accepted;
+        int unsigned waited;
+
+        req_valid = 1'b1;
+        req_addr  = addr;
+        req_we    = we;
+        req_wdata = wdata;
+        req_id    = id;
+
+        ok     = 1'b0;
+        waited = 0;
+        do begin
+            @(posedge clk);
+            accepted = req_ready;   // pre-edge value: exactly what the DUT sampled
+            #1;
+            waited++;
+        end while (!accepted && waited < max_wait);
+
+        ok           = accepted;
+        accept_cycle = cycle_cnt;
+        req_valid    = 1'b0;
+    endtask
+
+    // End-to-end scoreboard: issues one request and records its expected
+    // outcome under its CPU id for the out-of-order checker. The outcome
+    // is computed at acceptance, in acceptance order, from the flat
+    // reference memory: a load expects the word as it stands, a store
+    // updates it.
+    //
+    // Why a flat memory in acceptance order is the exact specification of
+    // this controller, although misses complete out of order:
+    //   - accesses to different words never interact, so only the order of
+    //     the accesses to each single word matters;
+    //   - a hit is applied in the lookup stage, one edge after acceptance;
+    //     the pipeline is in order, and the read-after-write stall makes a
+    //     same-set access behind a store hit observe that store;
+    //   - a miss parks its request. While any request to a line is parked,
+    //     the line is absent, so every later request to it misses and
+    //     parks too -- none can overtake as a hit. A request accepted just
+    //     before the line's fill is presented is looked up during F0 and
+    //     is parked under the same MSHR entry before F1;
+    //   - once the line is installed, its parked requests replay oldest
+    //     first (age matrix), and neither the CPU nor another fill is
+    //     admitted until all of them have been issued, so the line cannot
+    //     be evicted in between, and every later request to it is behind
+    //     them;
+    //   - a dirty line is written back on eviction and a re-miss reads the
+    //     written-back data (the MSHR orders the read after the write; the
+    //     fill model reproduces this), so data is never lost or reverted.
+    // Hence every load returns the value of the latest store to its word
+    // accepted before it. Response timing is not predicted, only bounded
+    // below (ooo checker) and above (the drain watchdog).
+    //
+    // The caller must pass an id that is not outstanding: ids are the
+    // CPU's means of telling responses apart, and the controller does not
+    // check them.
+    task automatic ooo_issue(
+        input  logic [ADDR_WIDTH-1:0]   addr,
+        input  logic                    we,
+        input  logic [DATA_WIDTH-1:0]   wdata,
+        input  logic [TXN_ID_WIDTH-1:0] id,
+        input  int unsigned             max_wait,
+        output bit                      ok
+    );
+        int unsigned           accept_cycle;
+        logic [ADDR_WIDTH-1:0] word_addr;
+
+        if (ooo_busy[id]) begin
+            $error("ooo_issue: id %0d is still outstanding (TB error)", id);
+            ooo_err++;
+        end
+
+        cpu_send_bounded(addr, we, wdata, id, max_wait, accept_cycle, ok);
+        if (!ok)
+            return;
+
+        word_addr = {addr[ADDR_WIDTH-1:BYTE_OFF_WIDTH], BYTE_OFF_WIDTH'(0)};
+        ooo_exp[id] = '{addr: addr, we: we, data: ref_read(word_addr), cycle: accept_cycle};
+        if (we)
+            ref_mem[word_addr] = wdata;
+        ooo_busy[id] = 1'b1;
     endtask
 
     // Scoreboard prediction of one access, as the hit path performs it:
