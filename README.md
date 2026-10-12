@@ -24,8 +24,17 @@ order. See [`docs/STRUCTURE_README.md`](docs/STRUCTURE_README.md) for
 why that split exists and how addresses flow between the two.
 
 ```
-CPU  <->  Cache Controller  <->  MSHR  <->  Main Memory (AXI4)
+          +------------------------------ cache_top ------------------------------+
+CPU  <->  |  Cache Controller  <->  Tag / Valid / Data arrays                     |
+          |         ^                                                             |
+          |         v                                                             |
+          |       MSHR  ----------------------------------------------------------|-> Main Memory (AXI4)
+          +-----------------------------------------------------------------------+
 ```
+
+`rtl/cache_top.sv` is the structural top level that wires the five
+blocks together; it exposes the CPU request/response interface and one
+AXI4 master port ([`docs/CACHE_TOP_README.md`](docs/CACHE_TOP_README.md)).
 
 The MSHR is the only block that ever touches the AXI bus. The cache
 controller hands it complete misses and dirty victims; the MSHR turns
@@ -42,7 +51,8 @@ marked valid. Full protocol and rationale:
 [`docs/AXI_IF_README.md`](docs/AXI_IF_README.md),
 [`docs/CACHE_TAG_ARRAY_README.md`](docs/CACHE_TAG_ARRAY_README.md),
 [`docs/CACHE_VALID_ARRAY_README.md`](docs/CACHE_VALID_ARRAY_README.md),
-[`docs/CACHE_DATA_SRAM_README.md`](docs/CACHE_DATA_SRAM_README.md).
+[`docs/CACHE_DATA_SRAM_README.md`](docs/CACHE_DATA_SRAM_README.md),
+[`docs/CACHE_TOP_README.md`](docs/CACHE_TOP_README.md).
 
 For a step-by-step visual walkthrough before reading the RTL, see
 [`visual_flow/`](visual_flow/) (static dataflow diagrams for the MSHR
@@ -58,7 +68,7 @@ and the data SRAM — conceptual, not cycle-accurate).
 | `cache_valid_array.sv` — valid bit, 4-way, sync reset | Done | 8 directed tests, all passing |
 | `cache_data_sram.sv` — line data, 4-way | Done | 6 directed tests, all passing |
 | `cache_controller.sv` — lookup, hit path, true-LRU state, miss allocation + waiting table | Hit path + LRU done; miss side (MSHR allocation, waiting table, back-pressure) done; fill/eviction + replay in progress | 13 tests (12 directed + 1 constrained-random), all passing |
-| Top-level cache integration | Not started | — |
+| `cache_top.sv` — top-level integration (controller + 3 arrays + MSHR) | Done (structural; compiles and elaborates warning-free) | System-level TB not started |
 
 `mshr.sv` currently covers: single read/write miss fill, secondary-miss
 merge, single victim writeback, MSHR-full stall and recovery,
@@ -171,7 +181,7 @@ plusargs).
 ## Repo layout
 
 ```
-rtl/          Synthesizable SystemVerilog modules
+rtl/          Synthesizable SystemVerilog modules (top level: cache_top.sv)
 tb/           Testbenches
 docs/         Per-module design docs (architecture, interface, rationale)
 visual_flow/  Conceptual diagrams / interactive teaching aid

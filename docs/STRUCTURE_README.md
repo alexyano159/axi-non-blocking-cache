@@ -1,5 +1,23 @@
 # Cache & MSHR Structure Reference
 
+## Module hierarchy
+
+```
+cache_top                      (rtl/cache_top.sv -- structural only)
+├── u_controller   cache_controller   lookup, hit path, LRU, miss/fill/replay sequencing
+├── u_tag_array    cache_tag_array    tag + dirty bit, 4-way compare
+├── u_valid_array  cache_valid_array  valid bit (only array with reset)
+├── u_data_sram    cache_data_sram    128-bit line data
+└── u_mshr         mshr               miss table + writeback queue, AXI4 master
+                     └── axi_if.master  (port of cache_top, to memory)
+```
+
+The controller is the only client of the three arrays and of the MSHR;
+the MSHR is the only block on the AXI bus. Wiring and port-group details:
+[`CACHE_TOP_README.md`](CACHE_TOP_README.md).
+
+---
+
 ## How does the MSHR know which memory block a miss/fill/writeback belongs to?
 
 Short answer: **it never has to figure this out itself** — the cache
