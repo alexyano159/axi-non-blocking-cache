@@ -174,8 +174,10 @@ module cache_controller_tb;
     // given that line's id, as the MSHR's merge path does. Ids start at
     // MSHR_STUB_ID_BASE rather than 0, so that an id recorded by the
     // controller cannot coincide with its waiting-table slot index by
-    // construction. Entries are never released (no fills); the stub is
-    // cleared by reset, as the waiting table is.
+    // construction. A line's entry is released when its fill is accepted,
+    // as the MSHR frees the entry on that edge, so a later miss to the
+    // line opens a new entry; the stub is also cleared by reset, as the
+    // waiting table is.
     //
     // The id the controller samples on an allocation edge must be the
     // pre-edge value. stub_next_id is updated non-blockingly for that
@@ -197,9 +199,13 @@ module cache_controller_tb;
         if (!rst_n) begin
             stub_line_id.delete();
             stub_next_id <= MSHR_STUB_ID_BASE;
-        end else if (mshr_alloc_valid && !stub_line_id.exists(mshr_alloc_addr)) begin
-            stub_line_id[mshr_alloc_addr] =  stub_next_id;
-            stub_next_id                  <= stub_next_id + 1'b1;
+        end else begin
+            if (mshr_alloc_valid && !stub_line_id.exists(mshr_alloc_addr)) begin
+                stub_line_id[mshr_alloc_addr] =  stub_next_id;
+                stub_next_id                  <= stub_next_id + 1'b1;
+            end
+            if (mshr_fill_valid && mshr_fill_ready && stub_line_id.exists(mshr_fill_addr))
+                stub_line_id.delete(mshr_fill_addr);
         end
     end
 
@@ -831,27 +837,24 @@ module cache_controller_tb;
         req_valid    = 1'b0;
     endtask
 
-    // Scoreboard-checked CPU access. Predicts the outcome from the
-    // reference model, issues the request through cpu_send, and queues
-    // the expected response. A store hit also updates the model word and
-    // marks the line dirty. A predicted miss queues nothing, since miss
-    // handling is not implemented. Returns #1 after the acceptance edge,
-    // with no further delay, so the caller can sample the arrays' lookup
-    // outputs for this request immediately, or issue the next request
-    // back-to-back. accept_cycle is passed through from cpu_send.
-    task automatic sb_access(
+    // Scoreboard prediction of one access, as the hit path performs it:
+    // returns whether the model holds the line, and the expected response
+    // (id, we, data; the cycle is left to the caller). On a hit, a store
+    // updates the model word and marks the line dirty, and the way becomes
+    // the most recently used. Shared by sb_access (CPU requests) and by
+    // the replay tests, which apply each replayed request in replay order.
+    function automatic logic model_access(
         input  logic [ADDR_WIDTH-1:0]   addr,
         input  logic                    we,
         input  logic [DATA_WIDTH-1:0]   wdata,
         input  logic [TXN_ID_WIDTH-1:0] id,
-        output int unsigned             accept_cycle
+        output resp_rec_t               exp
     );
         logic [SET_IDX_WIDTH-1:0]  s;
         logic [TAG_WIDTH-1:0]      t;
         logic [WORD_OFF_WIDTH-1:0] d;
         logic                      hit;
         int                        way;
-        resp_rec_t                 exp;
 
         {t, s, d} = addr[ADDR_WIDTH-1:BYTE_OFF_WIDTH];
 
@@ -887,6 +890,30 @@ module cache_controller_tb;
                     model_age[s][w] = model_age[s][w] + 1'b1;
             end
         end
+
+        return hit;
+    endfunction
+
+    // Scoreboard-checked CPU access. Predicts the outcome from the
+    // reference model (model_access), issues the request through
+    // cpu_send, and queues the expected response for a hit, or the
+    // expected MSHR allocation for a miss (the miss's eventual answer
+    // comes from its replay, which the replay tests predict separately).
+    // Returns #1 after the acceptance edge, with no further delay, so the
+    // caller can sample the arrays' lookup outputs for this request
+    // immediately, or issue the next request back-to-back. accept_cycle
+    // is passed through from cpu_send.
+    task automatic sb_access(
+        input  logic [ADDR_WIDTH-1:0]   addr,
+        input  logic                    we,
+        input  logic [DATA_WIDTH-1:0]   wdata,
+        input  logic [TXN_ID_WIDTH-1:0] id,
+        output int unsigned             accept_cycle
+    );
+        logic      hit;
+        resp_rec_t exp;
+
+        hit = model_access(addr, we, wdata, id, exp);
 
         cpu_send(addr, we, wdata, id, accept_cycle);
 
@@ -3333,6 +3360,284 @@ module cache_controller_tb;
             if (errors == 0)
                 $display("[PASS] test 16: clean victim not written back; dirty victim written back with its address and modified data on the fill edge; full queue holds F1 for %0d cycles (no write, stable writeback, CPU held), then completes; evicted lines miss",
                          T16_HOLD);
+        end
+
+        // ---------------------------------------------------------------
+        // Test 17: replay of one line's waiters, in arrival order.
+        // Three requests wait on line X -- a store to word 1, a load of
+        // word 1, a load of word 3 -- and one on line Y. X is filled, then
+        // Y; a CPU load to a resident line Z is presented together with
+        // X's fill. Expected, with D = the edge X's fill is accepted:
+        //   D+1  replay of the store            (response D+3)
+        //   D+2  no issue: the store writes set X this cycle
+        //   D+3  replay of the load of word 1   (response D+5, stored data)
+        //   D+4  replay of the load of word 3   (response D+6, filled data)
+        //   D+5  F0 of Y's fill -- held until X's replays were issued
+        //   D+6  Y's fill accepted
+        //   D+7  replay of Y's load             (response D+9)
+        //   D+8  CPU load to Z accepted -- held by the fills and replays
+        // Checked as well: only X's waiters are marked ready by X's fill,
+        // every replay frees its slot, replays are not counted as misses
+        // and allocate nothing, and each response carries its own id.
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [SET_IDX_WIDTH-1:0] SET_X = 6'd10;
+            localparam logic [SET_IDX_WIDTH-1:0] SET_Y = 6'd11;
+            localparam logic [SET_IDX_WIDTH-1:0] SET_Z = 6'd12;
+            localparam logic [TAG_WIDTH-1:0]     TAG_X = 22'h17_000A;
+            localparam logic [TAG_WIDTH-1:0]     TAG_Y = 22'h17_000B;
+            localparam logic [TAG_WIDTH-1:0]     TAG_Z = 22'h17_000C;
+            localparam logic [DATA_WIDTH-1:0]    ST_DATA = 32'h5707_E017;
+            localparam logic [LINE_WIDTH-1:0]    LINE_X = {32'hA017_0003, 32'hA017_0002, 32'hA017_0001, 32'hA017_0000};
+            localparam logic [LINE_WIDTH-1:0]    LINE_Y = {32'hB017_0003, 32'hB017_0002, 32'hB017_0001, 32'hB017_0000};
+            localparam logic [LINE_WIDTH-1:0]    LINE_Z = {32'hC017_0003, 32'hC017_0002, 32'hC017_0001, 32'hC017_0000};
+
+            // The four waiting requests, in issue order.
+            logic [ADDR_WIDTH-1:0]    w_addr  [4];
+            logic                     w_we    [4];
+            logic [DATA_WIDTH-1:0]    w_wdata [4];
+            logic [TXN_ID_WIDTH-1:0]  w_id    [4];
+            int unsigned              w_issue [4];   // expected replay issue edge, relative to D (X) or Y's accept edge
+
+            logic [MSHR_ID_WIDTH-1:0] mid_x, mid_y;
+            logic [WAY_WIDTH-1:0]     way;
+            logic                     hit;
+            resp_rec_t                exp;
+            int unsigned              acc, pc_x, dc_x, pc_y, dc_y, acc_z;
+            int unsigned              miss_base;
+            int unsigned              errors;
+
+            reset_dut_and_model();
+            errors = 0;
+            preload_line(SET_Z, 2'd0, TAG_Z, LINE_Z);
+
+            w_addr[0] = make_addr(TAG_X, SET_X, 2'd1); w_we[0] = 1'b1; w_wdata[0] = ST_DATA; w_id[0] = 4'd1; w_issue[0] = 1;
+            w_addr[1] = make_addr(TAG_X, SET_X, 2'd1); w_we[1] = 1'b0; w_wdata[1] = '0;      w_id[1] = 4'd2; w_issue[1] = 3;
+            w_addr[2] = make_addr(TAG_X, SET_X, 2'd3); w_we[2] = 1'b0; w_wdata[2] = '0;      w_id[2] = 4'd3; w_issue[2] = 4;
+            w_addr[3] = make_addr(TAG_Y, SET_Y, 2'd0); w_we[3] = 1'b0; w_wdata[3] = '0;      w_id[3] = 4'd4; w_issue[3] = 1;
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            fill_log.delete();
+            wb_log.delete();
+            wb_req_cnt    = 0;
+            fill_rule_err = 0;
+            wb_hold_err   = 0;
+            miss_base     = miss_cnt;
+            resp_ready    = 1'b1;
+
+            // The four misses park in slots 0-3; X's three share one MSHR
+            // entry, Y has its own. Nothing is ready yet.
+            for (int i = 0; i < 4; i++)
+                sb_access(w_addr[i], w_we[i], w_wdata[i], w_id[i], acc);
+            repeat (2) @(posedge clk);
+            #1;
+            mid_x = stub_line_id[line_addr(w_addr[0])];
+            mid_y = stub_line_id[line_addr(w_addr[3])];
+            if (dut.wait_valid !== 16'h000F || dut.wait_ready !== '0) begin
+                $error("[FAIL] test 17: before the fills, wait_valid = %b, wait_ready = %b; expected slots 0-3 occupied, none ready",
+                       dut.wait_valid, dut.wait_ready);
+                errors++;
+            end
+
+            // X's fill races the CPU load to Z; Y's fill is presented as
+            // soon as X's is accepted, as the MSHR presents its next
+            // completed entry.
+            fork
+                begin
+                    mshr_fill(mid_x, make_addr(TAG_X, SET_X, 2'd0), LINE_X, pc_x, dc_x, way);
+                    if (dut.wait_ready !== 16'h0007) begin
+                        $error("[FAIL] test 17: after X's fill, wait_ready = %b, expected 0111 (X's waiters only)",
+                               dut.wait_ready);
+                        errors++;
+                    end
+                    mshr_fill(mid_y, make_addr(TAG_Y, SET_Y, 2'd0), LINE_Y, pc_y, dc_y, way);
+                end
+                sb_access(make_addr(TAG_Z, SET_Z, 2'd2), 1'b0, '0, 4'd5, acc_z);
+            join
+            repeat (HIT_LATENCY + 1) @(posedge clk);
+            #1;
+
+            // Expected replay responses, applied to the model in replay
+            // order (both fills have already been applied by mshr_fill).
+            for (int i = 0; i < 4; i++) begin
+                hit = model_access(w_addr[i], w_we[i], w_wdata[i], w_id[i], exp);
+                if (!hit) begin
+                    $error("[FAIL] test 17: scoreboard misses on replay %0d (TB model error)", i);
+                    errors++;
+                end
+                exp.cycle = ((i < 3) ? dc_x : dc_y) + w_issue[i] + HIT_LATENCY;
+                exp_log.push_back(exp);
+            end
+            // The load of word 1 must observe the store (TB model check).
+            foreach (exp_log[i])
+                if (exp_log[i].id == 4'd2 && exp_log[i].data !== ST_DATA) begin
+                    $error("[FAIL] test 17: scoreboard expects 0x%08h for the load behind the store, not the stored 0x%08h (TB model error)",
+                           exp_log[i].data, ST_DATA);
+                    errors++;
+                end
+            // The CPU load's response was queued by sb_access during the
+            // fork; order all expectations by arrival edge.
+            exp_log.sort() with (item.cycle);
+
+            if (dc_x - pc_x != FILL_LATENCY) begin
+                $error("[FAIL] test 17: X's fill took %0d edges, expected %0d", dc_x - pc_x, FILL_LATENCY);
+                errors++;
+            end
+            if (dc_y != dc_x + 6) begin
+                $error("[FAIL] test 17: Y's fill accepted %0d edges after X's, expected 6 (held until X's replays were issued)",
+                       dc_y - dc_x);
+                errors++;
+            end
+            if (acc_z != dc_y + 2) begin
+                $error("[FAIL] test 17: CPU load accepted %0d edges after Y's fill, expected 2 (held until Y's replay was issued)",
+                       acc_z - dc_y);
+                errors++;
+            end
+
+            check_responses("test 17", errors);
+            if (dut.wait_valid !== '0 || dut.wait_ready !== '0) begin
+                $error("[FAIL] test 17: after all replays, wait_valid = %b, wait_ready = %b; expected all free",
+                       dut.wait_valid, dut.wait_ready);
+                errors++;
+            end
+            if (miss_cnt - miss_base != 4) begin
+                $error("[FAIL] test 17: %0d lookups classified as miss, expected 4 (replays are not misses)",
+                       miss_cnt - miss_base);
+                errors++;
+            end
+            check_allocs("test 17", errors);
+            if (fill_rule_err != 0) begin
+                $error("[FAIL] test 17: %0d fill-handshake rule violations", fill_rule_err);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 17: X's 3 waiters replayed in arrival order (store, then load seeing the stored word, then load), 1-cycle bubble after the store, own ids; Y's waiter untouched until Y's fill; Y's fill and a CPU load held during replays; slots freed, no new misses");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 18: slot reuse keeps arrival order (age matrix).
+        // An older store to line Q waits in slot 1. Slot 0 is freed by the
+        // replay of an unrelated line P and then reused by a newer load of
+        // the same word of Q. When Q is filled, the store (higher slot,
+        // older) must replay before the load (lower slot, newer), and the
+        // load must return the stored data. Replaying by slot index would
+        // return the filled data instead. Also checked directly: the reused
+        // slot holds the new request, and the age matrix records slot 1 as
+        // older than slot 0 and not the reverse -- the column clear on
+        // reuse. A broken age matrix can leave no slot "oldest" and stall
+        // the replays, so the wait for the responses is bounded.
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [SET_IDX_WIDTH-1:0] SET_P = 6'd14;
+            localparam logic [SET_IDX_WIDTH-1:0] SET_Q = 6'd15;
+            localparam logic [TAG_WIDTH-1:0]     TAG_P = 22'h18_000A;
+            localparam logic [TAG_WIDTH-1:0]     TAG_Q = 22'h18_000B;
+            localparam logic [DATA_WIDTH-1:0]    ST_DATA = 32'h5707_E018;
+            localparam logic [LINE_WIDTH-1:0]    LINE_P = {32'hA018_0003, 32'hA018_0002, 32'hA018_0001, 32'hA018_0000};
+            localparam logic [LINE_WIDTH-1:0]    LINE_Q = {32'hB018_0003, 32'hB018_0002, 32'hB018_0001, 32'hB018_0000};
+            localparam int unsigned              T18_WATCH = 50;
+
+            logic [ADDR_WIDTH-1:0]    addr_p, addr_q;
+            logic [MSHR_ID_WIDTH-1:0] mid_p, mid_q;
+            logic [WAY_WIDTH-1:0]     way;
+            logic                     hit;
+            resp_rec_t                exp;
+            int unsigned              acc, pc, dc_p, dc_q, watchdog;
+            int unsigned              errors;
+
+            reset_dut_and_model();
+            errors = 0;
+            addr_p = make_addr(TAG_P, SET_P, 2'd0);
+            addr_q = make_addr(TAG_Q, SET_Q, 2'd2);
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            fill_log.delete();
+            wb_req_cnt    = 0;
+            fill_rule_err = 0;
+            resp_ready    = 1'b1;
+
+            // Slot 0: load of P. Slot 1: store to Q.
+            sb_access(addr_p, 1'b0, '0,      4'd1, acc);
+            sb_access(addr_q, 1'b1, ST_DATA, 4'd2, acc);
+            repeat (2) @(posedge clk);
+            #1;
+            mid_p = stub_line_id[line_addr(addr_p)];
+            mid_q = stub_line_id[line_addr(addr_q)];
+
+            // P is filled; its load replays from slot 0, freeing it.
+            mshr_fill(mid_p, line_addr(addr_p), LINE_P, pc, dc_p, way);
+            hit = model_access(addr_p, 1'b0, '0, 4'd1, exp);
+            exp.cycle = dc_p + 1 + HIT_LATENCY;
+            exp_log.push_back(exp);
+            repeat (2) @(posedge clk);
+            #1;
+            if (dut.wait_valid !== 16'h0002) begin
+                $error("[FAIL] test 18: after P's replay, wait_valid = %b, expected slot 1 only", dut.wait_valid);
+                errors++;
+            end
+
+            // A newer load of the same word of Q reuses slot 0.
+            sb_access(addr_q, 1'b0, '0, 4'd3, acc);
+            repeat (2) @(posedge clk);
+            #1;
+            if (dut.wait_valid !== 16'h0003 || dut.wait_mem[0].addr !== addr_q ||
+                dut.wait_mem[0].id !== 4'd3 || dut.wait_mem[0].mshr_id !== mid_q) begin
+                $error("[FAIL] test 18: slot 0 not reused by the newer load (wait_valid %b, slot 0 addr 0x%08h id %0d mshr %0d)",
+                       dut.wait_valid, dut.wait_mem[0].addr, dut.wait_mem[0].id, dut.wait_mem[0].mshr_id);
+                errors++;
+            end
+            if (dut.wait_older[1][0] !== 1'b0 || dut.wait_older[0][1] !== 1'b1) begin
+                $error("[FAIL] test 18: age matrix after reuse: older[1][0] = %b, older[0][1] = %b; expected 0, 1 (slot 1 older than slot 0)",
+                       dut.wait_older[1][0], dut.wait_older[0][1]);
+                errors++;
+            end
+
+            // Q is filled: the store (slot 1) replays first, then -- after
+            // the same-set bubble -- the load (slot 0), which sees the store.
+            mshr_fill(mid_q, line_addr(addr_q), LINE_Q, pc, dc_q, way);
+            hit = model_access(addr_q, 1'b1, ST_DATA, 4'd2, exp);
+            exp.cycle = dc_q + 1 + HIT_LATENCY;
+            exp_log.push_back(exp);
+            hit = model_access(addr_q, 1'b0, '0, 4'd3, exp);
+            exp.cycle = dc_q + 3 + HIT_LATENCY;
+            exp_log.push_back(exp);
+            if (exp.data !== ST_DATA) begin
+                $error("[FAIL] test 18: scoreboard expects 0x%08h for the newer load, not the stored 0x%08h (TB model error)",
+                       exp.data, ST_DATA);
+                errors++;
+            end
+
+            watchdog = 0;
+            while (resp_log.size() < 3 && watchdog < T18_WATCH) begin
+                @(posedge clk);
+                watchdog++;
+            end
+            repeat (2) @(posedge clk);
+            #1;
+            if (resp_log.size() < 3) begin
+                $error("[FAIL] test 18: only %0d of 3 responses within %0d cycles of Q's fill -- replay stalled (wait_ready %b)",
+                       resp_log.size(), T18_WATCH, dut.wait_ready);
+                errors++;
+            end
+
+            check_responses("test 18", errors);
+            if (dut.wait_valid !== '0) begin
+                $error("[FAIL] test 18: wait_valid = %b after all replays, expected all free", dut.wait_valid);
+                errors++;
+            end
+            check_allocs("test 18", errors);
+
+            if (errors == 0)
+                $display("[PASS] test 18: freed slot 0 reused by a newer request; age matrix keeps the older store (slot 1) ahead of it; store replayed first and the newer load returned the stored data");
         end
 
         // ---------------------------------------------------------------
