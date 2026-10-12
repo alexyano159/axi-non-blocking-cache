@@ -3071,9 +3071,14 @@ module cache_controller_tb;
         // Test 12 (hit-under-miss) and test 13 (waiting table full /
         // back-pressure) added 2026-10-08. The miss side is fully covered.
         //
-        // Next: fill/eviction and replay (RTL), then their tests -- incl.
-        // slot release and reuse (age-matrix column clear) and removal of
-        // test 9's temporary miss cap (T9_MAX_MISSES).
+        // Tests 14 (fill into free / LRU way) and 15 (fill_id restart)
+        // added 2026-10-12, with TB-driven fill inputs: mshr_fill task,
+        // model_fill, fill monitor (fill_log, fill_rule_err),
+        // check_fill_write.
+        //
+        // Next: dirty-victim writeback (test 16), then replay and its
+        // tests -- incl. slot release and reuse (age-matrix column clear)
+        // and removal of test 9's temporary miss cap (T9_MAX_MISSES).
         // ---------------------------------------------------------------
 
         $finish;

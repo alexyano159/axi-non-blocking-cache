@@ -813,7 +813,7 @@ module cache_controller #(
     //
     // Fill, sub-step 1 (branch cache_fill, 2026-10-12): two-cycle fill
     // into an invalid or LRU way, LRU update from the fill, fill_id
-    // restart (see Fill sequencing). Tests 14-15 pending.
+    // restart (see Fill sequencing). Verified by tests 14-15.
     //
     // Next:
     //   - Sub-step 2: dirty victim -> mshr_wb_*, address
