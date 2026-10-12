@@ -1051,6 +1051,28 @@ module cache_top_tb;
     endtask
 
     // ===================================================================
+    // White-box views of the tag and data storage
+    // Both arrays are built from sram_sdp banks inside generate blocks,
+    // which cannot be selected by a run-time way or word number. These
+    // continuous assignments collect the banks into plain arrays that
+    // check_consistency can index freely.
+    // ===================================================================
+    logic [TAG_WIDTH-1:0]  tag_view  [NUM_WAYS][NUM_SETS];
+    logic [DATA_WIDTH-1:0] word_view [NUM_WAYS][WORDS_PER_LINE][NUM_SETS];
+
+    for (genvar w = 0; w < NUM_WAYS; w++) begin : g_view
+        assign tag_view[w] = dut.u_tag_array.g_way[w].u_tag_bank.mem;
+        for (genvar i = 0; i < WORDS_PER_LINE; i++) begin : g_word
+            assign word_view[w][i] = dut.u_data_sram.g_way[w].g_word[i].u_bank.mem;
+        end
+    end
+
+    function automatic logic [LINE_WIDTH-1:0] cached_line(int way, int set);
+        for (int i = 0; i < WORDS_PER_LINE; i++)
+            cached_line[i*DATA_WIDTH +: DATA_WIDTH] = word_view[way][i][set];
+    endfunction
+
+    // ===================================================================
     // End-of-test consistency (white-box)
     // For every line ever accessed: if the cache holds it valid and dirty,
     // the cached copy must equal the reference image; otherwise the
@@ -1074,22 +1096,22 @@ module cache_top_tb;
             exp = ref_line(la);
             way = -1;
             for (int w = 0; w < NUM_WAYS; w++)
-                if (dut.u_valid_array.valid_mem[w][s] && dut.u_tag_array.tag_mem[w][s] == t) begin
+                if (dut.u_valid_array.valid_mem[w][s] && tag_view[w][s] == t) begin
                     if (way >= 0) err($sformatf("consistency: line 0x%08h present in ways %0d and %0d", la, way, w));
                     way = w;
                 end
             if (way >= 0 && dut.u_tag_array.dirty_mem[way][s]) begin
                 n_dirty++;
-                if (dut.u_data_sram.mem[way][s] !== exp)
+                if (cached_line(way, s) !== exp)
                     err($sformatf("consistency: dirty cached line 0x%08h = %h, reference %h",
-                                  la, dut.u_data_sram.mem[way][s], exp));
+                                  la, cached_line(way, s), exp));
             end else begin
                 if (mem_line(la) !== exp)
                     err($sformatf("consistency: memory line 0x%08h = %h, reference %h (not dirty in the cache)",
                                   la, mem_line(la), exp));
-                if (way >= 0 && dut.u_data_sram.mem[way][s] !== exp)
+                if (way >= 0 && cached_line(way, s) !== exp)
                     err($sformatf("consistency: clean cached line 0x%08h = %h, reference %h",
-                                  la, dut.u_data_sram.mem[way][s], exp));
+                                  la, cached_line(way, s), exp));
             end
             n_lines++;
         end

@@ -334,8 +334,11 @@ slots are occupied, so an MSHR entry is free. This needs
 - Otherwise a presented fill owns the read port and blocks the CPU.
 - Because no fill can start while replays are pending, nothing can evict
   a just-installed line before its waiters replay — which is why a
-  replay always hits (asserted). Consecutive fills complete back to back,
-  one per two cycles, and the CPU resumes once the MSHR has none left
+  replay always hits (asserted). Each fill takes two cycles (F0, F1);
+  when the line has waiters, their replays issue before the next F0, so in
+  the full system consecutive fills take at least three cycles each
+  (two only when a fill has no waiters, as in the unit tests). The CPU
+  resumes once the MSHR has no fill left
   and no replays remain.
 
 `req_ready` depends combinationally on `req_addr` (term c) and on
@@ -397,7 +400,7 @@ are at the default parameters.
 | `tag_wr_tag` | 22 | out | Fill's tag (ignored on a store hit) |
 | `tag_wr_tag_en` | 1 | out | 1 on a fill only |
 | `tag_wr_dirty` | 1 | out | 1 on a store hit, 0 on a fill |
-| `tag_wr_dirty_en` | 1 | out | Always 1 (both writers set the dirty bit) |
+| `tag_wr_dirty_en` | 1 | out | Always 1 (both writers write the dirty bit) |
 
 ### Valid array (`cache_valid_array`)
 

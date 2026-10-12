@@ -73,7 +73,7 @@ module mshr #(
     output      logic [ID_WIDTH-1:0]   fill_id,        // entry that completed
     output      logic [ADDR_WIDTH-1:0] fill_addr,      // address of the completed line
     output      logic [LINE_WIDTH-1:0] fill_data,      // reassembled line data, all beats concatenated
-    output      logic                  fill_is_write,  // 1 = controller must merge the pending store and mark the line dirty
+    output      logic                  fill_is_write,  // 1 = some merged access was a store (unused by cache_controller)
     input  wire logic                  fill_ready,     // 1 = the data array can accept the fill this cycle
 
     // -----------------------------------------------------------------
@@ -90,8 +90,8 @@ module mshr #(
     // cache line.
     // -------------------------------------------------------------------
     localparam int              BEAT_CNT_WIDTH = $clog2(LINE_WORDS);
-    localparam logic [7:0]      BURST_LEN      = LINE_WORDS - 1;            // AxLEN = beats - 1
-    localparam logic [2:0]      BURST_SIZE     = $clog2(DATA_WIDTH / 8);    // AxSIZE = log2(bytes/beat)
+    localparam logic [7:0]      BURST_LEN      = 8'(LINE_WORDS - 1);           // AxLEN = beats - 1
+    localparam logic [2:0]      BURST_SIZE     = 3'($clog2(DATA_WIDTH / 8));  // AxSIZE = log2(bytes/beat)
     localparam logic [1:0]      BURST_INCR     = 2'b01;
 
     // Fixed-priority encoder: returns the lowest set bit index in `vec`.
@@ -246,10 +246,10 @@ module mshr #(
             ar_last_grant <= '0;
         end else begin
             // Allocation: open a new entry, or merge into an existing one.
-            // On a merge, only the is_write flag needs updating -- if any
-            // access that merged into this entry was a store, the line
-            // must come back marked dirty, regardless of whether the
-            // first (primary) access was a load.
+            // On a merge, only the is_write flag needs updating: it is the
+            // OR of every merged access, reported as fill_is_write. (The
+            // current controller installs fills clean and replays the
+            // stores through its hit path, so it does not use the flag.)
             if (alloc_valid && alloc_ready) begin
                 if (fe_any_match) begin
                     fe_is_write[fe_match_idx] <= fe_is_write[fe_match_idx] | alloc_is_write;

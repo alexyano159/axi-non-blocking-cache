@@ -9,9 +9,8 @@
 // the registered compare/dirty result -- since a subsequent lookup is
 // the only way to confirm a write actually took effect.
 //
-// See private_notes/DESIGN_DECISIONS.txt for the rationale behind the
-// module's registered-compare / no-reset / single-write-port choices
-// being verified here.
+// The rationale behind the module's registered-read / no-reset /
+// single-write-port choices is in docs/CACHE_TAG_ARRAY_README.md.
 // -----------------------------------------------------------------------
 `default_nettype none
 `timescale 1ns/1ps

@@ -739,8 +739,10 @@ module cache_controller #(
     // so the number of restarts is bounded by the number of entries.
     //
     // Fills take priority over CPU requests. The CPU is held off while any
-    // fill is presented, so consecutive fills complete back to back (one
-    // per two cycles) and the CPU resumes once the MSHR has none left.
+    // fill is presented. Each fill takes F0 and F1; when the line has
+    // waiting requests, their replays must issue before the next F0, so in
+    // the full system consecutive fills take at least three cycles each.
+    // The CPU resumes once the MSHR has no fill left.
     // -------------------------------------------------------------------
     logic                     fill_start;      // F0 in this cycle
     logic [MSHR_ID_WIDTH-1:0] fill_id_q;       // id presented in the previous cycle
@@ -874,7 +876,16 @@ module cache_controller #(
 
     // wait_count is one bit wider than a slot index, so it holds
     // WAIT_DEPTH itself; the sum with lookup_q.valid is widened once more.
-    assign wait_count = (WAIT_IDX_WIDTH+1)'($countones(wait_valid));
+    // The population count is an explicit adder loop rather than
+    // $countones, which synthesis tools do not uniformly support (Quartus
+    // Prime rejects it); synthesis maps the loop to an adder tree.
+    function automatic logic [WAIT_IDX_WIDTH:0] count_occupied(input logic [WAIT_DEPTH-1:0] vec);
+        count_occupied = '0;
+        for (int i = 0; i < WAIT_DEPTH; i++)
+            count_occupied = count_occupied + (WAIT_IDX_WIDTH+1)'(vec[i]);
+    endfunction
+
+    assign wait_count = count_occupied(wait_valid);
     assign wait_space = ({1'b0, wait_count} + (WAIT_IDX_WIDTH+2)'(lookup_q.valid))
                         < (WAIT_IDX_WIDTH+2)'(WAIT_DEPTH);
 

@@ -50,10 +50,10 @@ Two rules shape the whole picture:
 | Instance | Module | Role |
 |---|---|---|
 | `u_controller` | `cache_controller` | Address split, hit/miss, hit path + response FIFO, true LRU, MSHR allocation, waiting table, fill installation, dirty-victim handoff, replay |
-| `u_tag_array` | `cache_tag_array` | Tag + dirty bit per (way, set); registered 4-way compare; stored-tag read-out. No reset |
+| `u_tag_array` | `cache_tag_array` | Tag + dirty bit per (way, set); 4-way compare on the registered read; stored-tag read-out. Tags in 4 `sram_sdp` banks. No reset |
 | `u_valid_array` | `cache_valid_array` | Valid bit per (way, set); synchronous reset to all-invalid |
-| `u_data_sram` | `cache_data_sram` | 128-bit line per (way, set); registered read of all 4 ways; word-masked write. No reset |
-| `u_mshr` | `mshr` | Up to 16 outstanding misses with merging; victim writeback queue; AXI4 master |
+| `u_data_sram` | `cache_data_sram` | 128-bit line per (way, set); registered read of all 4 ways; word-masked write. 16 `sram_sdp` banks. No reset |
+| `u_mshr` | `mshr` | Up to 16 outstanding misses with merging; victim writeback queue; read-after-write ordering of a re-miss behind its own writeback; AXI4 master |
 
 ## Interface
 
@@ -110,7 +110,7 @@ testbenches.
 
 | Port group | Between | Handshake |
 |---|---|---|
-| `tag_rd_*`, `tag_match`, `tag_dirty_out`, `tag_tag_out` | controller ↔ tag array | None. Address in cycle N, registered result in N+1 |
+| `tag_rd_*`, `tag_lookup_tag`, `tag_match`, `tag_dirty_out`, `tag_tag_out` | controller ↔ tag array | None. Address in cycle N, registered result in N+1 |
 | `tag_wr_*` | controller → tag array | `wr_en` strobe; `wr_tag_en` / `wr_dirty_en` pick the fields |
 | `valid_rd_*`, `valid_out` | controller ↔ valid array | None. Same 1-cycle latency as the tag array |
 | `valid_wr_*` | controller → valid array | `wr_en` strobe (fills only) |
@@ -335,16 +335,16 @@ the stability check in test 11; fixed with a grant lock (see
 - One configuration only (the default parameters).
 - No reset in the middle of traffic at system level (covered for the
   MSHR alone in `mshr_tb` test 13).
-- LRU order is checked only indirectly (test 8 and the permutation
+- LRU order is checked only indirectly (tests 6 and 8, and the permutation
   invariant), not against a reference model of recency.
 
 ### Running
 
 ```bash
 vlib work
-vlog -sv rtl/axi_if.sv rtl/cache_controller.sv rtl/cache_data_sram.sv \
-     rtl/cache_tag_array.sv rtl/cache_valid_array.sv rtl/cache_top.sv rtl/mshr.sv \
-     tb/cache_top_tb.sv
+vlog -sv -svinputport=var rtl/axi_if.sv rtl/sram_sdp.sv rtl/cache_controller.sv \
+     rtl/cache_data_sram.sv rtl/cache_tag_array.sv rtl/cache_valid_array.sv \
+     rtl/cache_top.sv rtl/mshr.sv tb/cache_top_tb.sv
 vsim -c cache_top_tb +seed=7 +nreq=5000 -do "run -all; quit -f"
 ```
 

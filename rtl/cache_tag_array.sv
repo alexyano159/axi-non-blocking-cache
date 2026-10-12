@@ -23,17 +23,21 @@
 //   1. Hit write : a store hit sets the dirty bit of an already-resident
 //                  line. The tag itself does not change.
 //   2. Fill write: after a miss, the controller writes the new line's tag
-//                  into the freshly allocated way, and sets/clears dirty
-//                  according to whether the fill is completing a load
-//                  (clean) or a store (dirty).
+//                  into the freshly allocated way and clears its dirty
+//                  bit. A line is always installed clean: a store that
+//                  missed is replayed after the fill as an ordinary
+//                  store hit, which sets dirty through path 1.
 // wr_tag_en / wr_dirty_en let a fill-write update both fields in the same
 // cycle while a hit-write updates only dirty, without needing a separate
 // write port or an implicit "mode" signal.
 //
 // Read port latency matches cache_data_sram: the tag compare result and
-// dirty bit are registered, valid one cycle after rd_set_idx/lookup_tag
-// are presented -- so the controller can combine this array's hit
+// dirty bit are valid one cycle after rd_set_idx/lookup_tag are
+// presented -- so the controller can combine this array's hit
 // information with the data array's line contents in the same cycle.
+// Tags are stored in sram_sdp banks (block RAM after synthesis); the
+// compare is performed on the banks' registered outputs against a
+// registered copy of lookup_tag.
 //
 // The stored tags of the addressed set are also read out (tag_out),
 // with the same one-cycle latency. The compare alone is sufficient for
@@ -85,7 +89,7 @@ module cache_tag_array #(
     // separate mode signal:
     //   - Hit write : wr_tag_en = 0, wr_dirty_en = 1, wr_dirty = 1.
     //   - Fill write: wr_tag_en = 1, wr_tag = new line's tag,
-    //                 wr_dirty_en = 1, wr_dirty = fill_is_write.
+    //                 wr_dirty_en = 1, wr_dirty = 0 (installed clean).
     // -----------------------------------------------------------------
     input  wire logic                     wr_en,
     input  wire logic [SET_IDX_WIDTH-1:0] wr_set_idx,
@@ -96,37 +100,61 @@ module cache_tag_array #(
     input  wire logic                     wr_dirty_en
 );
 
-    // Storage: one (tag, dirty) pair per (way, set), modeled as
-    // NUM_WAYS independent banks -- matching cache_data_sram's bank
-    // layout so both arrays are indexed identically and read together.
-    logic [TAG_WIDTH-1:0] tag_mem   [NUM_WAYS][NUM_SETS];
-    logic                 dirty_mem [NUM_WAYS][NUM_SETS];
+    // Tag storage: one NUM_SETS x TAG_WIDTH sram_sdp bank per way, all
+    // sharing the read address -- the same bank layout as
+    // cache_data_sram, so both arrays are indexed identically and read
+    // together. Each bank's registered output is tag_out directly.
+    genvar gw;
+    generate
+    for (gw = 0; gw < NUM_WAYS; gw = gw + 1) begin : g_way
+        sram_sdp #(
+            .WIDTH (TAG_WIDTH),
+            .DEPTH (NUM_SETS)
+        ) u_tag_bank (
+            .clk     (clk),
+            .rd_addr (rd_set_idx),
+            .rd_data (tag_out[gw]),
+            .wr_en   (wr_en && wr_tag_en && (wr_way_sel == WAY_WIDTH'(gw))),
+            .wr_addr (wr_set_idx),
+            .wr_data (wr_tag)
+        );
+    end
+    endgenerate
 
-    // Registered compare and read-out: the tag stored at the addressed
-    // set is compared against lookup_tag combinationally and the 1-bit
-    // result is registered; the stored tag itself is registered in
-    // parallel for eviction. This keeps tag_match/dirty_out/tag_out
-    // latency identical to cache_data_sram's rd_line -- all are valid
-    // the cycle after the address is presented.
+    // Compare after the read register. A block RAM can only present
+    // registered read data, so the compare cannot sit between the array
+    // and a register (doing so forces the array into flip-flops).
+    // Instead lookup_tag is registered alongside the address, and the
+    // registered stored tags are compared against it combinationally.
+    // tag_match therefore remains valid the cycle after rd_set_idx /
+    // lookup_tag are presented, as before; the cost is one 22-bit
+    // equality compare moved into the cycle that consumes tag_match.
+    logic [TAG_WIDTH-1:0] lookup_tag_q;
+
     always_ff @(posedge clk) begin
+        lookup_tag_q <= lookup_tag;
+    end
+
+    always_comb begin
         for (int w = 0; w < NUM_WAYS; w++) begin
-            tag_match[w] <= (tag_mem[w][rd_set_idx] == lookup_tag);
-            dirty_out[w] <= dirty_mem[w][rd_set_idx];
-            tag_out[w]   <= tag_mem[w][rd_set_idx];
+            tag_match[w] = (tag_out[w] == lookup_tag_q);
         end
     end
 
-    // Write: tag and dirty are gated independently so a hit-write can
-    // touch only the dirty bit while a fill-write updates both fields
-    // in the same cycle.
+    // Dirty bits: kept in flip-flops (NUM_WAYS x NUM_SETS = 256 bits by
+    // default) rather than in sram_sdp banks. The field is tiny, and
+    // four dedicated block RAMs for 64 bits each would waste far more
+    // area than the registers. Read and write timing match the tag
+    // banks: registered read, written on the same edge as the tag on a
+    // fill, written alone on a store hit.
+    logic dirty_mem [NUM_WAYS][NUM_SETS];
+
     always_ff @(posedge clk) begin
-        if (wr_en) begin
-            if (wr_tag_en) begin
-                tag_mem[wr_way_sel][wr_set_idx] <= wr_tag;
-            end
-            if (wr_dirty_en) begin
-                dirty_mem[wr_way_sel][wr_set_idx] <= wr_dirty;
-            end
+        for (int w = 0; w < NUM_WAYS; w++) begin
+            dirty_out[w] <= dirty_mem[w][rd_set_idx];
+        end
+        if (wr_en && wr_dirty_en) begin
+            dirty_mem[wr_way_sel][wr_set_idx] <= wr_dirty;
         end
     end
 

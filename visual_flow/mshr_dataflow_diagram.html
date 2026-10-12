@@ -240,12 +240,12 @@
       <rect x="20" y="250" width="110" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
       <text x="75" y="289" text-anchor="middle" class="boxtitle">CPU / CORE</text>
 
-      <!-- Controller (MSHR path in progress) -->
+      <!-- Controller -->
       <rect x="190" y="190" width="190" height="190" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="6 4"></rect>
       <text x="285" y="235" text-anchor="middle" class="boxtitle">CACHE CONTROLLER</text>
       <text x="285" y="253" text-anchor="middle" class="boxsub">tag compare · way select</text>
       <text x="285" y="267" text-anchor="middle" class="boxsub">replacement policy</text>
-      <text x="285" y="345" text-anchor="middle" class="boxsub" font-style="italic">(MSHR path in progress)</text>
+      <text x="285" y="345" text-anchor="middle" class="boxsub" font-style="italic">(miss, fill, replay)</text>
 
       <!-- Fill Engine -->
       <rect x="460" y="90" width="260" height="180" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"></rect>
@@ -297,7 +297,7 @@
         <li><span><b>Round-robin arbiter</b> grants the shared AR channel to one waiting entry.</span></li>
         <li><span><b>AR/R burst:</b> 4 beats stream back, tagged by <span style="font-family:var(--font-mono)">rid</span>, into that entry's buffer.</span></li>
         <li><span><b>MSHR → Controller:</b> completed line handed off (<span style="font-family:var(--font-mono)">fill_valid/fill_ready</span>); entry frees the same cycle.</span></li>
-        <li><span><b>Controller installs</b> the line (evicting + writing back a dirty victim first, if the set was full).</span></li>
+        <li><span><b>Controller installs</b> the line (if the set was full, a dirty victim is handed to the writeback queue on the same edge).</span></li>
       </ol>
     </div>
     <div>

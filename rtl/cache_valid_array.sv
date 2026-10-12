@@ -19,12 +19,12 @@
 // is registered, valid one cycle after rd_set_idx is presented, so the
 // controller can combine all three arrays' results in the same cycle.
 //
-// Single shared write port, set by the controller for two purposes:
+// Single shared write port, supporting two operations:
 //   1. Fill write : after a miss, the controller sets the newly
 //                   allocated way's valid bit (wr_valid = 1).
-//   2. Invalidate  : an explicit invalidation clears a way's valid bit
-//                    (wr_valid = 0) without touching tag/dirty/data --
-//                    those become don't-care until the way is refilled.
+//   2. Invalidate  : clears a way's valid bit (supported by the port;
+//                    unused by the current controller), wr_valid = 0,
+//                    leaving tag/dirty/data don't-care until refilled.
 // No wr_valid_en is needed: unlike cache_tag_array's independent
 // tag/dirty fields, this module stores only one bit, so wr_en alone
 // gates the write.
