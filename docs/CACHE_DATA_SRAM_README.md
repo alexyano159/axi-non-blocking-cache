@@ -29,8 +29,9 @@ client; it reaches this module through its `data_`-prefixed port
 group. It is responsible for:
 - Forming the hit by ANDing the tag array's raw `tag_match` with the
   valid array's `valid_out`, then selecting the hitting way's line from
-  `rd_line`. (Choosing a victim way at fill time, via true LRU, is added
-  with the fill path.)
+  `rd_line`, and, on a fill, choosing the victim way (an invalid way
+  first, else the true-LRU way) and reading the victim's line from
+  `rd_line` for a dirty writeback.
 - Merging its two write sources onto this module's single write port
   (see below) -- this module has no arbitration logic of its own.
 - This module has **no direct connection to the MSHR** -- fill data
@@ -51,9 +52,9 @@ group. It is responsible for:
 
 ## Two write sources, one port
 
-The port is shared by two sources. The controller currently drives only
-the hit-write source (the store-hit path); the fill-write source is
-added with miss handling, and will be muxed onto the same port:
+The port is shared by two sources, both driven by the controller and
+muxed onto the same port (they never coincide: the CPU is held off
+while a fill is installed):
 
 | Source | `wr_word_en` | When |
 |---|---|---|

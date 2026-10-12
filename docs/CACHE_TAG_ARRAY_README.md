@@ -30,9 +30,9 @@ It is responsible for:
   array's output to obtain the real hit/hit_way -- `tag_match` alone
   is meaningless for an entry that was never validly filled.
 - Merging its two write sources onto this module's single write port:
-  the hit-write (dirty only) is implemented; the fill-write (tag +
-  dirty) is added with miss handling. This module has no arbitration
-  logic of its own.
+  the hit-write (dirty only) and the fill-write (tag + dirty). The two
+  never coincide -- the CPU is held off while a fill is installed -- and
+  this module has no arbitration logic of its own.
 - Reading `tag_out` when it evicts a dirty line: the victim's
   writeback address is `{stored tag, set index, zero offset}`, and
   this array is the only place that tag is kept.
@@ -59,13 +59,14 @@ It is responsible for:
 
 ## Two write sources, one port
 
-The controller currently drives only the hit write; the fill write is
-added with miss handling.
+The controller drives both sources (see `docs/CACHE_CONTROLLER_README.md`,
+"Fill"). A fill always installs the line clean; a store that missed is
+replayed afterwards through the hit path, which sets the dirty bit.
 
 | Source | `wr_tag_en` | `wr_dirty_en` | When |
 |---|---|---|---|
 | Hit write | 0 | 1 | A store hits an already-resident line; only its dirty bit changes. |
-| Fill write | 1 | 1 | The MSHR returns a line after a miss; tag and dirty are both set for the freshly allocated way. |
+| Fill write | 1 | 1 | The MSHR returns a line after a miss; the victim way gets the new tag, with dirty = 0. |
 
 ## Timing: registered compare, read-old-data on collision
 

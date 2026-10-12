@@ -27,10 +27,11 @@ group. It is responsible for:
 - ANDing this module's `valid_out` with `cache_tag_array`'s raw
   `tag_match` to obtain the real hit/hit_way -- `tag_match` alone is
   meaningless for an entry that was never validly filled.
-- Driving this module's write port on a fill (mark the newly allocated
-  way valid) -- added with the fill path; until then the controller
-  holds `wr_en` low. The invalidate encoding (`wr_valid = 0`) is
-  supported by the port but has no user in the controller yet.
+- Driving this module's write port on a fill (mark the victim way
+  valid). The invalidate encoding (`wr_valid = 0`) is supported by the
+  port but unused by the controller: an evicted way is refilled in the
+  same cycle, so a line never needs to be invalidated on its own (there
+  is no flush or coherence invalidation in this design).
 - No direct connection to the MSHR -- fill/invalidate requests reach
   this module only via the controller.
 
@@ -49,8 +50,9 @@ group. It is responsible for:
 
 ## Two write sources, one port
 
-Neither source is driven by the controller yet: the fill write is added
-with miss handling, and the invalidate encoding has no user so far.
+The controller drives only the fill write; the invalidate encoding is
+kept for a future flush or coherence feature and is verified here on its
+own.
 
 | Source | `wr_valid` | When |
 |---|---|---|
