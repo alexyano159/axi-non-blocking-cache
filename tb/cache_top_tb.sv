@@ -69,7 +69,7 @@ module cache_top_tb;
     localparam int unsigned REQ_TIMEOUT    = 20000;    // request accepted
     localparam int unsigned RESP_TIMEOUT   = 20000;    // response returned
     localparam int unsigned IDLE_TIMEOUT   = 40000;    // system drained
-    localparam int unsigned GLOBAL_TIMEOUT = 3000000;  // whole run
+    localparam int unsigned GLOBAL_TIMEOUT = 3000000;  // whole run, plus 400 per random request
 
     localparam int unsigned MAX_ERR_PRINT  = 40;       // error messages printed in full
 
@@ -1103,10 +1103,14 @@ module cache_top_tb;
     // ===================================================================
     // Global watchdog: a last line of defence should a wait loop itself
     // be defective.
+    // The bound grows with the requested random-test length.
     initial begin
-        repeat (GLOBAL_TIMEOUT) @(posedge clk);
+        int unsigned nreq, limit;
+        if (!$value$plusargs("nreq=%d", nreq)) nreq = 5000;
+        limit = GLOBAL_TIMEOUT + 400 * nreq;
+        repeat (limit) @(posedge clk);
         cur_test = "global";
-        hang($sformatf("global watchdog expired after %0d cycles", GLOBAL_TIMEOUT));
+        hang($sformatf("global watchdog expired after %0d cycles", limit));
     end
 
     initial begin
@@ -1597,21 +1601,26 @@ module cache_top_tb;
             $display("[COV] test 11: hit-under-miss %0d, R out-of-order completions %0d, R interleaved beats %0d, RAW stalls %0d, peak outstanding %0d",
                      c_hum, c_ooo, c_il, c_raw, cov_max_out);
 
-            // Coverage floors, scaled to the run length (calibrated for
-            // 5000 requests; each floor is well below the value observed
-            // over several seeds).
+            // Coverage floors per 1000 requests, roughly one third of the
+            // minimum observed over seeds 1-30 at 5000 requests (minimum
+            // per 1000: dirty writebacks 177, merges 160, held re-misses
+            // 32, fill restarts 13, replays 440, hit-under-miss 315,
+            // out-of-order R 47, interleaved R beats 83). A floor that
+            // is not met means the stimulus, not the design, has
+            // regressed. For runs shorter than 1000 requests the floors
+            // scale down proportionally.
             begin
-                int unsigned s;
-                s = (n_random + 999) / 1000;   // floors per 1000 requests
-                if (c_wb    < 20 * s) err($sformatf("coverage: dirty writebacks %0d < %0d", c_wb, 20 * s));
-                if (c_merge < 20 * s) err($sformatf("coverage: merges %0d < %0d", c_merge, 20 * s));
-                if (c_held  <  1 * s) err($sformatf("coverage: re-misses held by writeback %0d < %0d", c_held, s));
-                if (c_rs    <  1 * s) err($sformatf("coverage: fill restarts %0d < %0d", c_rs, s));
-                if (c_rp    < 50 * s) err($sformatf("coverage: replays %0d < %0d", c_rp, 50 * s));
-                if (c_hum   < 50 * s) err($sformatf("coverage: hit-under-miss %0d < %0d", c_hum, 50 * s));
-                if (c_ooo   < 10 * s) err($sformatf("coverage: out-of-order R completions %0d < %0d", c_ooo, 10 * s));
-                if (c_il    < 10 * s) err($sformatf("coverage: interleaved R beats %0d < %0d", c_il, 10 * s));
-                if (c_full  <  1)     err("coverage: writeback queue never full");
+                int unsigned k;
+                k = n_random;   // floor = per_1000 * k / 1000
+                if (c_wb    <  60 * k / 1000) err($sformatf("coverage: dirty writebacks %0d < %0d", c_wb,  60 * k / 1000));
+                if (c_merge <  50 * k / 1000) err($sformatf("coverage: merges %0d < %0d",           c_merge, 50 * k / 1000));
+                if (c_held  <  10 * k / 1000) err($sformatf("coverage: re-misses held by writeback %0d < %0d", c_held, 10 * k / 1000));
+                if (c_rs    <   5 * k / 1000) err($sformatf("coverage: fill restarts %0d < %0d",    c_rs,  5 * k / 1000));
+                if (c_rp    < 150 * k / 1000) err($sformatf("coverage: replays %0d < %0d",          c_rp, 150 * k / 1000));
+                if (c_hum   < 100 * k / 1000) err($sformatf("coverage: hit-under-miss %0d < %0d",   c_hum, 100 * k / 1000));
+                if (c_ooo   <  15 * k / 1000) err($sformatf("coverage: out-of-order R completions %0d < %0d", c_ooo, 15 * k / 1000));
+                if (c_il    <  25 * k / 1000) err($sformatf("coverage: interleaved R beats %0d < %0d", c_il, 25 * k / 1000));
+                if (n_random >= 1000 && c_full < 1) err("coverage: writeback queue never full");
             end
         end
         test_end($sformatf("%0d constrained-random requests (seed %0d): scoreboard, protocol and mirror checks clean, coverage floors met",
