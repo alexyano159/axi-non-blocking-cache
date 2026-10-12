@@ -37,6 +37,7 @@ then reads the matching way out of the data SRAM in the same cycle.
 Only the valid array has a reset; the tag and data arrays are modeled
 as reset-less SRAM macros whose contents are ignored until a way is
 marked valid. Full protocol and rationale:
+[`docs/CACHE_CONTROLLER_README.md`](docs/CACHE_CONTROLLER_README.md),
 [`docs/MSHR_README.md`](docs/MSHR_README.md),
 [`docs/AXI_IF_README.md`](docs/AXI_IF_README.md),
 [`docs/CACHE_TAG_ARRAY_README.md`](docs/CACHE_TAG_ARRAY_README.md),
