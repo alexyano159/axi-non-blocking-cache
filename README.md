@@ -125,7 +125,13 @@ installed after it); and dirty-victim writeback (a clean victim is not
 written back; a dirty one is handed to the MSHR with its own address
 and its modified data on the same edge as the fill write; with the
 writeback queue full, the fill waits with nothing written, the CPU held
-off and the writeback held stable, then completes).
+off and the writeback held stable, then completes); and replay (a line's
+waiting requests re-run through the hit path in arrival order once it
+is installed -- a load behind a store to the same word returns the
+stored data, each response carries its own id, only that line's waiters
+are released, and fills and CPU requests wait until the replays are
+issued -- including a freed waiting-table slot reused by a newer request
+that must still replay after an older one in a higher slot).
 
 ## Running the testbenches
 

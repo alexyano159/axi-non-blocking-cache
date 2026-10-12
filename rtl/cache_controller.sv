@@ -999,7 +999,7 @@ module cache_controller #(
     // Replay R1 (branch cache_replay, 2026-10-12): ready marking at fill,
     // oldest-first selection via the age matrix, issue into the lookup
     // stage, slot release at issue, priority replay > fill > CPU (see
-    // Replay). Tests 17-18 pending.
+    // Replay). Verified by tests 17-18.
     //
     // Next: R2 -- automatic MSHR fill model in the TB and test 9 without
     // its miss cap; then the controller README and the top level.

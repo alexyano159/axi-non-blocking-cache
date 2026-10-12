@@ -3667,8 +3667,14 @@ module cache_controller_tb;
         // (wb_log, wb_hold_err), model_victim_way and check_allocs'
         // exp_wbs argument.
         //
-        // Next: replay and its tests -- incl. slot release and reuse (age-matrix column clear)
-        // and removal of test 9's temporary miss cap (T9_MAX_MISSES).
+        // Tests 17 (replay order, priorities, exact timing) and 18 (slot
+        // reuse / age matrix) added 2026-10-12, with model_access shared
+        // by sb_access and the replay predictions, and stub release on
+        // fill.
+        //
+        // Next (R2): an automatic MSHR fill model, so that test 9 runs
+        // end to end with fills, evictions and replays, and removal of
+        // test 9's temporary miss cap (T9_MAX_MISSES).
         // ---------------------------------------------------------------
 
         $finish;
