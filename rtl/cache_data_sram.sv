@@ -60,8 +60,8 @@ module cache_data_sram #(
     // arbitrates hit-writes vs. fill-writes and presents one merged
     // request per cycle:
     //   - Hit write : wr_word_en = one-hot at the target word offset,
-    //                 wr_data carries the store word at its correct
-    //                 32-bit slice.
+    //                 wr_data carries the store word (the controller
+    //                 replicates it into every 32-bit lane).
     //   - Fill write: wr_word_en = all-ones, wr_data is the full line
     //                 returned by the MSHR.
     // -----------------------------------------------------------------

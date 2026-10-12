@@ -10,9 +10,8 @@
 // compare against a known value -- since a subsequent read is the
 // only way to confirm a write actually took effect.
 //
-// See private_notes/DESIGN_DECISIONS.txt for the rationale behind the
-// module's registered-read / no-reset / single-write-port choices
-// being verified here.
+// The rationale behind the module's registered-read / no-reset /
+// single-write-port choices is in docs/CACHE_DATA_SRAM_README.md.
 // -----------------------------------------------------------------------
 `default_nettype none
 `timescale 1ns/1ps

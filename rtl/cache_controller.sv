@@ -739,8 +739,10 @@ module cache_controller #(
     // so the number of restarts is bounded by the number of entries.
     //
     // Fills take priority over CPU requests. The CPU is held off while any
-    // fill is presented, so consecutive fills complete back to back (one
-    // per two cycles) and the CPU resumes once the MSHR has none left.
+    // fill is presented. Each fill takes F0 and F1; when the line has
+    // waiting requests, their replays must issue before the next F0, so in
+    // the full system consecutive fills take at least three cycles each.
+    // The CPU resumes once the MSHR has no fill left.
     // -------------------------------------------------------------------
     logic                     fill_start;      // F0 in this cycle
     logic [MSHR_ID_WIDTH-1:0] fill_id_q;       // id presented in the previous cycle

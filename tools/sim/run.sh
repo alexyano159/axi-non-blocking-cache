@@ -30,11 +30,13 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Questa install: first known release found wins.
 for QUESTA_BIN in /c/altera_lite/25.1std/questa_fse/win64 \
-                  /c/altera_lite/24.1std/questa_fse/win64; do
+                  /c/altera_lite/24.1std/questa_fse/win64 \
+                  /c/intelFPGA_lite/25.1std/questa_fse/win64 \
+                  /c/intelFPGA_lite/24.1std/questa_fse/win64; do
     [ -x "$QUESTA_BIN/vsim.exe" ] && break
 done
 if [ ! -x "$QUESTA_BIN/vsim.exe" ]; then
-    echo "run.sh: Questa not found under /c/altera_lite/*/questa_fse/win64" >&2
+    echo "run.sh: Questa not found under /c/{altera_lite,intelFPGA_lite}/*/questa_fse/win64" >&2
     exit 1
 fi
 export PATH="$QUESTA_BIN:$PATH"

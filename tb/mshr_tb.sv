@@ -5,7 +5,7 @@
 //   1. Clock/reset generation and DUT instantiation
 //   2. AXI memory model (slave-side BFM on the same axi_if)
 //   3. Driver/helper tasks (send_miss, wait_for_fill, push_writeback, ...)
-//   4. Directed tests 1-13
+//   4. Directed tests 1-14
 //
 // See docs/MSHR_README.md for the design rationale being
 // verified here (merge-over-new-alloc, round-robin AR arbitration,

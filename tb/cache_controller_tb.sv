@@ -14,7 +14,7 @@
 // fills and writebacks are logged and checked.
 //
 // Preload mode: lines can also be installed directly by the TB, which
-// tests 2-13 rely on. While tb_preload = 1, a mux in front of each
+// tests 2-14 and 17 rely on. While tb_preload = 1, a mux in front of each
 // array's write port hands that port to the TB instead of the
 // controller. Writing the arrays' storage hierarchically is not an
 // option -- it is driven by always_ff, which permits no second writer.
@@ -1009,8 +1009,8 @@ module cache_controller_tb;
 
     // Holds the synchronous reset for a few edges, then releases it.
     // Every TB-side change is applied #1 after the edge, never on it, so
-    // the DUT samples a stable value (see VERIFICATION_PROBLEMS.txt,
-    // Problem 4).
+    // the DUT samples a stable value (a change made on the edge itself
+    // races with the DUT sampling it).
     task automatic apply_reset();
         rst_n = 1'b0;
         repeat (3) @(posedge clk);
@@ -1142,10 +1142,9 @@ module cache_controller_tb;
     // updates, so it observes the pre-edge value. It must not be read
     // directly after the request fields are driven -- req_ready depends
     // combinationally on req_addr (read-after-write stall), and in the
-    // same time step it would still reflect the previous address (see
-    // VERIFICATION_PROBLEMS.txt). A bounded wait turns a permanently
-    // stalled controller into a clear failure rather than a hung
-    // simulation.
+    // same time step it would still reflect the previous address. A
+    // bounded wait turns a permanently stalled controller into a clear
+    // failure rather than a hung simulation.
     localparam int unsigned REQ_TIMEOUT_CYCLES = 100;
 
     task automatic cpu_send(
