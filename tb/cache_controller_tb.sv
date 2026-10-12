@@ -80,7 +80,7 @@ module cache_controller_tb;
     logic [TAG_WIDTH-1:0]     tag_lookup_tag;
     logic [NUM_WAYS-1:0]      tag_match;
     logic [NUM_WAYS-1:0]      tag_dirty_out;
-    logic [TAG_WIDTH-1:0]     tag_tag_out [NUM_WAYS];  // consumed once the controller's fill/eviction path is added
+    logic [TAG_WIDTH-1:0]     tag_tag_out [NUM_WAYS];
 
     logic [SET_IDX_WIDTH-1:0] valid_rd_set_idx;
     logic [NUM_WAYS-1:0]      valid_out;
@@ -234,6 +234,7 @@ module cache_controller_tb;
         .tag_lookup_tag     (tag_lookup_tag),
         .tag_match          (tag_match),
         .tag_dirty_out      (tag_dirty_out),
+        .tag_tag_out        (tag_tag_out),
         .tag_wr_en          (ctrl_tag_wr_en),
         .tag_wr_set_idx     (ctrl_tag_wr_set_idx),
         .tag_wr_way_sel     (ctrl_tag_wr_way_sel),
