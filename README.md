@@ -72,7 +72,8 @@ lookup, a non-matching tag correctly reporting no hit, a same-cycle
 read/write collision returning the pre-write value, independent gating
 of the tag vs. dirty write-enables (each checked with a deliberately
 mismatched value on the other field, to catch a broken gate), way
-isolation, set isolation, and `wr_en` gating.
+isolation, set isolation, `wr_en` gating, and read-out of every way's
+stored tag (`tag_out`, used to form a dirty victim's writeback address).
 
 `cache_valid_array.sv` currently covers: reset clearing a previously
 written entry (with the output shown as `X` before the first clocked
@@ -85,11 +86,12 @@ register directly without a lookup.
 a same-cycle read/write collision, a fill-write overwriting stale data
 across all four words, way isolation, `wr_en` gating, and set isolation.
 
-`cache_controller.sv` currently covers (hit path and miss allocation; the
-three real arrays are instantiated, lines are installed through a TB
-preload mux, and the MSHR inputs are tied to a stub that accepts every
-miss, assigns per-line entry ids as the real MSHR would, and never
-fills): reset idle state, a single load hit with
+`cache_controller.sv` currently covers (hit path, miss allocation and
+fill; the three real arrays are instantiated, lines are installed
+through a TB preload mux or through the controller's own fill path,
+the MSHR allocation inputs are tied to a stub that accepts every miss
+and assigns per-line entry ids as the real MSHR would, and fills are
+presented by a TB model of the MSHR's fill handshake): reset idle state, a single load hit with
 exact 2-cycle latency, a load hit on every way x word of a full set,
 valid gating (matching tag with valid = 0 misses, reported to the MSHR
 as one line-aligned allocation), a store hit with a
@@ -109,7 +111,18 @@ served back-to-back with exact latency among four pending misses, no
 stall even for a same-set hit behind a store miss); and waiting-table
 back-pressure (the conservative one-cycle hold at 15 occupied slots, and
 a full table holding off even a would-be hit with the parked requests
-left intact).
+left intact); fill installation (four fills into the free ways of a set,
+lowest index first, two cycles each, with tag, valid bit and full line
+written together and the CPU held off meanwhile, then a fifth fill
+replacing the least recently used way, with every resident line hitting
+afterwards); and the fill restart (a fill displaced by a lower-numbered
+MSHR entry between its read and write cycles writes nothing, the
+displacing fill is installed next, and the displaced one is re-read and
+installed after it); and dirty-victim writeback (a clean victim is not
+written back; a dirty one is handed to the MSHR with its own address
+and its modified data on the same edge as the fill write; with the
+writeback queue full, the fill waits with nothing written, the CPU held
+off and the writeback held stable, then completes).
 
 ## Running the testbenches
 

@@ -25,10 +25,11 @@
 // Work in progress: address decomposition, the lookup shadow register,
 // hit/miss detection and the hit completion path (load-hit response,
 // store-hit write, read-after-write stall, response FIFO), the true-LRU
-// replacement state (updated on hits), and the miss side of miss
+// replacement state (updated on hits and fills), the miss side of miss
 // handling (MSHR allocation, waiting table with age-ordered slots,
-// waiting-table back-pressure) are implemented; fill/eviction
-// sequencing and replay of waiting requests are added in later steps.
+// waiting-table back-pressure), and fill installation into an invalid
+// or LRU way with dirty-victim writeback are implemented; replay of
+// waiting requests is added in a later step.
 // -----------------------------------------------------------------------
 `default_nettype none
 
@@ -79,6 +80,7 @@ module cache_controller #(
     output      logic [TAG_WIDTH-1:0]     tag_lookup_tag,
     input  wire logic [NUM_WAYS-1:0]      tag_match,
     input  wire logic [NUM_WAYS-1:0]      tag_dirty_out,
+    input  wire logic [TAG_WIDTH-1:0]     tag_tag_out [NUM_WAYS],   // stored tags of the set read last cycle (victim writeback address)
 
     output      logic                     tag_wr_en,
     output      logic [SET_IDX_WIDTH-1:0] tag_wr_set_idx,
@@ -149,14 +151,32 @@ module cache_controller #(
     assign req_set_idx  = req_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH +: SET_IDX_WIDTH];
     assign req_tag      = req_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH + SET_IDX_WIDTH +: TAG_WIDTH];
 
-    // Drive the same decomposed address into all three arrays every
-    // cycle; the result is consumed only for an accepted request (marked
-    // by lookup_q.valid). Their registered outputs return together, one
-    // cycle later, so the controller can combine them.
-    assign tag_rd_set_idx   = req_set_idx;
-    assign tag_lookup_tag   = req_tag;
-    assign valid_rd_set_idx = req_set_idx;
-    assign data_rd_set_idx  = req_set_idx;
+    // The line presented by the MSHR for installation is decomposed the
+    // same way. The fill signals declared here are driven in the Fill
+    // sequencing section below; they are declared early because the
+    // array read and write ports are shared with the CPU path.
+    logic [SET_IDX_WIDTH-1:0] fill_set_idx;
+    logic [TAG_WIDTH-1:0]     fill_tag;
+    logic                     fill_busy;   // fill in its write cycle (F1); the arrays hold the fill set's contents
+    logic                     fill_wr;     // fill is installed into the arrays this cycle
+    logic [WAY_WIDTH-1:0]     fill_way;    // way receiving the fill
+
+    assign fill_set_idx = mshr_fill_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH +: SET_IDX_WIDTH];
+    assign fill_tag     = mshr_fill_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH + SET_IDX_WIDTH +: TAG_WIDTH];
+
+    // Array read ports: all three arrays receive the same address every
+    // cycle, and their registered outputs return together one cycle
+    // later. While the MSHR presents a fill, the read port belongs to the
+    // fill's set; the CPU is held off at the same time (see Request
+    // acceptance), so no accepted request is ever looked up at the wrong
+    // address. Otherwise the CPU's address is driven, and the result is
+    // consumed only for an accepted request (marked by lookup_q.valid).
+    // During a fill, the lookup tag is the fill's own tag, which lets the
+    // duplicate-line invariant below be checked on tag_match.
+    assign tag_rd_set_idx   = mshr_fill_valid ? fill_set_idx : req_set_idx;
+    assign tag_lookup_tag   = mshr_fill_valid ? fill_tag     : req_tag;
+    assign valid_rd_set_idx = tag_rd_set_idx;
+    assign data_rd_set_idx  = tag_rd_set_idx;
 
     // -------------------------------------------------------------------
     // Lookup shadow register
@@ -239,39 +259,50 @@ module cache_controller #(
 `endif
 
     // -------------------------------------------------------------------
-    // Store-hit write (lookup stage, cycle N+1)
-    // A store that hits updates only the addressed word of the hitting
-    // way, and marks the line dirty so that a later eviction writes it
-    // back (write-back policy). The tag field is left untouched.
+    // Array write ports: store hit and fill
+    // Two sources share each array's single write port. They are
+    // mutually exclusive by construction: the CPU is held off while a
+    // fill is presented, so the lookup stage is empty in the fill's write
+    // cycle (asserted in Fill sequencing).
+    //
+    // Store hit (lookup stage, cycle N+1): updates only the addressed
+    // word of the hitting way and marks the line dirty, so that a later
+    // eviction writes it back (write-back policy). The tag is unchanged.
+    //
+    // Fill (F1): installs the complete line into the victim way -- new
+    // tag, clean, valid. A store that missed is not merged here; it is
+    // replayed through the hit path, which then sets the dirty bit.
     // -------------------------------------------------------------------
     logic store_hit_wr;
 
     assign store_hit_wr = lookup_hit && lookup_q.we;
 
-    // Data SRAM: one-hot word enable at the store's word offset. The
-    // store word is replicated across all word lanes; wr_word_en alone
-    // determines which lane is committed, which avoids a variable shifter.
-    assign data_wr_en      = store_hit_wr;
-    assign data_wr_set_idx = lookup_q.set_idx;
-    assign data_wr_way_sel = hit_way;
-    assign data_wr_word_en = WORDS_PER_LINE'(1) << lookup_q.word_off;
-    assign data_wr_data    = {WORDS_PER_LINE{lookup_q.wdata}};
+    // Data SRAM. Store hit: one-hot word enable at the store's word
+    // offset, with the store word replicated across all word lanes, so
+    // wr_word_en alone selects the committed lane (no variable shifter).
+    // Fill: all word lanes enabled.
+    assign data_wr_en      = store_hit_wr || fill_wr;
+    assign data_wr_set_idx = fill_wr ? fill_set_idx   : lookup_q.set_idx;
+    assign data_wr_way_sel = fill_wr ? fill_way       : hit_way;
+    assign data_wr_word_en = fill_wr ? '1             : WORDS_PER_LINE'(1) << lookup_q.word_off;
+    assign data_wr_data    = fill_wr ? mshr_fill_data : {WORDS_PER_LINE{lookup_q.wdata}};
 
-    // Tag array: dirty-only update (wr_tag_en = 0).
-    assign tag_wr_en       = store_hit_wr;
-    assign tag_wr_set_idx  = lookup_q.set_idx;
-    assign tag_wr_way_sel  = hit_way;
-    assign tag_wr_tag      = lookup_q.tag;   // don't-care while tag_wr_tag_en = 0
-    assign tag_wr_tag_en   = 1'b0;
-    assign tag_wr_dirty    = 1'b1;
+    // Tag array. Store hit: dirty-only update (wr_tag_en = 0, dirty = 1).
+    // Fill: tag and dirty written together (dirty = 0).
+    assign tag_wr_en       = store_hit_wr || fill_wr;
+    assign tag_wr_set_idx  = fill_wr ? fill_set_idx : lookup_q.set_idx;
+    assign tag_wr_way_sel  = fill_wr ? fill_way     : hit_way;
+    assign tag_wr_tag      = fill_tag;               // don't-care for a store hit (wr_tag_en = 0)
+    assign tag_wr_tag_en   = fill_wr;
+    assign tag_wr_dirty    = !fill_wr;
     assign tag_wr_dirty_en = 1'b1;
 
-    // Valid array: no writer yet -- lines become valid only via the fill
-    // path, which is added together with miss handling.
-    assign valid_wr_en      = 1'b0;
-    assign valid_wr_set_idx = '0;
-    assign valid_wr_way_sel = '0;
-    assign valid_wr_valid   = 1'b0;
+    // Valid array: lines become valid only through a fill. No path
+    // invalidates a line, since an evicted way is immediately refilled.
+    assign valid_wr_en      = fill_wr;
+    assign valid_wr_set_idx = fill_set_idx;
+    assign valid_wr_way_sel = fill_way;
+    assign valid_wr_valid   = 1'b1;
 
     // -------------------------------------------------------------------
     // Replacement state: true LRU, one age counter per way
@@ -292,9 +323,11 @@ module cache_controller #(
     // read-after-write stall is required. Cost: NUM_SETS x NUM_WAYS x
     // WAY_WIDTH = 512 flip-flops at the default parameters.
     //
-    // Only hits update the order at present. Fills will be added as a
-    // second source of lru_upd_* together with the fill path; a miss
-    // itself does not update the order, since its line is not yet present.
+    // Two sources update the order: a hit (lookup stage) and a fill (F1),
+    // which are mutually exclusive for the same reason as the array write
+    // ports. A miss itself does not update the order, since its line is
+    // not yet present; the fill does, so that a second fill to the same
+    // set observes the first one and selects a different victim.
     // -------------------------------------------------------------------
     typedef logic [NUM_WAYS-1:0][WAY_WIDTH-1:0] lru_ages_t;   // ages of one set, indexed by way
 
@@ -306,9 +339,9 @@ module cache_controller #(
     lru_ages_t                lru_cur;    // current ages of the set being updated
     lru_ages_t                lru_nxt;    // ages after the update
 
-    assign lru_upd_en  = lookup_hit;
-    assign lru_upd_set = lookup_q.set_idx;
-    assign lru_upd_way = hit_way;
+    assign lru_upd_en  = lookup_hit || fill_wr;
+    assign lru_upd_set = fill_wr ? fill_set_idx : lookup_q.set_idx;
+    assign lru_upd_way = fill_wr ? fill_way     : hit_way;
     assign lru_cur     = lru_age[lru_upd_set];
 
     always_comb begin
@@ -338,11 +371,11 @@ module cache_controller #(
 
     // Victim lookup: the least recently used way of a set is the one whose
     // age is NUM_WAYS-1. The ages form a permutation, so exactly one way
-    // matches. The set is driven by the fill path once it is implemented.
+    // matches. The set is that of the line currently presented for fill.
     logic [SET_IDX_WIDTH-1:0] lru_victim_set;
     logic [WAY_WIDTH-1:0]     lru_victim_way;
 
-    assign lru_victim_set = mshr_fill_addr[BYTE_OFF_WIDTH + WORD_OFF_WIDTH +: SET_IDX_WIDTH];
+    assign lru_victim_set = fill_set_idx;
 
     always_comb begin
         lru_victim_way = '0;
@@ -379,9 +412,11 @@ module cache_controller #(
     // committed and the re-issued read observes it.
     //
     // The comparison is at set granularity (not way/word), since the
-    // requested way is not yet known at issue time. Every future array
-    // writer (fill, eviction) is to be OR-ed into arr_wr_active so that a
-    // single rule covers all read-after-write cases.
+    // requested way is not yet known at issue time. The fill write needs
+    // no term here: no request is accepted while a fill is presented (see
+    // Request acceptance), so none can read a set during its fill write.
+    // arr_wr_active is also consulted by the fill itself, which defers
+    // its read (F0) past a same-set store hit.
     //
     // Note: this term depends combinationally on req_addr. This is
     // permitted by valid/ready semantics (a source must not make its
@@ -614,13 +649,142 @@ module cache_controller #(
 `endif
 
     // -------------------------------------------------------------------
+    // Fill sequencing
+    // Installs the line presented by the MSHR in two cycles, since the
+    // victim can only be chosen once the target set's valid bits are read
+    // from the registered-output arrays:
+    //   F0 (read) : the fill's set is driven onto the array read ports
+    //               (see Array read ports) and the CPU is held off.
+    //   F1 (write): victim = lowest-indexed invalid way, else the LRU way.
+    //               A dirty victim is handed to the MSHR for writeback.
+    //               Tag, valid bit, full line and LRU order are written in
+    //               this cycle, and mshr_fill_ready completes the handoff.
+    // The victim is chosen at fill time rather than at miss time, so the
+    // old line keeps serving hits while the miss is outstanding.
+    //
+    // F0 is deferred by one cycle if a store hit is writing the fill's set
+    // in that cycle, since the arrays do not forward a same-edge write and
+    // the read would return stale contents. The CPU is already held off,
+    // so the lookup stage is empty in the following cycle and the deferral
+    // cannot repeat.
+    //
+    // Fill selection may change between F0 and F1: the MSHR presents its
+    // lowest-indexed completed entry, so an entry completing during F0
+    // can displace the one whose set was read. The presented id is
+    // registered every cycle (fill_id_q); F1 writes only if it is
+    // unchanged. Otherwise nothing is written, and the cycle acts as F0
+    // for the newly presented fill, whose set is already on the read
+    // port. A displaced fill cannot be displaced again by the same entry,
+    // so the number of restarts is bounded by the number of entries.
+    //
+    // Fills take priority over CPU requests. The CPU is held off while any
+    // fill is presented, so consecutive fills complete back to back (one
+    // per two cycles) and the CPU resumes once the MSHR has none left.
+    // -------------------------------------------------------------------
+    logic                     fill_start;      // F0 in this cycle
+    logic [MSHR_ID_WIDTH-1:0] fill_id_q;       // id presented in the previous cycle
+    logic                     fill_id_same;    // presented fill is the one whose set was read
+    logic [NUM_WAYS-1:0]      fill_inv_vec;    // invalid ways of the fill's set
+    logic [WAY_WIDTH-1:0]     fill_inv_way;    // lowest-indexed invalid way
+    logic                     victim_dirty;    // victim holds modified data that must be written back
+
+    assign fill_start   = mshr_fill_valid && !fill_busy
+                          && !(arr_wr_active && (arr_wr_set_idx == fill_set_idx));
+    assign fill_id_same = (mshr_fill_id == fill_id_q);
+
+    // The line is written once the victim, if dirty, has been handed to
+    // the MSHR's writeback queue in the same cycle (see Victim writeback).
+    assign fill_wr      = fill_busy && fill_id_same && (!victim_dirty || mshr_wb_ready);
+
+    // Victim selection (F1): an invalid way is always used before any
+    // valid line is displaced; the LRU order decides only for a full set.
+    assign fill_inv_vec = ~valid_out;
+
+    always_comb begin
+        fill_inv_way = '0;
+        for (int w = NUM_WAYS - 1; w >= 0; w--) begin
+            if (fill_inv_vec[w]) fill_inv_way = WAY_WIDTH'(w);
+        end
+    end
+
+    assign fill_way = (|fill_inv_vec) ? fill_inv_way : lru_victim_way;
+
+    // -------------------------------------------------------------------
+    // Victim writeback (F1)
+    // A valid, dirty victim is the only copy of its modified data, so it
+    // is handed to the MSHR's writeback queue before being overwritten.
+    // Its address is formed from the stored tag (tag_out) and the fill's
+    // set; its data is the line the arrays return for the fill's set. The
+    // handoff and the fill write share one edge: the MSHR captures the
+    // victim from the array outputs before the write is committed.
+    //
+    // If the queue is full (mshr_wb_ready = 0), F1 repeats with nothing
+    // written. The victim cannot change meanwhile: the read port stays on
+    // the fill's set, the CPU is held off (no hit can write the set or
+    // reorder its LRU), and no other fill can be installed. If the MSHR's
+    // fill selection changes while waiting, mshr_wb_valid is withdrawn
+    // without a handshake; the writeback queue acts only on
+    // valid && ready, so the withdrawal has no effect there.
+    //
+    // mshr_fill_ready depends combinationally on mshr_wb_ready, which the
+    // MSHR derives from its queue occupancy alone, so no loop forms.
+    // -------------------------------------------------------------------
+    assign victim_dirty  = valid_out[fill_way] && tag_dirty_out[fill_way];
+
+    assign mshr_wb_valid = fill_busy && fill_id_same && victim_dirty;
+    assign mshr_wb_addr  = {tag_tag_out[fill_way], fill_set_idx, LINE_OFF_WIDTH'(0)};
+    assign mshr_wb_data  = data_rd_line[fill_way];
+
+    // F0 -> F1; F1 -> F1 on a restart or while the writeback queue is
+    // full; F1 -> idle once the line is written.
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            fill_busy <= 1'b0;
+        end else begin
+            fill_busy <= (fill_start || fill_busy) && !fill_wr;
+        end
+    end
+
+    // No reset: fill_id_q is consulted only in F1, which is always
+    // preceded by a cycle in which it was loaded.
+    always_ff @(posedge clk) begin
+        fill_id_q <= mshr_fill_id;
+    end
+
+    assign mshr_fill_ready = fill_wr;
+
+`ifndef SYNTHESIS
+    // The MSHR holds a completed entry until it is accepted, so a fill
+    // cannot be withdrawn while it is being installed.
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     fill_busy |-> mshr_fill_valid)
+        else $error("cache_controller: fill withdrawn by the MSHR during F1");
+
+    // The two writers of the shared array and LRU ports must never
+    // coincide: the CPU hold-off leaves the lookup stage empty in F1.
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     fill_busy |-> !lookup_q.valid)
+        else $error("cache_controller: request in the lookup stage during fill F1");
+
+    // A missing line is installed only by its own fill, so the filled
+    // line must not already be present in its set; a duplicate would make
+    // hit_way ambiguous.
+    assert property (@(posedge clk) disable iff (!rst_n)
+                     fill_wr |-> !(|(tag_match & valid_out)))
+        else $error("cache_controller: fill of 0x%08h duplicates a line already in set %0d",
+                    mshr_fill_addr, fill_set_idx);
+`endif
+
+    // -------------------------------------------------------------------
     // Request acceptance
     // Accept only when
     //   (a) the FIFO is guaranteed a free slot for this request's result,
     //       assuming no pops occur in the meantime;
     //   (b) the waiting table is guaranteed a free slot, should this
     //       request miss;
-    //   (c) the request does not collide with a same-cycle array write.
+    //   (c) the request does not collide with a same-cycle array write;
+    //   (d) the MSHR is not presenting a fill, which owns the array read
+    //       ports and, in F1, the array write and LRU update ports.
     // (a) and (b) both count the occupied entries plus the one request
     // already in the lookup stage, whose outcome is not yet known and is
     // therefore assumed to consume an entry; the new request needs one
@@ -648,17 +812,11 @@ module cache_controller #(
     assign wait_space = ({1'b0, wait_count} + (WAIT_IDX_WIDTH+2)'(lookup_q.valid))
                         < (WAIT_IDX_WIDTH+2)'(WAIT_DEPTH);
 
-    assign req_ready  = resp_space && wait_space && !raw_hazard;
-
-    // -------------------------------------------------------------------
-    // MSHR port tie-offs
-    // Writeback and fill handling are added in later steps; until then
-    // the controller issues no writebacks and accepts no fills.
-    // -------------------------------------------------------------------
-    assign mshr_wb_valid       = 1'b0;
-    assign mshr_wb_addr        = '0;
-    assign mshr_wb_data        = '0;
-    assign mshr_fill_ready     = 1'b0;
+    // (d) depends combinationally on mshr_fill_valid, which the MSHR
+    // derives from its entry state alone, so no combinational loop forms.
+    // Since a fill write occurs only while mshr_fill_valid is high, (d)
+    // also prevents any request from reading a set during its fill write.
+    assign req_ready  = resp_space && wait_space && !raw_hazard && !mshr_fill_valid;
 
 `ifndef SYNTHESIS
     // The acceptance rule must guarantee that a lookup result never finds
@@ -673,49 +831,22 @@ module cache_controller #(
     // true-LRU replacement state implemented and verified (test 10),
     // 2026-10-04. Miss side implemented (MSHR allocation, waiting table +
     // age matrix, waiting-table back-pressure); tests 4, 9, 10 updated to
-    // check allocations, 2026-10-06.
+    // check allocations, 2026-10-06. Waiting table verified by tests
+    // 11-13 (2026-10-08).
     //
-    // Waiting table verified by cache_controller_tb tests 11-13
-    // (2026-10-08).
+    // Fill, sub-step 1 (branch cache_fill, 2026-10-12): two-cycle fill
+    // into an invalid or LRU way, LRU update from the fill, fill_id
+    // restart (see Fill sequencing). Verified by tests 14-15.
+    // Sub-step 2: dirty-victim writeback, F1 repeated while the
+    // writeback queue is full (see Victim writeback). Verified by test 16.
     //
-    // Next: fill/eviction (branch cache_fill, not yet created), then
-    // replay of pending requests through the hit path (see
-    // DESIGN_DECISIONS.txt). Planned fill sequence, 2 cycles:
-    //   F0 (read) : mshr_fill_valid and no same-set store hit in the
-    //               lookup stage -> drive the fill's set onto the array
-    //               read ports instead of the CPU's; req_ready = 0. Fills
-    //               take priority over new CPU requests.
-    //   F1 (write): victim = lowest invalid way, else lru_victim_way. A
-    //               valid dirty victim goes to mshr_wb_*; if
-    //               mshr_wb_ready = 0, stay in F1 with the CPU held off
-    //               and the read port on the fill's set, so the victim's
-    //               data stays on the array outputs. Then write tag
-    //               (dirty = 0 -- a replayed store sets dirty), valid = 1,
-    //               full line (word_en = '1); LRU update from the fill
-    //               (second lru_upd_* source); OR the fill write into
-    //               arr_wr_active; raise mshr_fill_ready.
-    //   Holding off the CPU in F0 leaves the lookup stage empty in F1,
-    //   so the array write port and LRU update port are free for the
-    //   fill, and the "merge in the handoff cycle" corner case (an
-    //   alloc_id whose fill was already presented) cannot arise.
-    //
-    // Issues found while planning -- both agreed and logged in
-    // DESIGN_DECISIONS.txt (2026-10-12). Issue 1 is implemented
-    // (cache_tag_array tag_out, test 9); issue 2 is part of the fill
-    // logic:
-    //   1. Victim writeback address: cache_tag_array outputs only
-    //      tag_match and dirty_out, never a stored tag, so the victim's
-    //      address cannot be formed. Proposed: add a registered tag_out
-    //      [NUM_WAYS] read output to cache_tag_array (+ a test in
-    //      cache_tag_array_tb), as a separate commit before the fill
-    //      logic. Rejected: a shadow tag copy in the controller.
-    //   2. The MSHR's fill-completion mux is fixed-priority (lowest
-    //      entry first, mshr.sv fe_done_sel): if a lower-numbered entry
-    //      completes between F0 and F1, F1 sees a different line than
-    //      the set F0 read. Proposed: latch mshr_fill_id in F0; in F1, if
-    //      it differs, abandon and restart from F0 (rare, bounded by the
-    //      entry count; the MSHR stays untouched). Rejected: changing the
-    //      MSHR to lock its selection once a fill starts.
+    // Next:
+    //   - Open issue, to be decided before replay: a miss to a line whose
+    //     dirty copy is still queued for writeback can be read from
+    //     memory before the write lands (AXI does not order AR against
+    //     AW to the same address). The MSHR does not check its writeback
+    //     queue on allocation.
+    //   - Replay of waiting requests through the hit path.
     // -------------------------------------------------------------------
 
 endmodule : cache_controller
