@@ -170,7 +170,10 @@ module mshr #(
     logic [NUM_ENTRIES-1:0] ar_hi_mask;      // entries with index strictly above ar_last_grant
     logic [NUM_ENTRIES-1:0] ar_req_hi;       // requesting entries within ar_hi_mask
     logic                   ar_grant_valid;  // at least one entry is requesting the AR channel
-    logic [ID_WIDTH-1:0]    ar_grant_idx;    // entry granted the AR channel this cycle
+    logic [ID_WIDTH-1:0]    ar_rr_idx;       // round-robin choice among the current requesters
+    logic [ID_WIDTH-1:0]    ar_grant_idx;    // entry presented on the AR channel this cycle
+    logic                   ar_lock;         // an AR was presented and not accepted on the last edge
+    logic [ID_WIDTH-1:0]    ar_lock_idx;     // entry presented on that edge
 
     always_comb begin
         for (int i = 0; i < NUM_ENTRIES; i++) begin
@@ -180,7 +183,31 @@ module mshr #(
 
     assign ar_req_hi      = fe_req_vec & ar_hi_mask;
     assign ar_grant_valid = |fe_req_vec;
-    assign ar_grant_idx   = (|ar_req_hi) ? pick_lowest(ar_req_hi) : pick_lowest(fe_req_vec);
+    assign ar_rr_idx      = (|ar_req_hi) ? pick_lowest(ar_req_hi) : pick_lowest(fe_req_vec);
+
+    // Grant lock (AXI4 handshake rule: once ARVALID is asserted, ARVALID
+    // and the address-channel payload must remain unchanged until
+    // ARREADY). The round-robin choice is combinational over fe_req_vec,
+    // which can gain members while a request waits for ARREADY -- a new
+    // allocation, or an entry whose writeback wait has just cleared --
+    // and would then switch arid/araddr to another entry before the
+    // handshake. A presented but unaccepted request is therefore kept
+    // on the channel until accepted; arbitration resumes after the
+    // handshake. The locked entry remains a requester throughout: it
+    // leaves FE_REQ only through its own AR handshake, and its writeback
+    // wait mask can only lose bits.
+    always_ff @(posedge clk) begin
+        if (!rst_n) ar_lock <= 1'b0;
+        else        ar_lock <= axi.arvalid && !axi.arready;
+    end
+
+    // No reset: consulted only while ar_lock is set, which requires a
+    // preceding cycle in which it was loaded.
+    always_ff @(posedge clk) begin
+        ar_lock_idx <= ar_grant_idx;
+    end
+
+    assign ar_grant_idx = ar_lock ? ar_lock_idx : ar_rr_idx;
 
     assign axi.arvalid = ar_grant_valid;
     assign axi.arid    = ar_grant_idx;
