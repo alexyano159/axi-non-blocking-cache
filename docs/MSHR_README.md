@@ -28,7 +28,9 @@ miss. From there:
    - **Yes** → merge into it (`alloc_id` = that entry's index). No new
      AXI traffic — this is a secondary miss (also called an MSHR hit).
    - **No, and a slot is free** → open a new entry, issue an AXI read
-     burst (`AR`/`R`) for the line.
+     burst (`AR`/`R`) for the line. If that line is still waiting in
+     the writeback queue, the read is held until the write completes
+     (see "Read-after-write ordering" below).
    - **No slot free either** → `alloc_ready = 0`, controller stalls.
 3. Memory streams back 4 beats on `R`; the MSHR reassembles them.
 4. `fill_valid` + `fill_data` are presented to the controller; once it
@@ -89,6 +91,42 @@ Why not let several be in flight at once:
   per-slot state array and an ID pool, doubling the amount of logic (and
   verification surface) for a part of the design that isn't performance
   critical.
+
+## Read-after-write ordering: a re-miss waits for its own writeback
+
+**The problem:** a dirty line X is evicted and sits in the writeback
+queue. Shortly after, the CPU asks for X again, which is now a miss. AXI
+does **not** order a read against an earlier write to the same
+address, so the new read of X could reach memory before the write does,
+and return the **old** data.
+
+**The fix (hold the read):**
+- When a new entry is opened, its line address is compared against
+  every busy writeback-queue slot (4 compares). The matching slots are
+  stored in the entry's wait mask (`fe_wb_wait`, one bit per slot).
+- An entry with any bit set stays in `FE_REQ` but is **not offered to
+  the AR arbiter**.
+- When a writeback finishes (its `B` response arrives), that slot's bit
+  is cleared in every entry. Once the mask is empty, the read goes out
+  normally.
+
+**Why checking once, at allocation, is enough:** a line can only be
+evicted while it's in the cache, and while it's in the cache every
+access to it hits. So X's writeback is always queued *before* any new
+miss to X can exist.
+
+**Why slots, not a counter:** a slot can be freed and reused by an
+unrelated writeback. Remembering *which* slots to wait for means a
+reused slot is never mistaken for the one being waited on.
+
+**Cost:** 4 address compares plus a 4-bit mask per entry. Only the rare
+re-miss to a just-evicted dirty line is delayed, by at most
+`WB_QUEUE_DEPTH` writebacks. The miss itself is never stalled, which
+matters because the controller can't hold a detected miss.
+
+**Rejected alternative:** forward the line straight from the writeback
+queue. It's faster, but needs a 128-bit datapath into the line buffer
+and a "newest match" picker, all for a rare case.
 
 ## The AR arbiter: why round-robin, not fixed-priority
 
