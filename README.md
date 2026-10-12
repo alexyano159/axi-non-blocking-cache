@@ -105,18 +105,19 @@ fill; the three real arrays are instantiated, lines are installed
 through a TB preload mux or through the controller's own fill path,
 the MSHR allocation inputs are tied to a stub that accepts every miss
 and assigns per-line entry ids as the real MSHR would, and fills are
-presented by a TB model of the MSHR's fill handshake): reset idle state, a single load hit with
+presented by a TB model of the MSHR's fill handshake -- placed by hand in
+the directed tests, and by an automatic model of the MSHR's fill engine
+backed by a golden memory image in the end-to-end test): reset idle state, a single load hit with
 exact 2-cycle latency, a load hit on every way x word of a full set,
 valid gating (matching tag with valid = 0 misses, reported to the MSHR
 as one line-aligned allocation), a store hit with a
 single masked word write and dirty 0 -> 1, the 1-cycle same-set
 read-after-write stall (and its absence otherwise), full one-per-cycle
 throughput, response back-pressure filling the 3-entry FIFO with a
-stable held response, a 500-request constrained-random load/store mix
-under random back-pressure (scoreboard-checked, every miss's MSHR
-allocation checked, with a read-after-write coverage floor and a
-reproducible `+seed`; misses temporarily capped at 14 until fills
-release waiting-table slots), and the true-LRU recency
+stable held response, a 500-request constrained-random load/store hit
+mix under random back-pressure (scoreboard-checked in order, with a
+read-after-write coverage floor, the final LRU order checked against
+the model, and a reproducible `+seed`), and the true-LRU recency
 order after every kind of hit, including back-to-back same-set hits
 and the reported victim; the waiting table's slot contents (address,
 load/store, store data, CPU id, MSHR id including secondary-miss merges)
@@ -142,7 +143,22 @@ is installed -- a load behind a store to the same word returns the
 stored data, each response carries its own id, only that line's waiters
 are released, and fills and CPU requests wait until the replays are
 issued -- including a freed waiting-table slot reused by a newer request
-that must still replay after an older one in a higher slot).
+that must still replay after an older one in a higher slot); and an
+end-to-end constrained-random test (about 3000 requests over twelve
+lines competing for the four ways of two sets, up to 16 CPU ids in
+flight, random fill latency, random response and writeback-queue
+back-pressure) in which hits, misses, secondary misses, fills and fill
+restarts, clean and dirty evictions, writebacks, replays and
+read-after-write stalls all overlap. Every response is matched by id
+against a flat reference memory updated in acceptance order, every
+evicted line and every writeback is checked against it, every request
+must be answered exactly once, every wait is watchdog-bounded, and
+coverage floors on each of those events make a pass meaningful. The test
+was shown to fail against deliberately broken copies of the controller
+(replay by slot index, no read-after-write hold on replay, wrong
+writeback data, replayed store not marking the line dirty, no fill
+restart, CPU or fill admitted during replays, broken age matrix, ready
+marking ignoring the MSHR id).
 
 ## Running the testbenches
 

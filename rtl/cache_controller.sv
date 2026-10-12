@@ -1001,8 +1001,13 @@ module cache_controller #(
     // stage, slot release at issue, priority replay > fill > CPU (see
     // Replay). Verified by tests 17-18.
     //
-    // Next: R2 -- automatic MSHR fill model in the TB and test 9 without
-    // its miss cap; then the controller README and the top level.
+    // Replay R2 (branch tb_auto_fill, 2026-10-12): verified end to end by
+    // test 19 -- constrained-random traffic against an automatic MSHR
+    // fill model, checked against a flat reference memory in acceptance
+    // order, with every eviction and writeback checked; 30 seeds clean.
+    // No RTL change was required.
+    //
+    // Next: the controller README, then the top level.
     // -------------------------------------------------------------------
 
 endmodule : cache_controller
