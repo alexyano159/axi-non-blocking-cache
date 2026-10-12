@@ -841,11 +841,9 @@ module cache_controller #(
     // writeback queue is full (see Victim writeback). Verified by test 16.
     //
     // Next:
-    //   - Open issue, to be decided before replay: a miss to a line whose
-    //     dirty copy is still queued for writeback can be read from
-    //     memory before the write lands (AXI does not order AR against
-    //     AW to the same address). The MSHR does not check its writeback
-    //     queue on allocation.
+    //   - Resolved in mshr.sv (2026-10-12, mshr_tb test 14): a miss to a
+    //     line still queued for writeback holds its AR until that write's
+    //     B response (see "Read-after-write ordering" there).
     //   - Replay of waiting requests through the hit path.
     // -------------------------------------------------------------------
 
