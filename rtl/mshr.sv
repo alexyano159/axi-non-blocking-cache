@@ -123,20 +123,21 @@ module mshr #(
     logic                         fe_is_write[NUM_ENTRIES];  // set if any merged access was a store
     logic [BEAT_CNT_WIDTH-1:0]    fe_beat_cnt[NUM_ENTRIES];  // R beats received so far for this entry
     logic [LINE_WIDTH-1:0]        fe_line_buf[NUM_ENTRIES];  // reassembled line data, filled beat by beat
+    logic [WB_QUEUE_DEPTH-1:0]    fe_wb_wait [NUM_ENTRIES];  // writeback-queue slots this entry's read must wait for (see Read-after-write ordering)
 
     // Per-entry status vectors, recomputed combinationally every cycle
     // from the current state array. Each bit position corresponds to one
     // entry / AXI ID.
     logic [NUM_ENTRIES-1:0] fe_match_vec;  // entries in flight whose address matches the incoming miss (merge candidates)
     logic [NUM_ENTRIES-1:0] fe_free_vec;   // entries available for a new allocation
-    logic [NUM_ENTRIES-1:0] fe_req_vec;    // entries currently requesting the AR channel
+    logic [NUM_ENTRIES-1:0] fe_req_vec;    // entries currently requesting the AR channel (not held by a pending writeback)
     logic [NUM_ENTRIES-1:0] fe_done_vec;   // entries holding a completed line, waiting to be presented
 
     always_comb begin
         for (int i = 0; i < NUM_ENTRIES; i++) begin
             fe_match_vec[i] = (fe_state[i] != FE_IDLE) && (fe_addr[i] == alloc_addr);
             fe_free_vec[i]  = (fe_state[i] == FE_IDLE);
-            fe_req_vec[i]   = (fe_state[i] == FE_REQ);
+            fe_req_vec[i]   = (fe_state[i] == FE_REQ) && (fe_wb_wait[i] == '0);
             fe_done_vec[i]  = (fe_state[i] == FE_DONE);
         end
     end
@@ -355,6 +356,64 @@ module mshr #(
                 default: wb_state <= WB_IDLE;
             endcase
         end
+    end
+
+    // ===================================================================
+    // Read-after-write ordering
+    // AXI4 does not order a read against an earlier write to the same
+    // address: a miss to a line whose dirty copy is still in the
+    // writeback queue could have its AR overtake the AW/W, and read the
+    // stale memory contents. An entry is therefore held out of AR
+    // arbitration (FE_REQ, but not in fe_req_vec) until every writeback
+    // of its line that was queued when it was allocated has completed,
+    // i.e. received its B response.
+    //
+    // The comparison is made once, at allocation, which is sufficient for
+    // this cache: a line can only be evicted while resident, and a
+    // resident line hits, so its writeback is always queued before any
+    // new miss to it can be allocated. A writeback pushed in the
+    // allocation cycle itself is included as well, so the check does not
+    // depend on that same-cycle ordering. A merge needs no check: the
+    // existing entry already recorded its own wait mask.
+    //
+    // Each entry records which queue slots it waits for, rather than a
+    // count, so a slot freed and reused by an unrelated writeback cannot
+    // be mistaken for the one awaited: a slot's bit is cleared in every
+    // entry when that slot completes. The wait lasts at most
+    // WB_QUEUE_DEPTH writebacks, and only the rare re-miss to a line
+    // just evicted dirty is delayed.
+    // ===================================================================
+    logic [WB_QUEUE_DEPTH-1:0] wb_slot_busy;    // slot holds a queued or in-progress writeback
+    logic [WB_QUEUE_DEPTH-1:0] wb_alloc_match;  // slots whose writeback the allocating miss must wait for
+    logic [WB_QUEUE_DEPTH-1:0] wb_pop_mask;     // slot completing this cycle
+
+    // Occupancy per slot: slot i is busy if it lies within wb_count
+    // positions of the head, counting circularly.
+    always_comb begin
+        for (int i = 0; i < WB_QUEUE_DEPTH; i++) begin
+            int slot_ofs;   // circular distance from the head
+            slot_ofs        = (i >= wb_head) ? (i - wb_head) : (i + WB_QUEUE_DEPTH - wb_head);
+            wb_slot_busy[i] = (slot_ofs < wb_count);
+        end
+    end
+
+    always_comb begin
+        for (int i = 0; i < WB_QUEUE_DEPTH; i++) begin
+            wb_alloc_match[i] = (wb_slot_busy[i] && (wb_queue_addr[i] == alloc_addr))
+                             || (wb_push && (i == wb_tail) && (wb_addr == alloc_addr));
+            wb_pop_mask[i]    = wb_pop && (i == wb_head);
+        end
+    end
+
+    // No reset: a mask is written at every new allocation before its
+    // entry can request AR, and is consulted only while the entry is in
+    // FE_REQ. A slot completing in the allocation cycle is excluded from
+    // the new mask, since its clear is applied on the same edge.
+    always_ff @(posedge clk) begin
+        for (int i = 0; i < NUM_ENTRIES; i++)
+            fe_wb_wait[i] <= fe_wb_wait[i] & ~wb_pop_mask;
+        if (alloc_valid && alloc_ready && !fe_any_match)
+            fe_wb_wait[fe_free_idx] <= wb_alloc_match & ~wb_pop_mask;
     end
 
 endmodule : mshr
