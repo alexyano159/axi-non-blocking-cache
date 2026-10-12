@@ -28,8 +28,8 @@
 // replacement state (updated on hits and fills), the miss side of miss
 // handling (MSHR allocation, waiting table with age-ordered slots,
 // waiting-table back-pressure), and fill installation into an invalid
-// or LRU way are implemented; dirty-victim writeback and replay of
-// waiting requests are added in later steps.
+// or LRU way with dirty-victim writeback are implemented; replay of
+// waiting requests is added in a later step.
 // -----------------------------------------------------------------------
 `default_nettype none
 
@@ -656,6 +656,7 @@ module cache_controller #(
     //   F0 (read) : the fill's set is driven onto the array read ports
     //               (see Array read ports) and the CPU is held off.
     //   F1 (write): victim = lowest-indexed invalid way, else the LRU way.
+    //               A dirty victim is handed to the MSHR for writeback.
     //               Tag, valid bit, full line and LRU order are written in
     //               this cycle, and mshr_fill_ready completes the handoff.
     // The victim is chosen at fill time rather than at miss time, so the
@@ -685,11 +686,15 @@ module cache_controller #(
     logic                     fill_id_same;    // presented fill is the one whose set was read
     logic [NUM_WAYS-1:0]      fill_inv_vec;    // invalid ways of the fill's set
     logic [WAY_WIDTH-1:0]     fill_inv_way;    // lowest-indexed invalid way
+    logic                     victim_dirty;    // victim holds modified data that must be written back
 
     assign fill_start   = mshr_fill_valid && !fill_busy
                           && !(arr_wr_active && (arr_wr_set_idx == fill_set_idx));
     assign fill_id_same = (mshr_fill_id == fill_id_q);
-    assign fill_wr      = fill_busy && fill_id_same;
+
+    // The line is written once the victim, if dirty, has been handed to
+    // the MSHR's writeback queue in the same cycle (see Victim writeback).
+    assign fill_wr      = fill_busy && fill_id_same && (!victim_dirty || mshr_wb_ready);
 
     // Victim selection (F1): an invalid way is always used before any
     // valid line is displaced; the LRU order decides only for a full set.
@@ -704,7 +709,34 @@ module cache_controller #(
 
     assign fill_way = (|fill_inv_vec) ? fill_inv_way : lru_victim_way;
 
-    // F0 -> F1; F1 -> F1 on a restart; F1 -> idle once the line is written.
+    // -------------------------------------------------------------------
+    // Victim writeback (F1)
+    // A valid, dirty victim is the only copy of its modified data, so it
+    // is handed to the MSHR's writeback queue before being overwritten.
+    // Its address is formed from the stored tag (tag_out) and the fill's
+    // set; its data is the line the arrays return for the fill's set. The
+    // handoff and the fill write share one edge: the MSHR captures the
+    // victim from the array outputs before the write is committed.
+    //
+    // If the queue is full (mshr_wb_ready = 0), F1 repeats with nothing
+    // written. The victim cannot change meanwhile: the read port stays on
+    // the fill's set, the CPU is held off (no hit can write the set or
+    // reorder its LRU), and no other fill can be installed. If the MSHR's
+    // fill selection changes while waiting, mshr_wb_valid is withdrawn
+    // without a handshake; the writeback queue acts only on
+    // valid && ready, so the withdrawal has no effect there.
+    //
+    // mshr_fill_ready depends combinationally on mshr_wb_ready, which the
+    // MSHR derives from its queue occupancy alone, so no loop forms.
+    // -------------------------------------------------------------------
+    assign victim_dirty  = valid_out[fill_way] && tag_dirty_out[fill_way];
+
+    assign mshr_wb_valid = fill_busy && fill_id_same && victim_dirty;
+    assign mshr_wb_addr  = {tag_tag_out[fill_way], fill_set_idx, LINE_OFF_WIDTH'(0)};
+    assign mshr_wb_data  = data_rd_line[fill_way];
+
+    // F0 -> F1; F1 -> F1 on a restart or while the writeback queue is
+    // full; F1 -> idle once the line is written.
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             fill_busy <= 1'b0;
@@ -786,15 +818,6 @@ module cache_controller #(
     // also prevents any request from reading a set during its fill write.
     assign req_ready  = resp_space && wait_space && !raw_hazard && !mshr_fill_valid;
 
-    // -------------------------------------------------------------------
-    // MSHR writeback tie-off
-    // Dirty-victim writeback is added in the next step; until then the
-    // controller issues no writebacks.
-    // -------------------------------------------------------------------
-    assign mshr_wb_valid       = 1'b0;
-    assign mshr_wb_addr        = '0;
-    assign mshr_wb_data        = '0;
-
 `ifndef SYNTHESIS
     // The acceptance rule must guarantee that a lookup result never finds
     // the FIFO full; a violation would silently drop a CPU response.
@@ -814,14 +837,10 @@ module cache_controller #(
     // Fill, sub-step 1 (branch cache_fill, 2026-10-12): two-cycle fill
     // into an invalid or LRU way, LRU update from the fill, fill_id
     // restart (see Fill sequencing). Verified by tests 14-15.
+    // Sub-step 2: dirty-victim writeback, F1 repeated while the
+    // writeback queue is full (see Victim writeback). Test 16 pending.
     //
     // Next:
-    //   - Sub-step 2: dirty victim -> mshr_wb_*, address
-    //     {tag_tag_out[fill_way], fill_set_idx, 0}, data
-    //     data_rd_line[fill_way]. fill_wr additionally requires
-    //     mshr_wb_ready when the victim is valid and dirty; while it is
-    //     low, F1 repeats with the read port on the fill's set, so the
-    //     victim stays on the array outputs.
     //   - Open issue, to be decided before replay: a miss to a line whose
     //     dirty copy is still queued for writeback can be read from
     //     memory before the write lands (AXI does not order AR against
