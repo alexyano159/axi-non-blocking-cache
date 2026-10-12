@@ -54,6 +54,7 @@ module cache_tag_array_tb;
     logic [TAG_WIDTH-1:0]     lookup_tag;
     logic [NUM_WAYS-1:0]      tag_match;
     logic [NUM_WAYS-1:0]      dirty_out;
+    logic [TAG_WIDTH-1:0]     tag_out [NUM_WAYS];
 
     logic                     wr_en;
     logic [SET_IDX_WIDTH-1:0] wr_set_idx;
@@ -79,6 +80,7 @@ module cache_tag_array_tb;
         .lookup_tag (lookup_tag),
         .tag_match  (tag_match),
         .dirty_out  (dirty_out),
+        .tag_out    (tag_out),
 
         .wr_en      (wr_en),
         .wr_set_idx (wr_set_idx),
