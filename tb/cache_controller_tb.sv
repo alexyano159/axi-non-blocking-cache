@@ -1,19 +1,18 @@
 // -----------------------------------------------------------------------
 // Testbench for the cache controller (rtl/cache_controller.sv) --
-// hit path, replacement state (LRU) and miss side (waiting table).
+// hit path, replacement state (LRU), miss side (waiting table) and fill.
 //
 // The DUT is the controller wired to the real, already-verified
 // cache_tag_array, cache_valid_array and cache_data_sram, so any failure
 // here is attributable to the controller itself. The MSHR is not
-// instantiated: only the miss side of miss handling exists so far, so
-// its inputs are tied to an MSHR that accepts every allocation and never
-// fills, except mshr_fill_addr, which test 10 drives to probe the LRU
-// victim, and mshr_alloc_id, which a small stub assigns per line as the
-// real MSHR would. Allocations the controller issues are logged and
-// checked.
+// instantiated. Its inputs model an MSHR that accepts every allocation:
+// mshr_alloc_id is assigned per line by a small stub, as the real MSHR
+// would, and the fill inputs (mshr_fill_*) are driven by the TB -- by
+// the mshr_fill task, or cycle by cycle where a test needs exact
+// control. Allocations and fills are logged and checked.
 //
-// Preload mode: with no fill path yet, lines can only become valid if
-// the TB installs them. While tb_preload = 1, a mux in front of each
+// Preload mode: lines can also be installed directly by the TB, which
+// tests 2-13 rely on. While tb_preload = 1, a mux in front of each
 // array's write port hands that port to the TB instead of the
 // controller. Writing the arrays' storage hierarchically is not an
 // option -- it is driven by always_ff, which permits no second writer.
@@ -140,12 +139,13 @@ module cache_controller_tb;
 
     // -------------------------------------------------------------------
     // MSHR port. Controller outputs are observed (they must stay idle on
-    // the hit path); inputs are tied to the values an idle MSHR drives
-    // just after reset (free entries, empty writeback queue, no fill).
-    // mshr_fill_addr is a variable rather than a constant: with
-    // mshr_fill_valid = 0 it carries no fill, but it selects the set whose
-    // LRU victim the controller computes, which test 10 probes.
-    // mshr_alloc_id is driven by the allocation stub below.
+    // the hit path); the remaining inputs are tied to the values an idle
+    // MSHR drives just after reset (free entries, empty writeback queue).
+    // The fill inputs are TB-driven variables, idle (no fill) by default.
+    // With mshr_fill_valid = 0, mshr_fill_addr carries no fill, but it
+    // still selects the set whose LRU victim the controller computes,
+    // which test 10 probes. mshr_alloc_id is driven by the allocation
+    // stub below.
     // -------------------------------------------------------------------
     logic                     mshr_alloc_valid;
     logic [ADDR_WIDTH-1:0]    mshr_alloc_addr;
@@ -159,11 +159,11 @@ module cache_controller_tb;
     logic      [MSHR_ID_WIDTH-1:0] mshr_alloc_id;            // driven by the allocation stub
     wire logic                     mshr_wb_ready     = 1'b1;
     wire logic                     mshr_wb_done      = 1'b0;
-    wire logic                     mshr_fill_valid   = 1'b0;
-    wire logic [MSHR_ID_WIDTH-1:0] mshr_fill_id      = '0;
-    logic      [ADDR_WIDTH-1:0]    mshr_fill_addr    = '0;   // TB-driven: selects the set for the LRU victim probe (test 10)
-    wire logic [LINE_WIDTH-1:0]    mshr_fill_data    = '0;
-    wire logic                     mshr_fill_is_write = 1'b0;
+    logic                          mshr_fill_valid   = 1'b0;   // TB-driven (mshr_fill, test 15)
+    logic      [MSHR_ID_WIDTH-1:0] mshr_fill_id      = '0;
+    logic      [ADDR_WIDTH-1:0]    mshr_fill_addr    = '0;     // also selects the set for the LRU victim probe (test 10)
+    logic      [LINE_WIDTH-1:0]    mshr_fill_data    = '0;
+    wire logic                     mshr_fill_is_write = 1'b0;  // unused by the controller: stores are replayed, not merged
 
     // -------------------------------------------------------------------
     // MSHR allocation stub.
@@ -366,12 +366,18 @@ module cache_controller_tb;
     end
 
     // -------------------------------------------------------------------
-    // Cycle counter and response monitor.
+    // Cycle counter, response monitor and fill monitor.
     // cycle_cnt holds the index of the most recent rising edge. The
-    // monitor runs in the same process, so each logged response carries
-    // the index of the edge on which its handshake completed -- directly
-    // comparable with cpu_send's accept_cycle. DUT outputs read here are
-    // their pre-edge values, since flop updates land in the NBA region.
+    // monitors run in the same process, so each logged response or fill
+    // carries the index of the edge on which its handshake completed --
+    // directly comparable with cpu_send's accept_cycle and mshr_fill's
+    // done_cycle. DUT outputs read here are their pre-edge values, since
+    // flop updates land in the NBA region.
+    //
+    // The fill monitor also enforces two rules on every edge:
+    //   - mshr_fill_ready is never raised without a presented fill;
+    //   - no CPU request is accepted while a fill is presented (fills
+    //     own the array ports and take priority over the CPU).
     // -------------------------------------------------------------------
     typedef struct {
         logic [TXN_ID_WIDTH-1:0] id;
@@ -380,13 +386,31 @@ module cache_controller_tb;
         int unsigned             cycle;
     } resp_rec_t;
 
-    int unsigned cycle_cnt = 0;
+    typedef struct {
+        logic [MSHR_ID_WIDTH-1:0] id;
+        logic [ADDR_WIDTH-1:0]    addr;
+        int unsigned              cycle;
+    } fill_rec_t;
+
+    int unsigned cycle_cnt     = 0;
     resp_rec_t   resp_log [$];
+    fill_rec_t   fill_log [$];
+    int unsigned fill_rule_err = 0;
 
     always @(posedge clk) begin
         cycle_cnt++;
         if (rst_n && resp_valid && resp_ready)
             resp_log.push_back('{id: resp_id, data: resp_data, we: resp_we, cycle: cycle_cnt});
+        if (rst_n && mshr_fill_valid && mshr_fill_ready)
+            fill_log.push_back('{id: mshr_fill_id, addr: mshr_fill_addr, cycle: cycle_cnt});
+        if (rst_n && mshr_fill_ready && !mshr_fill_valid) begin
+            $error("fill monitor: mshr_fill_ready without a presented fill at cycle %0d", cycle_cnt);
+            fill_rule_err++;
+        end
+        if (rst_n && mshr_fill_valid && req_ready) begin
+            $error("fill monitor: req_ready high while a fill is presented at cycle %0d", cycle_cnt);
+            fill_rule_err++;
+        end
     end
 
     // -------------------------------------------------------------------
@@ -501,9 +525,13 @@ module cache_controller_tb;
         logic [SET_IDX_WIDTH-1:0]  tag_set;
         logic [WAY_WIDTH-1:0]      tag_way;
         logic                      tag_tag_en;
+        logic [TAG_WIDTH-1:0]      tag_tag;
         logic                      tag_dirty;
         logic                      tag_dirty_en;
         logic                      valid_en;
+        logic [SET_IDX_WIDTH-1:0]  valid_set;
+        logic [WAY_WIDTH-1:0]      valid_way;
+        logic                      valid_valid;
     } wr_rec_t;
 
     wr_rec_t     wr_log [$];
@@ -522,9 +550,13 @@ module cache_controller_tb;
                 tag_set:      ctrl_tag_wr_set_idx,
                 tag_way:      ctrl_tag_wr_way_sel,
                 tag_tag_en:   ctrl_tag_wr_tag_en,
+                tag_tag:      ctrl_tag_wr_tag,
                 tag_dirty:    ctrl_tag_wr_dirty,
                 tag_dirty_en: ctrl_tag_wr_dirty_en,
-                valid_en:     ctrl_valid_wr_en
+                valid_en:     ctrl_valid_wr_en,
+                valid_set:    ctrl_valid_wr_set_idx,
+                valid_way:    ctrl_valid_wr_way_sel,
+                valid_valid:  ctrl_valid_wr_valid
             });
         end
         if (rst_n && (mshr_alloc_valid || mshr_wb_valid))
@@ -830,6 +862,129 @@ module cache_controller_tb;
             exp_log.push_back(exp);
         end else begin
             exp_alloc_log.push_back('{addr: line_addr(addr), is_write: we});
+        end
+    endtask
+
+    // Scoreboard prediction of a fill: the lowest-indexed invalid way of
+    // the line's set, else its least recently used way (age NUM_WAYS-1).
+    // The model installs the line there -- clean, valid -- and makes the
+    // way the most recently used, as the controller does. Returns the way.
+    function automatic logic [WAY_WIDTH-1:0] model_fill(
+        input logic [ADDR_WIDTH-1:0] addr,
+        input logic [LINE_WIDTH-1:0] line
+    );
+        logic [SET_IDX_WIDTH-1:0]  s;
+        logic [TAG_WIDTH-1:0]      t;
+        logic [WORD_OFF_WIDTH-1:0] d;
+        logic [WAY_WIDTH-1:0]      way;
+        logic [WAY_WIDTH-1:0]      way_age;
+        logic                      found;
+
+        {t, s, d} = addr[ADDR_WIDTH-1:BYTE_OFF_WIDTH];
+
+        found = 1'b0;
+        for (int w = 0; w < NUM_WAYS; w++) begin
+            if (!found && !model_valid[s][w]) begin
+                way   = WAY_WIDTH'(w);
+                found = 1'b1;
+            end
+        end
+        if (!found) begin
+            for (int w = 0; w < NUM_WAYS; w++)
+                if (model_age[s][w] == WAY_WIDTH'(NUM_WAYS - 1))
+                    way = WAY_WIDTH'(w);
+        end
+
+        model_line [s][way] = line;
+        model_tag  [s][way] = t;
+        model_valid[s][way] = 1'b1;
+        model_dirty[s][way] = 1'b0;
+
+        way_age = model_age[s][way];
+        for (int w = 0; w < NUM_WAYS; w++) begin
+            if (w == way)
+                model_age[s][w] = '0;
+            else if (model_age[s][w] < way_age)
+                model_age[s][w] = model_age[s][w] + 1'b1;
+        end
+
+        return way;
+    endfunction
+
+    // MSHR fill model: presents one completed line and holds it until the
+    // controller accepts it (mshr_fill_ready sampled on an edge, as the
+    // MSHR samples it), then withdraws it, as the MSHR's entry returns to
+    // idle on that edge. present_cycle is the edge after which the fill
+    // first appears; done_cycle the edge on which it was accepted. The
+    // scoreboard is updated through model_fill, which returns the way the
+    // line is expected in. Called #1 after an edge.
+    localparam int unsigned FILL_LATENCY        = 2;     // present -> accept edges: F0 + F1
+    localparam int unsigned FILL_TIMEOUT_CYCLES = 100;
+
+    task automatic mshr_fill(
+        input  logic [MSHR_ID_WIDTH-1:0] id,
+        input  logic [ADDR_WIDTH-1:0]    addr,
+        input  logic [LINE_WIDTH-1:0]    line,
+        output int unsigned              present_cycle,
+        output int unsigned              done_cycle,
+        output logic [WAY_WIDTH-1:0]     exp_way
+    );
+        logic        accepted;
+        int unsigned waited;
+
+        mshr_fill_valid = 1'b1;
+        mshr_fill_id    = id;
+        mshr_fill_addr  = addr;
+        mshr_fill_data  = line;
+        present_cycle   = cycle_cnt;
+
+        waited = 0;
+        do begin
+            @(posedge clk);
+            accepted = mshr_fill_ready;   // pre-edge value: exactly what the MSHR samples
+            #1;
+            if (++waited > FILL_TIMEOUT_CYCLES)
+                $fatal(1, "mshr_fill: fill of id %0d (0x%08h) not accepted within %0d cycles",
+                       id, addr, FILL_TIMEOUT_CYCLES);
+        end while (!accepted);
+
+        done_cycle      = cycle_cnt;
+        mshr_fill_valid = 1'b0;
+        exp_way         = model_fill(addr, line);
+    endtask
+
+    // Checks one logged array write against a fill: the full line into
+    // (set, way) with all word lanes enabled, the line's tag written
+    // clean, and the valid bit set -- on all three arrays together.
+    task automatic check_fill_write(
+        input  string                    what,
+        input  wr_rec_t                  rec,
+        input  logic [SET_IDX_WIDTH-1:0] set_idx,
+        input  logic [WAY_WIDTH-1:0]     way,
+        input  logic [TAG_WIDTH-1:0]     tag,
+        input  logic [LINE_WIDTH-1:0]    line,
+        inout  int unsigned              errors
+    );
+        if (!(rec.data_en && rec.data_set === set_idx && rec.data_way === way &&
+              rec.data_word_en === '1 && rec.data_data === line)) begin
+            $error("[FAIL] %s: data write (en %b set %0d way %0d word_en %b data 0x%032h), expected (1, %0d, %0d, 1111, 0x%032h)",
+                   what, rec.data_en, rec.data_set, rec.data_way, rec.data_word_en, rec.data_data,
+                   set_idx, way, line);
+            errors++;
+        end
+        if (!(rec.tag_en && rec.tag_set === set_idx && rec.tag_way === way &&
+              rec.tag_tag_en && rec.tag_tag === tag &&
+              rec.tag_dirty_en && rec.tag_dirty === 1'b0)) begin
+            $error("[FAIL] %s: tag write (en %b set %0d way %0d tag_en %b tag 0x%06h dirty_en %b dirty %b), expected (1, %0d, %0d, 1, 0x%06h, 1, 0)",
+                   what, rec.tag_en, rec.tag_set, rec.tag_way, rec.tag_tag_en, rec.tag_tag,
+                   rec.tag_dirty_en, rec.tag_dirty, set_idx, way, tag);
+            errors++;
+        end
+        if (!(rec.valid_en && rec.valid_set === set_idx && rec.valid_way === way &&
+              rec.valid_valid === 1'b1)) begin
+            $error("[FAIL] %s: valid write (en %b set %0d way %0d valid %b), expected (1, %0d, %0d, 1)",
+                   what, rec.valid_en, rec.valid_set, rec.valid_way, rec.valid_valid, set_idx, way);
+            errors++;
         end
     endtask
 
@@ -2603,6 +2758,300 @@ module cache_controller_tb;
             if (errors == 0)
                 $display("[PASS] test 13: 15 misses without stall; at 15 occupied a request behind an in-flight hit waits exactly 1 cycle; 16th miss fills the table; full table holds off even a hit for %0d cycles, parked requests intact",
                          T13_HOLD);
+        end
+
+        // ---------------------------------------------------------------
+        // Test 14: fill into free ways, then replacement of the LRU way.
+        // Four lines are filled into one empty set, then a fifth into the
+        // now-full set. Checked:
+        //   - each fill takes exactly two cycles (F0 read, F1 write) and
+        //     writes tag (clean), valid bit and the full line, on all
+        //     three arrays together, into the expected way;
+        //   - free ways are taken lowest-index first (0, 1, 2, 3);
+        //   - each fill makes its way the most recently used;
+        //   - with the set full, the least recently used way is replaced
+        //     -- set up by loads so that it is way 2, neither the oldest
+        //     fill nor way 0 or 3, which a broken victim selector would
+        //     tend to pick;
+        //   - a CPU request presented together with the first fill is
+        //     held off until the fill completes, then served normally;
+        //   - afterwards every resident line hits with its filled data,
+        //     and only the replaced line misses.
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [SET_IDX_WIDTH-1:0] T14_SET   = 6'd20;
+            localparam logic [SET_IDX_WIDTH-1:0] T14_OTHER = 6'd21;   // holds a preloaded line for the concurrent request
+            localparam logic [TAG_WIDTH-1:0]     T14_OTHER_TAG = 22'h0B_0000;
+
+            logic [TAG_WIDTH-1:0]  l_tag  [5];
+            logic [ADDR_WIDTH-1:0] l_addr [5];
+            logic [LINE_WIDTH-1:0] l_line [5];
+            logic [WAY_WIDTH-1:0]  exp_way;
+            int unsigned           present_c, done_c, acc_other, acc;
+            int unsigned           wr_base, miss_base;
+            int unsigned           errors;
+
+            reset_dut_and_model();
+            errors = 0;
+
+            // Five distinct lines of T14_SET; every word of every line is
+            // unique, so a wrong way or word shows up as wrong data.
+            for (int i = 0; i < 5; i++) begin
+                l_tag[i]  = 22'h0A_0000 + TAG_WIDTH'(i);
+                l_addr[i] = make_addr(l_tag[i], T14_SET, 2'd0);
+                for (int w = 0; w < WORDS_PER_LINE; w++)
+                    l_line[i][w * DATA_WIDTH +: DATA_WIDTH] = 32'h1400_0000 | (i << 8) | w;
+            end
+            preload_line(T14_OTHER, 2'd1, T14_OTHER_TAG,
+                         {32'h0B0B_0003, 32'h0B0B_0002, 32'h0B0B_0001, 32'h0B0B_0000});
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            fill_log.delete();
+            wb_req_cnt    = 0;
+            fill_rule_err = 0;
+            miss_base     = miss_cnt;
+            resp_ready    = 1'b1;
+
+            // Phase 1: four fills into the empty set. The first one races
+            // a load to another set, presented in the same cycle: the load
+            // must wait for the fill and be accepted on the edge after it.
+            for (int i = 0; i < 4; i++) begin
+                wr_base = wr_log.size();
+                if (i == 0) begin
+                    fork
+                        mshr_fill(MSHR_ID_WIDTH'(2 + i), l_addr[i], l_line[i], present_c, done_c, exp_way);
+                        sb_access(make_addr(T14_OTHER_TAG, T14_OTHER, 2'd2), 1'b0, '0, 4'd1, acc_other);
+                    join
+                    check_gap("test 14 load presented with the first fill", done_c, acc_other, 1, errors);
+                end else begin
+                    mshr_fill(MSHR_ID_WIDTH'(2 + i), l_addr[i], l_line[i], present_c, done_c, exp_way);
+                end
+
+                if (done_c - present_c != FILL_LATENCY) begin
+                    $error("[FAIL] test 14: fill %0d accepted %0d edge(s) after presentation, expected %0d",
+                           i, done_c - present_c, FILL_LATENCY);
+                    errors++;
+                end
+                if (exp_way !== WAY_WIDTH'(i)) begin
+                    $error("[FAIL] test 14: scoreboard predicts way %0d for fill %0d, expected %0d (TB model error)",
+                           exp_way, i, i);
+                    errors++;
+                end
+                if (wr_log.size() != wr_base + 1) begin
+                    $error("[FAIL] test 14: fill %0d produced %0d array-write cycles, expected 1",
+                           i, wr_log.size() - wr_base);
+                    errors++;
+                end else begin
+                    check_fill_write($sformatf("test 14 fill %0d", i), wr_log[wr_base],
+                                     T14_SET, WAY_WIDTH'(i), l_tag[i], l_line[i], errors);
+                end
+            end
+
+            // Filling ways 0..3 in order leaves way 3 youngest, way 0 oldest.
+            check_lru("test 14 after four fills", T14_SET, '{2'd3, 2'd2, 2'd1, 2'd0}, errors);
+
+            // Phase 2: loads in the order L2, L0, L3, L1 -- all hits. The
+            // recency order becomes L1, L3, L0, L2: way 2 is now the LRU.
+            sb_access(make_addr(l_tag[2], T14_SET, 2'd1), 1'b0, '0, 4'd2, acc);
+            sb_access(make_addr(l_tag[0], T14_SET, 2'd2), 1'b0, '0, 4'd3, acc);
+            sb_access(make_addr(l_tag[3], T14_SET, 2'd3), 1'b0, '0, 4'd4, acc);
+            sb_access(make_addr(l_tag[1], T14_SET, 2'd0), 1'b0, '0, 4'd5, acc);
+            @(posedge clk);
+            #1;
+            check_lru("test 14 after loads", T14_SET, '{2'd2, 2'd0, 2'd3, 2'd1}, errors);
+
+            // Phase 3: a fifth line into the full set replaces way 2.
+            wr_base = wr_log.size();
+            mshr_fill(4'd9, l_addr[4], l_line[4], present_c, done_c, exp_way);
+            if (done_c - present_c != FILL_LATENCY) begin
+                $error("[FAIL] test 14: fill 4 accepted %0d edge(s) after presentation, expected %0d",
+                       done_c - present_c, FILL_LATENCY);
+                errors++;
+            end
+            if (exp_way !== 2'd2) begin
+                $error("[FAIL] test 14: scoreboard predicts way %0d for the fifth fill, expected 2 (TB model error)",
+                       exp_way);
+                errors++;
+            end
+            if (wr_log.size() != wr_base + 1) begin
+                $error("[FAIL] test 14: fifth fill produced %0d array-write cycles, expected 1",
+                       wr_log.size() - wr_base);
+                errors++;
+            end else begin
+                check_fill_write("test 14 fill into the LRU way", wr_log[wr_base],
+                                 T14_SET, 2'd2, l_tag[4], l_line[4], errors);
+            end
+            check_lru("test 14 after the fifth fill", T14_SET, '{2'd3, 2'd1, 2'd0, 2'd2}, errors);
+
+            // Phase 4: the new line and the three survivors hit with their
+            // filled data; the replaced line (L2) misses and is allocated.
+            sb_access(make_addr(l_tag[4], T14_SET, 2'd3), 1'b0, '0, 4'd6,  acc);
+            sb_access(make_addr(l_tag[0], T14_SET, 2'd1), 1'b0, '0, 4'd7,  acc);
+            sb_access(make_addr(l_tag[1], T14_SET, 2'd2), 1'b0, '0, 4'd8,  acc);
+            sb_access(make_addr(l_tag[3], T14_SET, 2'd0), 1'b0, '0, 4'd9,  acc);
+            sb_access(make_addr(l_tag[2], T14_SET, 2'd1), 1'b0, '0, 4'd10, acc);
+            repeat (HIT_LATENCY + 1) @(posedge clk);
+            #1;
+
+            check_responses("test 14", errors);
+            if (miss_cnt - miss_base != 1) begin
+                $error("[FAIL] test 14: %0d lookups classified as miss, expected 1 (the replaced line)",
+                       miss_cnt - miss_base);
+                errors++;
+            end
+            check_allocs("test 14", errors);
+            if (fill_log.size() != 5) begin
+                $error("[FAIL] test 14: %0d fills accepted, expected 5", fill_log.size());
+                errors++;
+            end
+            if (fill_rule_err != 0) begin
+                $error("[FAIL] test 14: %0d fill-handshake rule violations", fill_rule_err);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 14: 4 fills into free ways 0-3 (2 cycles each, tag/valid/data written together), LRU way 2 replaced by the 5th fill, CPU held off during a fill, all resident lines hit, replaced line misses");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 15: fill selection changes between F0 and F1 (restart).
+        // The TB models the MSHR's fill-completion mux: it always presents
+        // the lowest-numbered completed entry, and removes an entry once
+        // the controller accepts it. Entry 7 (line A) is presented first;
+        // entry 3 (line B, another set) completes during A's F0 and
+        // displaces it. Expected, edge by edge after A is presented:
+        //   e0: F0 for A                -- no write, no accept
+        //   e1: F1 sees id 3, not 7     -- no write, no accept (restart;
+        //                                  the cycle reads B's set)
+        //   e2: F1 for B                -- B written, B accepted
+        //   e3: F0 for A                -- no write, no accept
+        //   e4: F1 for A                -- A written, A accepted
+        //   e5: idle
+        // Without the restart, e1 would write line B using the victim
+        // chosen from A's set -- the wrong set's contents. Afterwards both
+        // lines must hit with their own data.
+        // ---------------------------------------------------------------
+        begin
+            localparam int unsigned T15_EDGES = 6;
+
+            localparam logic [SET_IDX_WIDTH-1:0] SET_A = 6'd30;
+            localparam logic [SET_IDX_WIDTH-1:0] SET_B = 6'd31;
+            localparam logic [TAG_WIDTH-1:0]     TAG_A = 22'h15_00A0;
+            localparam logic [TAG_WIDTH-1:0]     TAG_B = 22'h15_00B0;
+            localparam logic [LINE_WIDTH-1:0]    LINE_A = {32'hAAAA_0003, 32'hAAAA_0002, 32'hAAAA_0001, 32'hAAAA_0000};
+            localparam logic [LINE_WIDTH-1:0]    LINE_B = {32'hBBBB_0003, 32'hBBBB_0002, 32'hBBBB_0001, 32'hBBBB_0000};
+
+            // Expected observations per edge (see table above).
+            localparam logic EXP_ACCEPT [T15_EDGES] = '{1'b0, 1'b0, 1'b1, 1'b0, 1'b1, 1'b0};
+
+            logic                     pend_3, pend_7;   // MSHR model: completed, not yet accepted
+            logic                     obs_accept [T15_EDGES];
+            logic                     obs_write  [T15_EDGES];
+            logic [SET_IDX_WIDTH-1:0] obs_set    [T15_EDGES];
+            logic [WAY_WIDTH-1:0]     way_a, way_b;
+            int unsigned              acc;
+            int unsigned              errors;
+
+            reset_dut_and_model();
+            errors = 0;
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            fill_log.delete();
+            wb_req_cnt    = 0;
+            fill_rule_err = 0;
+            resp_ready    = 1'b1;
+
+            // Entry 7 completes first and is presented.
+            pend_3 = 1'b0;
+            pend_7 = 1'b1;
+            mshr_fill_valid = 1'b1;
+            mshr_fill_id    = 4'd7;
+            mshr_fill_addr  = make_addr(TAG_A, SET_A, 2'd0);
+            mshr_fill_data  = LINE_A;
+
+            for (int e = 0; e < T15_EDGES; e++) begin
+                @(posedge clk);
+                obs_accept[e] = mshr_fill_valid && mshr_fill_ready;
+                obs_write[e]  = ctrl_tag_wr_en || ctrl_valid_wr_en || ctrl_data_wr_en;
+                obs_set[e]    = ctrl_data_wr_set_idx;
+                #1;
+
+                // MSHR model update after the edge: an accepted entry
+                // leaves; entry 3 completes during A's F0.
+                if (obs_accept[e]) begin
+                    if (mshr_fill_id == 4'd3) pend_3 = 1'b0;
+                    else                      pend_7 = 1'b0;
+                end
+                if (e == 0) pend_3 = 1'b1;
+
+                // Fill-completion mux: lowest-numbered completed entry.
+                if (pend_3) begin
+                    mshr_fill_valid = 1'b1;
+                    mshr_fill_id    = 4'd3;
+                    mshr_fill_addr  = make_addr(TAG_B, SET_B, 2'd0);
+                    mshr_fill_data  = LINE_B;
+                end else if (pend_7) begin
+                    mshr_fill_valid = 1'b1;
+                    mshr_fill_id    = 4'd7;
+                    mshr_fill_addr  = make_addr(TAG_A, SET_A, 2'd0);
+                    mshr_fill_data  = LINE_A;
+                end else begin
+                    mshr_fill_valid = 1'b0;
+                end
+            end
+
+            for (int e = 0; e < T15_EDGES; e++) begin
+                if (obs_accept[e] !== EXP_ACCEPT[e] || obs_write[e] !== EXP_ACCEPT[e]) begin
+                    $error("[FAIL] test 15: edge e%0d: accept %b, array write %b; expected %b, %b",
+                           e, obs_accept[e], obs_write[e], EXP_ACCEPT[e], EXP_ACCEPT[e]);
+                    errors++;
+                end
+            end
+            if (obs_set[2] !== SET_B || obs_set[4] !== SET_A) begin
+                $error("[FAIL] test 15: writes went to sets %0d (e2) and %0d (e4), expected %0d (B) and %0d (A)",
+                       obs_set[2], obs_set[4], SET_B, SET_A);
+                errors++;
+            end
+
+            // Both writes, in full: B first, then A, each into way 0 of
+            // its own (empty) set.
+            way_b = model_fill(make_addr(TAG_B, SET_B, 2'd0), LINE_B);
+            way_a = model_fill(make_addr(TAG_A, SET_A, 2'd0), LINE_A);
+            if (wr_log.size() != 2) begin
+                $error("[FAIL] test 15: %0d array-write cycles, expected 2", wr_log.size());
+                errors++;
+            end else begin
+                check_fill_write("test 15 fill of B", wr_log[0], SET_B, way_b, TAG_B, LINE_B, errors);
+                check_fill_write("test 15 fill of A", wr_log[1], SET_A, way_a, TAG_A, LINE_A, errors);
+            end
+            if (fill_log.size() != 2 || fill_log[0].id !== 4'd3 || fill_log[1].id !== 4'd7) begin
+                $error("[FAIL] test 15: accepted fill ids not (3, 7) in that order (%0d accepted)",
+                       fill_log.size());
+                errors++;
+            end
+
+            // Both lines hit with their own data.
+            sb_access(make_addr(TAG_A, SET_A, 2'd1), 1'b0, '0, 4'd1, acc);
+            sb_access(make_addr(TAG_B, SET_B, 2'd2), 1'b0, '0, 4'd2, acc);
+            repeat (HIT_LATENCY + 1) @(posedge clk);
+            #1;
+            check_responses("test 15", errors);
+            check_allocs("test 15", errors);
+            if (fill_rule_err != 0) begin
+                $error("[FAIL] test 15: %0d fill-handshake rule violations", fill_rule_err);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 15: fill displaced between F0 and F1 -- nothing written in the stale cycle, displacing fill (id 3) written next cycle, displaced fill (id 7) re-read and written after; both lines hit");
         end
 
         // ---------------------------------------------------------------
