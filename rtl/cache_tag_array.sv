@@ -104,19 +104,22 @@ module cache_tag_array #(
     // sharing the read address -- the same bank layout as
     // cache_data_sram, so both arrays are indexed identically and read
     // together. Each bank's registered output is tag_out directly.
-    for (genvar w = 0; w < NUM_WAYS; w++) begin : g_way
+    genvar gw;
+    generate
+    for (gw = 0; gw < NUM_WAYS; gw = gw + 1) begin : g_way
         sram_sdp #(
             .WIDTH (TAG_WIDTH),
             .DEPTH (NUM_SETS)
         ) u_tag_bank (
             .clk     (clk),
             .rd_addr (rd_set_idx),
-            .rd_data (tag_out[w]),
-            .wr_en   (wr_en && wr_tag_en && (wr_way_sel == WAY_WIDTH'(w))),
+            .rd_data (tag_out[gw]),
+            .wr_en   (wr_en && wr_tag_en && (wr_way_sel == WAY_WIDTH'(gw))),
             .wr_addr (wr_set_idx),
             .wr_data (wr_tag)
         );
     end
+    endgenerate
 
     // Compare after the read register. A block RAM can only present
     // registered read data, so the compare cannot sit between the array

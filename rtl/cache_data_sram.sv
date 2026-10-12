@@ -90,21 +90,24 @@ module cache_data_sram #(
     // the pre-write contents (sram_sdp's old-data behavior).
     logic [DATA_WIDTH-1:0] rd_word [NUM_WAYS][WORDS_PER_LINE];
 
-    for (genvar w = 0; w < NUM_WAYS; w++) begin : g_way
-        for (genvar i = 0; i < WORDS_PER_LINE; i++) begin : g_word
+    genvar gw, gi;
+    generate
+    for (gw = 0; gw < NUM_WAYS; gw = gw + 1) begin : g_way
+        for (gi = 0; gi < WORDS_PER_LINE; gi = gi + 1) begin : g_word
             sram_sdp #(
                 .WIDTH (DATA_WIDTH),
                 .DEPTH (NUM_SETS)
             ) u_bank (
                 .clk     (clk),
                 .rd_addr (rd_set_idx),
-                .rd_data (rd_word[w][i]),
-                .wr_en   (wr_en && (wr_way_sel == WAY_WIDTH'(w)) && wr_word_en[i]),
+                .rd_data (rd_word[gw][gi]),
+                .wr_en   (wr_en && (wr_way_sel == WAY_WIDTH'(gw)) && wr_word_en[gi]),
                 .wr_addr (wr_set_idx),
-                .wr_data (wr_data[i*DATA_WIDTH +: DATA_WIDTH])
+                .wr_data (wr_data[gi*DATA_WIDTH +: DATA_WIDTH])
             );
         end
     end
+    endgenerate
 
     // Reassemble each way's line from its word banks (wiring only).
     always_comb begin
