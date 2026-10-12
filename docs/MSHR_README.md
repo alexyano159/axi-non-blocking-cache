@@ -145,6 +145,17 @@ but only one `AR` can actually go out. Something has to pick a winner.
   is serviced within `NUM_ENTRIES` grants — no entry can be starved out,
   no matter how the others behave.
 
+**Grant lock.** AXI does not let a master change its mind: once `arvalid`
+is high, the request (`arid`, `araddr`, ...) must stay exactly the same
+until the memory says `arready`. The round-robin pick is recomputed every
+cycle, and a new entry can start requesting while another one is waiting
+for `arready` — without protection, the pick (and so `arid`/`araddr`)
+would jump to the newcomer. So the MSHR remembers "I presented entry N
+last cycle and it was not accepted" (`ar_lock`, `ar_lock_idx`) and keeps
+presenting entry N until it is accepted; round-robin resumes after that.
+This was found by the system testbench (`cache_top_tb`), whose AXI
+memory model checks that every request stays stable while it waits.
+
 The fill-completion handoff (which finished entry gets presented to the
 controller this cycle) still uses plain fixed-priority — that choice
 doesn't gate access to memory bandwidth, it only decides who waits one
