@@ -838,7 +838,7 @@ module cache_controller #(
     // into an invalid or LRU way, LRU update from the fill, fill_id
     // restart (see Fill sequencing). Verified by tests 14-15.
     // Sub-step 2: dirty-victim writeback, F1 repeated while the
-    // writeback queue is full (see Victim writeback). Test 16 pending.
+    // writeback queue is full (see Victim writeback). Verified by test 16.
     //
     // Next:
     //   - Open issue, to be decided before replay: a miss to a line whose

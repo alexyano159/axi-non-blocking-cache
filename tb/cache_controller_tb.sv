@@ -3357,8 +3357,12 @@ module cache_controller_tb;
         // model_fill, fill monitor (fill_log, fill_rule_err),
         // check_fill_write.
         //
-        // Next: dirty-victim writeback (test 16), then replay and its
-        // tests -- incl. slot release and reuse (age-matrix column clear)
+        // Test 16 (dirty-victim writeback, full writeback queue) added
+        // 2026-10-12, with TB-driven mshr_wb_ready, writeback monitor
+        // (wb_log, wb_hold_err), model_victim_way and check_allocs'
+        // exp_wbs argument.
+        //
+        // Next: replay and its tests -- incl. slot release and reuse (age-matrix column clear)
         // and removal of test 9's temporary miss cap (T9_MAX_MISSES).
         // ---------------------------------------------------------------
 

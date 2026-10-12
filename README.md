@@ -118,7 +118,11 @@ replacing the least recently used way, with every resident line hitting
 afterwards); and the fill restart (a fill displaced by a lower-numbered
 MSHR entry between its read and write cycles writes nothing, the
 displacing fill is installed next, and the displaced one is re-read and
-installed after it).
+installed after it); and dirty-victim writeback (a clean victim is not
+written back; a dirty one is handed to the MSHR with its own address
+and its modified data on the same edge as the fill write; with the
+writeback queue full, the fill waits with nothing written, the CPU held
+off and the writeback held stable, then completes).
 
 ## Running the testbenches
 
