@@ -699,7 +699,10 @@ module cache_controller #(
     //   fill, and the "merge in the handoff cycle" corner case (an
     //   alloc_id whose fill was already presented) cannot arise.
     //
-    // Open issues found while planning, to be agreed before coding:
+    // Issues found while planning -- both agreed and logged in
+    // DESIGN_DECISIONS.txt (2026-10-12). Issue 1 is implemented
+    // (cache_tag_array tag_out, test 9); issue 2 is part of the fill
+    // logic:
     //   1. Victim writeback address: cache_tag_array outputs only
     //      tag_match and dirty_out, never a stored tag, so the victim's
     //      address cannot be formed. Proposed: add a registered tag_out
@@ -713,7 +716,6 @@ module cache_controller #(
     //      it differs, abandon and restart from F0 (rare, bounded by the
     //      entry count; the MSHR stays untouched). Rejected: changing the
     //      MSHR to lock its selection once a fill starts.
-    // Both are to be logged in DESIGN_DECISIONS.txt once agreed.
     // -------------------------------------------------------------------
 
 endmodule : cache_controller
