@@ -64,8 +64,11 @@ merge, single victim writeback, MSHR-full stall and recovery,
 round-robin fairness of the AXI read-address arbiter, writeback-queue-full
 stall and recovery, fixed-priority ordering of the fill-completion mux,
 concurrent fill + writeback traffic, multi-way merge with an
-out-of-order dirty flag, entry reuse not leaking a stale dirty flag, and
-reset mid-fetch not leaving a stale merge target.
+out-of-order dirty flag, entry reuse not leaking a stale dirty flag,
+reset mid-fetch not leaving a stale merge target, and read-after-write
+ordering (a re-miss to a line still queued for writeback issues its read
+only after the write's `B` response and returns the written-back data,
+while an unrelated miss is not held).
 
 `cache_tag_array.sv` currently covers: fill-write with a matching
 lookup, a non-matching tag correctly reporting no hit, a same-cycle

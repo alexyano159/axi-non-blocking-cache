@@ -207,7 +207,13 @@ module mshr_tb;
     logic [ADDR_WIDTH-1:0]     mw_addr;
     logic [BEAT_CNT_WIDTH-1:0] mw_beat_cnt;
 
-    assign axi.awready = (mw_state == MW_IDLE);
+    // Testbench-only override, the write-side twin of ar_block: when
+    // raised, the write-address channel refuses every request, so queued
+    // victims stay in the DUT's writeback queue. Used by test 14 to hold
+    // a writeback in flight while a miss to the same line is issued.
+    logic aw_block;
+
+    assign axi.awready = (mw_state == MW_IDLE) && !aw_block;
     assign axi.wready  = (mw_state == MW_DATA);
     assign axi.bvalid  = (mw_state == MW_RESP);
     assign axi.bid     = mw_id;
@@ -245,6 +251,69 @@ module mshr_tb;
             endcase
         end
     end
+
+    // -------------------------------------------------------------------
+    // AXI handshake and fill monitor.
+    // Logs every AR handshake (address, id), every B handshake and every
+    // fill handoff (id, data), each with the index of the edge on which it
+    // completed, so a test can check the order in which memory saw a read
+    // and a write. Logging fills here, rather than waiting for one with
+    // wait_for_fill, also catches a fill that happens earlier than the
+    // test expects, which a later wait would miss and hang on.
+    // -------------------------------------------------------------------
+    typedef struct {
+        logic [ADDR_WIDTH-1:0] addr;
+        logic [ID_WIDTH-1:0]   id;
+        int unsigned           cycle;
+    } ar_rec_t;
+
+    typedef struct {
+        logic [ID_WIDTH-1:0]   id;
+        logic [LINE_WIDTH-1:0] data;
+        int unsigned           cycle;
+    } fill_rec_t;
+
+    int unsigned axi_cycle = 0;
+    ar_rec_t     ar_log   [$];
+    int unsigned b_log    [$];   // edge index of each B handshake
+    fill_rec_t   fill_log [$];
+
+    always @(posedge clk) begin
+        axi_cycle++;
+        if (rst_n && axi.arvalid && axi.arready)
+            ar_log.push_back('{addr: axi.araddr, id: axi.arid, cycle: axi_cycle});
+        if (rst_n && axi.bvalid && axi.bready)
+            b_log.push_back(axi_cycle);
+        if (rst_n && fill_valid && fill_ready)
+            fill_log.push_back('{id: fill_id, data: fill_data, cycle: axi_cycle});
+    end
+
+    // Returns 1, the data and the edge index if a fill of entry id
+    // appears in fill_log.
+    function automatic bit find_fill(input  logic [ID_WIDTH-1:0]   id,
+                                     output logic [LINE_WIDTH-1:0] data,
+                                     output int unsigned           cycle);
+        foreach (fill_log[i]) begin
+            if (fill_log[i].id == id) begin
+                data  = fill_log[i].data;
+                cycle = fill_log[i].cycle;
+                return 1'b1;
+            end
+        end
+        return 1'b0;
+    endfunction
+
+    // Returns 1 and the edge index if a read of addr appears in ar_log.
+    function automatic bit find_ar(input  logic [ADDR_WIDTH-1:0] addr,
+                                   output int unsigned           cycle);
+        foreach (ar_log[i]) begin
+            if (ar_log[i].addr == addr) begin
+                cycle = ar_log[i].cycle;
+                return 1'b1;
+            end
+        end
+        return 1'b0;
+    endfunction
 
     // ===================================================================
     // Step 3: Driver tasks.
@@ -354,6 +423,9 @@ module mshr_tb;
         // AR requesters; every other test sees the memory model's normal
         // as-fast-as-possible accept behavior.
         ar_block       = 1'b0;
+        // Off by default -- only test 14 raises it, to hold a writeback
+        // in the queue.
+        aw_block       = 1'b0;
     end
 
     // ===================================================================
@@ -1259,6 +1331,118 @@ module mshr_tb;
 
             if (!mismatch)
                 $display("[PASS] test 13: reset mid-fetch left no stale merge target -- a fresh miss to the same address re-issued a real AXI burst");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 14: re-miss to a line still queued for writeback.
+        // AXI does not order a read against an earlier write to the same
+        // address, so a miss to a line whose dirty copy has not yet
+        // reached memory must not issue its read until that write has
+        // completed (B response) -- otherwise it returns the stale memory
+        // contents. Line X's writeback is held in the queue (aw_block)
+        // while a miss to X and a miss to an unrelated line Y are issued.
+        // Checked:
+        //   - during the hold, Y's read is issued and completes (the wait
+        //     is specific to the matching line), X's read is not issued;
+        //   - after release, X's read follows the writeback's B response;
+        //   - X's fill returns the written-back data, not the stale data
+        //     memory held before.
+        // Every wait is watchdog-bounded, so a read that is wrongly held
+        // forever fails instead of hanging the simulation.
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [ADDR_WIDTH-1:0] X_ADDR    = 32'h0000_A000;
+            localparam logic [ADDR_WIDTH-1:0] Y_ADDR    = 32'h0000_B000;
+            localparam int unsigned           T14_HOLD  = 12;   // edges the writeback is held after both misses
+            localparam int unsigned           T14_WATCH = 200;
+
+            logic [LINE_WIDTH-1:0] old_line, new_line, y_line;
+            logic [LINE_WIDTH-1:0] got_data, got_y;
+            logic [ID_WIDTH-1:0]   id_x, id_y;
+            int unsigned           ar_x_cycle, ar_y_cycle, fill_x_cycle, fill_y_cycle;
+            int unsigned           watchdog;
+            logic                  mismatch;
+
+            old_line = {32'h01D0_0003, 32'h01D0_0002, 32'h01D0_0001, 32'h01D0_0000};
+            new_line = {32'h0E40_0003, 32'h0E40_0002, 32'h0E40_0001, 32'h0E40_0000};
+            y_line   = {32'h0F00_0003, 32'h0F00_0002, 32'h0F00_0001, 32'h0F00_0000};
+            mismatch = 1'b0;
+
+            mem_write_line(X_ADDR, old_line);
+            mem_write_line(Y_ADDR, y_line);
+            ar_log.delete();
+            b_log.delete();
+            fill_log.delete();
+
+            // X's dirty copy is queued but cannot reach memory; then X
+            // misses again, and so does the unrelated line Y.
+            aw_block = 1'b1;
+            push_writeback(X_ADDR, new_line);
+            send_miss(X_ADDR, 1'b0, id_x);
+            send_miss(Y_ADDR, 1'b0, id_y);
+
+            // During the hold, Y is fetched and handed off normally.
+            watchdog = 0;
+            while (!find_fill(id_y, got_y, fill_y_cycle) && watchdog < T14_WATCH) begin
+                @(posedge clk);
+                watchdog++;
+            end
+            if (watchdog >= T14_WATCH) begin
+                $error("[FAIL] test 14: unrelated miss Y not filled within %0d cycles while X's writeback was held",
+                       T14_WATCH);
+                mismatch = 1'b1;
+            end else if (got_y !== y_line) begin
+                $error("[FAIL] test 14: Y fill_data = %h, expected %h", got_y, y_line);
+                mismatch = 1'b1;
+            end
+            repeat (T14_HOLD) @(posedge clk);
+
+            if (!find_ar(Y_ADDR, ar_y_cycle)) begin
+                $error("[FAIL] test 14: no read issued for unrelated line Y during the hold");
+                mismatch = 1'b1;
+            end
+            if (find_ar(X_ADDR, ar_x_cycle)) begin
+                $error("[FAIL] test 14: read of X issued at edge %0d while its writeback was still queued", ar_x_cycle);
+                mismatch = 1'b1;
+            end
+            if (find_fill(id_x, got_data, fill_x_cycle)) begin
+                $error("[FAIL] test 14: X filled at edge %0d while its writeback was still queued (data %h, stale %h)",
+                       fill_x_cycle, got_data, old_line);
+                mismatch = 1'b1;
+            end
+            if (b_log.size() != 0) begin
+                $error("[FAIL] test 14: %0d write responses during the hold, expected none (aw_block)", b_log.size());
+                mismatch = 1'b1;
+            end
+
+            // Release the write channel: the writeback completes, then X
+            // is read and filled.
+            aw_block = 1'b0;
+            watchdog = 0;
+            while (!find_fill(id_x, got_data, fill_x_cycle) && watchdog < T14_WATCH) begin
+                @(posedge clk);
+                watchdog++;
+            end
+            if (watchdog >= T14_WATCH || !find_ar(X_ADDR, ar_x_cycle)) begin
+                $error("[FAIL] test 14: X not read and filled within %0d cycles after its writeback was released",
+                       T14_WATCH);
+                mismatch = 1'b1;
+            end else begin
+                if (b_log.size() == 0 || ar_x_cycle <= b_log[0]) begin
+                    $error("[FAIL] test 14: read of X at edge %0d, write response at edge %0d -- the read must follow the response",
+                           ar_x_cycle, (b_log.size() == 0) ? 0 : b_log[0]);
+                    mismatch = 1'b1;
+                end
+                if (got_data !== new_line) begin
+                    $error("[FAIL] test 14: X fill_data = %h, expected the written-back data %h (stale: %h)",
+                           got_data, new_line, old_line);
+                    mismatch = 1'b1;
+                end
+            end
+
+            if (!mismatch)
+                $display("[PASS] test 14: re-miss to a line queued for writeback -- read held until the write response (edge %0d -> read at edge %0d), unrelated miss not held, fill returned the written-back data",
+                         b_log[0], ar_x_cycle);
         end
 
         $finish;
