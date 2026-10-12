@@ -402,6 +402,88 @@ module mshr_tb;
         granted_id = fill_id;
     endtask
 
+    // Builds three simultaneous AR requesters -- ids 0, 1 and 2, for
+    // lines base, base+1 and base+2 -- with id 1, not id 0, holding the
+    // read-address channel. Used by tests 7 and 9.
+    //
+    // AXI4 forbids changing the AR payload while arvalid is high and
+    // arready low, so the first entry to request while the channel is
+    // blocked keeps it until accepted (mshr.sv grant lock). Allocating
+    // ids 0, 1, 2 in order would therefore always present id 0 first and
+    // yield the grant order 0, 1, 2 -- indistinguishable from fixed
+    // priority. Instead, id 0's miss is allocated behind a queued
+    // writeback of its own line (read-after-write hold), so id 1 is the
+    // first requester and locks the channel; the writeback is then
+    // completed, which makes id 0 a requester too. On reopening, the
+    // grants must be 1 (lock), then round-robin from 1: 2, then 0 --
+    // whereas a fixed-priority arbiter would grant 0 before 2.
+    //
+    // Returns the ids allocated and the id observed on the blocked
+    // channel; sets err if any step times out or deviates.
+    task automatic pile_up_three(input  logic [ADDR_WIDTH-1:0] base,
+                                 input  logic [LINE_WIDTH-1:0] line0,
+                                 output logic [ID_WIDTH-1:0]   id0,
+                                 output logic [ID_WIDTH-1:0]   id1,
+                                 output logic [ID_WIDTH-1:0]   id2,
+                                 output logic [ID_WIDTH-1:0]   presented,
+                                 output logic                  err);
+        localparam int LINE_BYTES = LINE_WORDS * (DATA_WIDTH / 8);
+        int watchdog;
+
+        err = 1'b0;
+
+        // Start from an empty writeback queue, so the push below is
+        // accepted while the write-address channel is blocked.
+        watchdog = 0;
+        while (dut.wb_count != 0 && watchdog < 500) begin
+            @(posedge clk);
+            watchdog++;
+        end
+        if (dut.wb_count != 0) begin
+            $error("pile_up_three: writeback queue not empty after %0d cycles", watchdog);
+            err = 1'b1;
+        end
+
+        aw_block = 1'b1;
+        ar_block = 1'b1;
+        push_writeback(base + 0 * LINE_BYTES, line0);
+        send_miss(base + 0 * LINE_BYTES, 1'b0, id0);   // held: its line is queued for writeback
+        send_miss(base + 1 * LINE_BYTES, 1'b0, id1);   // first requester: locks the AR channel
+        send_miss(base + 2 * LINE_BYTES, 1'b0, id2);
+
+        // Complete the writeback; id 0 then requests as well.
+        aw_block = 1'b0;
+        watchdog = 0;
+        while (!dut.fe_req_vec[id0] && watchdog < 200) begin
+            @(posedge clk);
+            watchdog++;
+        end
+        if (!dut.fe_req_vec[id0]) begin
+            $error("pile_up_three: id %0d still held %0d cycles after its writeback was released", id0, watchdog);
+            err = 1'b1;
+        end
+
+        presented = axi.arid;
+        if (!axi.arvalid || !dut.fe_req_vec[id1] || !dut.fe_req_vec[id2]) begin
+            $error("pile_up_three: expected three AR requesters (arvalid %b, req_vec %b)", axi.arvalid, dut.fe_req_vec);
+            err = 1'b1;
+        end
+    endtask
+
+    // Expected AR grant order for three requesters ids[0..2] when entry
+    // `first` holds the channel: `first`, then the others in round-robin
+    // order starting above `first` and wrapping around.
+    function automatic void rr_order_after(input  logic [ID_WIDTH-1:0] first,
+                                           output logic [ID_WIDTH-1:0] order [3]);
+        int idx;
+        order[0] = first;
+        idx = 1;
+        for (int i = 0; i < 3; i++)
+            if (i[ID_WIDTH-1:0] > first) order[idx++] = i[ID_WIDTH-1:0];
+        for (int i = 0; i < 3; i++)
+            if (i[ID_WIDTH-1:0] < first) order[idx++] = i[ID_WIDTH-1:0];
+    endfunction
+
     // -------------------------------------------------------------------
     // Idle-value drive for controller-side inputs; the driver tasks above
     // override these during each test, so the DUT always sees legal,
@@ -686,15 +768,20 @@ module mshr_tb;
         // makes this scenario a meaningful test rather than a coincidence
         // check.
         //
+        // AXI requires the AR payload to stay unchanged while arvalid is
+        // high and arready low, so the entry presented first on the
+        // blocked channel keeps it until accepted (mshr.sv grant lock);
+        // round-robin applies to the grants after it. pile_up_three makes
+        // id 1 the presented entry with ids 0 and 2 also requesting, so
+        // the expected order is 1 (lock), then 2 (round-robin above 1),
+        // then 0 -- a fixed-priority arbiter would grant 0 before 2.
+        //
         // Test 6 leaves the MSHR mid-drain (it only guarantees one entry
         // freed, not all sixteen), so this test opens by waiting
         // (watchdog-bounded) until every entry is back in FE_IDLE, before
-        // relying on entries 0/1/2 being free. The expected grant order is then computed
-        // from whatever ar_last_grant actually is at that point, instead
-        // of assuming it has settled back to its reset value (0). This
-        // keeps the test's pass/fail independent of test 6's internal
-        // retirement timing -- it proves round-robin behavior relative to
-        // the arbiter's real starting state, not a hardcoded one.
+        // relying on entries 0/1/2 being free. The expected order is
+        // derived from the entry actually observed on the blocked channel,
+        // so the test does not depend on the arbiter's history.
         // ---------------------------------------------------------------
         begin
             localparam logic [ADDR_WIDTH-1:0] BASE_ADDR  = 32'h0000_7000;
@@ -746,38 +833,37 @@ module mshr_tb;
 
             // Close the read-address channel so all three misses pile up
             // as simultaneous requesters instead of being granted one at
-            // a time as they arrive.
-            ar_block = 1'b1;
-            send_miss(BASE_ADDR + 0 * LINE_BYTES, 1'b0, id0);
-            send_miss(BASE_ADDR + 1 * LINE_BYTES, 1'b0, id1);
-            send_miss(BASE_ADDR + 2 * LINE_BYTES, 1'b0, id2);
-
-            if (id0 !== 4'd0 || id1 !== 4'd1 || id2 !== 4'd2) begin
-                $error("[FAIL] test 7: expected ids 0,1,2, got %0d,%0d,%0d -- MSHR was not cleanly idle before the test",
-                       id0, id1, id2);
-                mismatch = 1'b1;
-            end
-
-            // Derive the expected grant order from the arbiter's actual
-            // last-granted pointer (captured now, while the AR channel is
-            // still blocked and all three requests are parked in FE_REQ,
-            // so it cannot change out from under this read). This mirrors
-            // the DUT's own tie-break rule: ids strictly above last_grant
-            // go first, in ascending order, then whatever is left wraps
-            // around -- the same ar_hi_mask logic as mshr.sv, computed
-            // here independently rather than read back from the DUT.
-            last_grant = dut.ar_last_grant;
+            // a time as they arrive, with id 1 holding the channel (see
+            // pile_up_three).
             begin
-                int idx;
-                idx = 0;
-                for (int i = 0; i < 3; i++)
-                    if (i[ID_WIDTH-1:0] > last_grant) expected_order[idx++] = i[ID_WIDTH-1:0];
-                for (int i = 0; i < 3; i++)
-                    if (i[ID_WIDTH-1:0] <= last_grant) expected_order[idx++] = i[ID_WIDTH-1:0];
+                logic [ID_WIDTH-1:0] presented;
+                logic                pile_err;
+
+                pile_up_three(BASE_ADDR, '0, id0, id1, id2, presented, pile_err);
+                if (pile_err) mismatch = 1'b1;
+
+                if (id0 !== 4'd0 || id1 !== 4'd1 || id2 !== 4'd2) begin
+                    $error("[FAIL] test 7: expected ids 0,1,2, got %0d,%0d,%0d -- MSHR was not cleanly idle before the test",
+                           id0, id1, id2);
+                    mismatch = 1'b1;
+                end
+                if (presented !== id1) begin
+                    $error("[FAIL] test 7: id %0d presented on the blocked AR channel, expected id %0d (the first requester)",
+                           presented, id1);
+                    mismatch = 1'b1;
+                end
+
+                // Expected grant order: the presented entry keeps the
+                // channel until accepted (AXI payload stability), then
+                // the round-robin rule of mshr.sv (ar_hi_mask), computed
+                // here independently: ids strictly above the last grant
+                // first, in ascending order, then the wrap-around.
+                last_grant = presented;
+                rr_order_after(presented, expected_order);
             end
 
-            // Reopen the channel: all three entries now compete for the
-            // same grant at once.
+            // Reopen the channel: the locked entry is granted, then the
+            // two remaining entries compete under round-robin.
             ar_block = 1'b0;
 
             for (int i = 0; i < 3; i++) wait_for_ar_grant(grant_order[i]);
@@ -791,8 +877,8 @@ module mshr_tb;
             end
 
             if (!mismatch)
-                $display("[PASS] test 7: AR arbiter granted in round-robin order %0d,%0d,%0d from last_grant=%0d -- not fixed low-index priority",
-                          expected_order[0], expected_order[1], expected_order[2], last_grant);
+                $display("[PASS] test 7: AR channel held by id %0d until accepted, then round-robin %0d,%0d -- not fixed low-index priority",
+                          expected_order[0], expected_order[1], expected_order[2]);
         end
 
         // ---------------------------------------------------------------
@@ -870,15 +956,13 @@ module mshr_tb;
         // order in the scenario below, which is what makes it a
         // meaningful test rather than a coincidence check.
         //
-        // Reuses test 7's ar_block technique to force ids 0/1/2 to
-        // request the AR channel simultaneously, so round-robin
-        // arbitration -- not arrival order -- decides which finishes
-        // fetching first. The expected fetch-completion order is derived
-        // from ar_last_grant at the moment this test starts (same
-        // technique as test 7), rather than assumed to be a fixed
-        // (1, 2, 0) left over from test 7 -- that assumption would make
-        // this test's premise unverified and coupled to test 7's own
-        // internal state. The fetch order is captured directly (the
+        // Reuses test 7's pile-up (pile_up_three) to force ids 0/1/2 to
+        // request the AR channel simultaneously with id 1 holding it, so
+        // the grant lock and round-robin arbitration -- not allocation
+        // order -- decide which finishes fetching first (1, 2, 0). The
+        // expected fetch-completion order is derived from the entry
+        // observed on the blocked channel (same technique as test 7)
+        // rather than assumed. The fetch order is captured directly (the
         // cycle each entry first reaches FE_DONE) and checked against
         // that derivation, so the test proves -- rather than assumes --
         // that whichever entry fetches last is still handed off first.
@@ -935,30 +1019,26 @@ module mshr_tb;
 
             // Close the read-address channel so all three misses pile up
             // as simultaneous requesters instead of being fetched one at
-            // a time as they arrive.
-            ar_block = 1'b1;
-            send_miss(BASE_ADDR + 0 * LINE_BYTES, 1'b0, id0);
-            send_miss(BASE_ADDR + 1 * LINE_BYTES, 1'b0, id1);
-            send_miss(BASE_ADDR + 2 * LINE_BYTES, 1'b0, id2);
-
-            if (id0 !== 4'd0 || id1 !== 4'd1 || id2 !== 4'd2) begin
-                $error("[FAIL] test 9: expected ids 0,1,2, got %0d,%0d,%0d -- MSHR was not cleanly idle before the test",
-                       id0, id1, id2);
-                mismatch = 1'b1;
-            end
-
-            // Derive the expected fetch-completion order from the
-            // arbiter's actual last-granted pointer, captured now while
-            // the AR channel is still blocked (same technique as test 7,
-            // used here instead of assuming a value left over from it).
-            last_grant = dut.ar_last_grant;
+            // a time as they arrive, with id 1 holding the channel. The
+            // writeback of line 0 carries the line's own preloaded
+            // contents, so memory is unchanged by it.
             begin
-                int idx;
-                idx = 0;
-                for (int i = 0; i < 3; i++)
-                    if (i[ID_WIDTH-1:0] > last_grant) expected_fetch_order[idx++] = i[ID_WIDTH-1:0];
-                for (int i = 0; i < 3; i++)
-                    if (i[ID_WIDTH-1:0] <= last_grant) expected_fetch_order[idx++] = i[ID_WIDTH-1:0];
+                logic [ID_WIDTH-1:0] presented;
+                logic                pile_err;
+
+                pile_up_three(BASE_ADDR, {4{32'hA0A0_0000}}, id0, id1, id2, presented, pile_err);
+                if (pile_err) mismatch = 1'b1;
+
+                if (id0 !== 4'd0 || id1 !== 4'd1 || id2 !== 4'd2) begin
+                    $error("[FAIL] test 9: expected ids 0,1,2, got %0d,%0d,%0d -- MSHR was not cleanly idle before the test",
+                           id0, id1, id2);
+                    mismatch = 1'b1;
+                end
+
+                // Expected fetch-completion order: the presented entry
+                // first (grant lock), then round-robin above it.
+                last_grant = presented;
+                rr_order_after(presented, expected_fetch_order);
             end
 
             // Reopen the channel: round-robin arbitration now decides

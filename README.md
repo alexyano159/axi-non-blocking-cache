@@ -4,7 +4,8 @@ A non-blocking L1 data cache with AXI4 memory access, built around a
 Miss Status Holding Register (MSHR) that supports secondary-miss
 merging and out-of-order fill completion. SystemVerilog RTL, with a
 self-checking testbench per module (directed tests, plus a
-constrained-random test for the cache controller).
+constrained-random test for the cache controller) and a system-level
+testbench of the whole cache against a randomized AXI4 memory model.
 
 ## Architecture
 
@@ -63,12 +64,12 @@ and the data SRAM — conceptual, not cycle-accurate).
 | Module | RTL | Testbench |
 |---|---|---|
 | `axi_if.sv` — AXI4 interface | Done | — (exercised via `mshr_tb`) |
-| `mshr.sv` — miss handling + writeback | Done | 13 directed tests, all passing |
+| `mshr.sv` — miss handling + writeback | Done | 14 directed tests, all passing |
 | `cache_tag_array.sv` — tag + dirty bit, 4-way | Done | 8 directed tests, all passing |
 | `cache_valid_array.sv` — valid bit, 4-way, sync reset | Done | 8 directed tests, all passing |
 | `cache_data_sram.sv` — line data, 4-way | Done | 6 directed tests, all passing |
 | `cache_controller.sv` — lookup, hit path, true-LRU state, miss allocation + waiting table | Hit path + LRU done; miss side (MSHR allocation, waiting table, back-pressure) done; fill/eviction + replay in progress | 13 tests (12 directed + 1 constrained-random), all passing |
-| `cache_top.sv` — top-level integration (controller + 3 arrays + MSHR) | Done (structural; compiles and elaborates warning-free) | System-level TB not started |
+| `cache_top.sv` — top-level integration (controller + 3 arrays + MSHR) | Done (structural; compiles and elaborates warning-free) | System TB (`cache_top_tb`): 10 directed + 1 constrained-random (5000 requests) + 1 consistency test, all passing over 30 seeds; 12/12 mutants caught |
 
 `mshr.sv` currently covers: single read/write miss fill, secondary-miss
 merge, single victim writeback, MSHR-full stall and recovery,
@@ -79,7 +80,25 @@ out-of-order dirty flag, entry reuse not leaking a stale dirty flag,
 reset mid-fetch not leaving a stale merge target, and read-after-write
 ordering (a re-miss to a line still queued for writeback issues its read
 only after the write's `B` response and returns the written-back data,
-while an unrelated miss is not held).
+while an unrelated miss is not held). The AR grant is locked while a
+request waits for `arready` (AXI request stability); tests 7 and 9 check
+the lock and round-robin together.
+
+`cache_top.sv` is verified end to end by `cache_top_tb`: a scoreboard
+that treats the cache as flat memory (each request takes effect at
+acceptance, responses matched by id), an AXI4 memory model with random
+back-pressure on every channel, out-of-order and interleaved read data,
+and writes that land only at their `B` response; master-side protocol
+checks; procedural mirrors of the controller's assertions; and an
+end-of-test memory + dirty-line consistency check. Coverage per 5000
+random requests (seed 1): ~1000 dirty writebacks, ~900 merges, ~200
+re-misses held behind their own writeback, ~100 fill restarts, ~2400
+replays, ~1900 hit-under-miss responses, ~260 out-of-order read
+completions, with floors enforced. Twelve deliberately broken RTL copies
+were all caught. The testbench found one RTL bug: the MSHR's AR arbiter
+changed `arid`/`araddr` while `arvalid` was waiting for `arready` (fixed
+with a grant lock). Details:
+[`docs/CACHE_TOP_README.md`](docs/CACHE_TOP_README.md#verification).
 
 `cache_tag_array.sv` currently covers: fill-write with a matching
 lookup, a non-matching tag correctly reporting no hit, a same-cycle
@@ -193,6 +212,20 @@ elaboration.
 queues, `process::self().srandom`). The random test's seed can be set
 with `+seed=<n>` when invoking `vsim` directly (`run.sh` does not forward
 plusargs).
+
+**`cache_top_tb`** — system testbench; runs with `run.sh cache_top_tb`
+under Questa and also under ModelSim 18.1 (which ignores
+`assert property`; the testbench re-checks the controller's assertions
+procedurally). Plusargs, when invoking `vsim` directly: `+seed=<n>`
+(default 1) and `+nreq=<n>` (random requests, default 5000):
+
+```bash
+vlib work
+vlog -sv rtl/axi_if.sv rtl/cache_controller.sv rtl/cache_data_sram.sv \
+     rtl/cache_tag_array.sv rtl/cache_valid_array.sv rtl/cache_top.sv rtl/mshr.sv \
+     tb/cache_top_tb.sv
+vsim -c cache_top_tb +seed=7 +nreq=5000 -do "run -all; quit -f"
+```
 
 ## Repo layout
 
