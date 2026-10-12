@@ -874,7 +874,16 @@ module cache_controller #(
 
     // wait_count is one bit wider than a slot index, so it holds
     // WAIT_DEPTH itself; the sum with lookup_q.valid is widened once more.
-    assign wait_count = (WAIT_IDX_WIDTH+1)'($countones(wait_valid));
+    // The population count is an explicit adder loop rather than
+    // $countones, which synthesis tools do not uniformly support (Quartus
+    // Prime rejects it); synthesis maps the loop to an adder tree.
+    function automatic logic [WAIT_IDX_WIDTH:0] count_occupied(input logic [WAIT_DEPTH-1:0] vec);
+        count_occupied = '0;
+        for (int i = 0; i < WAIT_DEPTH; i++)
+            count_occupied = count_occupied + (WAIT_IDX_WIDTH+1)'(vec[i]);
+    endfunction
+
+    assign wait_count = count_occupied(wait_valid);
     assign wait_space = ({1'b0, wait_count} + (WAIT_IDX_WIDTH+2)'(lookup_q.valid))
                         < (WAIT_IDX_WIDTH+2)'(WAIT_DEPTH);
 
