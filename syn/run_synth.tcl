@@ -36,7 +36,7 @@ set_global_assignment -name VERILOG_MACRO "SYNTHESIS=1"
 
 # Sources: the interface first, then the RTL, then the wrapper.
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $repo_dir rtl axi_if.sv]
-foreach f {cache_tag_array cache_valid_array cache_data_sram cache_controller mshr cache_top} {
+foreach f {sram_sdp cache_tag_array cache_valid_array cache_data_sram cache_controller mshr cache_top} {
     set_global_assignment -name SYSTEMVERILOG_FILE [file join $repo_dir rtl $f.sv]
 }
 set_global_assignment -name SYSTEMVERILOG_FILE [file join $script_dir cache_top_syn.sv]

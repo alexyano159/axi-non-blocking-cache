@@ -90,8 +90,8 @@ module mshr #(
     // cache line.
     // -------------------------------------------------------------------
     localparam int              BEAT_CNT_WIDTH = $clog2(LINE_WORDS);
-    localparam logic [7:0]      BURST_LEN      = LINE_WORDS - 1;            // AxLEN = beats - 1
-    localparam logic [2:0]      BURST_SIZE     = $clog2(DATA_WIDTH / 8);    // AxSIZE = log2(bytes/beat)
+    localparam logic [7:0]      BURST_LEN      = 8'(LINE_WORDS - 1);           // AxLEN = beats - 1
+    localparam logic [2:0]      BURST_SIZE     = 3'($clog2(DATA_WIDTH / 8));  // AxSIZE = log2(bytes/beat)
     localparam logic [1:0]      BURST_INCR     = 2'b01;
 
     // Fixed-priority encoder: returns the lowest set bit index in `vec`.
