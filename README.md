@@ -3,9 +3,11 @@
 A non-blocking L1 data cache with AXI4 memory access, built around a
 Miss Status Holding Register (MSHR) that supports secondary-miss
 merging and out-of-order fill completion. SystemVerilog RTL, with a
-self-checking testbench per module (directed tests, plus a
-constrained-random test for the cache controller) and a system-level
-testbench of the whole cache against a randomized AXI4 memory model.
+self-checking testbench per functional module (directed and
+constrained-random tests) and a system-level testbench of the whole
+cache against a randomized AXI4 memory model. The design synthesizes
+and fits on an Intel Cyclone V FPGA, with the cache arrays mapped onto
+block RAM (see [Synthesis](#synthesis)).
 
 ## Architecture
 
@@ -44,9 +46,11 @@ the tag array, valid array, and data SRAM are three separate,
 identically-indexed arrays — the controller ANDs the tag array's raw
 compare against the valid array's per-way valid bits to get a real hit,
 then reads the matching way out of the data SRAM in the same cycle.
-Only the valid array has a reset; the tag and data arrays are modeled
-as reset-less SRAM macros whose contents are ignored until a way is
-marked valid. Full protocol and rationale:
+Only the valid array has a reset; the tag and data arrays are reset-less
+RAMs, built from banks of one generic simple dual-port RAM
+(`rtl/sram_sdp.sv`) that synthesis maps onto block RAM, and their
+contents are ignored until a way is marked valid. Full protocol and
+rationale:
 [`docs/CACHE_CONTROLLER_README.md`](docs/CACHE_CONTROLLER_README.md),
 [`docs/MSHR_README.md`](docs/MSHR_README.md),
 [`docs/AXI_IF_README.md`](docs/AXI_IF_README.md),
@@ -65,11 +69,12 @@ and the data SRAM — conceptual, not cycle-accurate).
 |---|---|---|
 | `axi_if.sv` — AXI4 interface | Done | — (exercised via `mshr_tb`) |
 | `mshr.sv` — miss handling + writeback, read-after-write ordering, AXI request stability | Done | 14 directed tests, all passing |
-| `cache_tag_array.sv` — tag + dirty bit + stored-tag read-out, 4-way | Done | 9 directed tests, all passing |
+| `sram_sdp.sv` — generic simple dual-port RAM (block-RAM inference template) | Done | — (exercised via the tag and data array TBs) |
+| `cache_tag_array.sv` — tag + dirty bit + stored-tag read-out, 4-way (one tag RAM per way) | Done | 9 directed tests, all passing |
 | `cache_valid_array.sv` — valid bit, 4-way, sync reset | Done | 8 directed tests, all passing |
-| `cache_data_sram.sv` — line data, 4-way | Done | 6 directed tests, all passing |
+| `cache_data_sram.sv` — line data, 4-way (16 RAM banks, one per way × word) | Done | 6 directed tests, all passing |
 | `cache_controller.sv` — lookup, hit path, true-LRU, miss allocation + waiting table, fill/eviction, replay | Done | 19 tests (17 directed + 2 constrained-random, one end-to-end with an automatic MSHR fill model), all passing over 30 seeds |
-| `cache_top.sv` — top-level integration (controller + 3 arrays + MSHR) | Done (structural; compiles and elaborates warning-free) | System TB (`cache_top_tb`): 10 directed + 1 constrained-random (5000 requests) + 1 consistency test, all passing over 30 seeds; 12/12 mutants caught |
+| `cache_top.sv` — top-level integration (controller + 3 arrays + MSHR) | Done (structural; compiles and elaborates warning-free) | System TB (`cache_top_tb`): 9 directed + 2 random (400-request back-pressure stress, 5000-request constrained-random) + 1 consistency test, all passing over 30 seeds; 12/12 mutants caught |
 
 `mshr.sv` currently covers: single read/write miss fill, secondary-miss
 merge, single victim writeback, MSHR-full stall and recovery,
@@ -182,42 +187,40 @@ marking ignoring the MSHR id).
 ## Running the testbenches
 
 All testbenches run under Questa (Intel/Altera FPGA Starter Edition,
-installed under `C:\altera_lite\<release>\`, license `.dat` in `tools/`):
+installed under `C:\intelFPGA_lite\<release>\` or
+`C:\altera_lite\<release>\`, license `.dat` in `tools/`):
 
 ```bash
 ./tools/sim/run.sh [tb_name]     # default: mshr_tb
 ./tools/sim/run.sh cache_tag_array_tb
 ```
 
-Compiles every file in `rtl/` plus `tb/<tb_name>.sv`, then runs all
-directed tests to completion, printing a `[PASS]`/`[FAIL]` line per
-test. Questa cannot handle non-ASCII paths, so if the project lives
-under one the script transparently simulates from an ASCII staging copy
-in `%LOCALAPPDATA%\axi-non-blocking-cache-sim\`; otherwise it runs in
+(`tools/sim/run.bat [tb_name]` does the same from a Windows
+double-click or `cmd`.) The script compiles every file in `rtl/` plus
+`tb/<tb_name>.sv`, then runs all of that testbench's tests to
+completion, printing a `[PASS]`/`[FAIL]` line per test. Questa cannot
+handle non-ASCII paths, so if the project lives under one the script
+transparently simulates from an ASCII staging copy in
+`%LOCALAPPDATA%\axi-non-blocking-cache-sim\`; otherwise it runs in
 `tools/sim/`.
 
-**`cache_tag_array_tb`** and **`cache_valid_array_tb`** — verified
-with `iverilog`/`vvp` (Icarus Verilog):
+All testbenches also run under ModelSim ASE 18.1 (Intel FPGA Starter
+Edition) with the `vlog`/`vsim` commands shown below. ModelSim does not
+evaluate concurrent assertions (`assert property`); every testbench's
+own checks still run, and the system testbench re-checks the
+controller's assertions procedurally. Use a bounded `run` (e.g.
+`run 500ms`) rather than `run -all` when experimenting with a modified
+design, so a hang ends instead of stalling.
+
+**`cache_valid_array_tb`** — also verified with Icarus Verilog:
 
 ```bash
-iverilog -g2012 -o tag_tb.vvp rtl/cache_tag_array.sv tb/cache_tag_array_tb.sv && vvp tag_tb.vvp
 iverilog -g2012 -o valid_tb.vvp rtl/cache_valid_array.sv tb/cache_valid_array_tb.sv && vvp valid_tb.vvp
 ```
 
-**`cache_data_sram_tb`** — requires Questa; its unpacked-array task
-ports aren't supported by Icarus Verilog's current SystemVerilog
-elaboration.
-
-**`cache_controller_tb`** — runs under Questa, and also under ModelSim
-ASE 18.1, which does not evaluate the concurrent assertions (`assert
-property`); the testbench's own checks still run. The random tests'
-seed can be set with `+seed=<n>` when invoking `vsim` directly (`run.sh`
-does not forward plusargs).
-
-All testbenches have also been run under ModelSim ASE 18.1 (Intel FPGA
-Starter Edition) with the same commands as below. Use a bounded `run`
-(e.g. `run 500ms`) rather than `run -all` when experimenting with a
-modified design, so a hang ends instead of stalling.
+**`cache_controller_tb`** — the random tests' seed can be set with
+`+seed=<n>` when invoking `vsim` directly (`run.sh` does not forward
+plusargs).
 
 **`cache_top_tb`** — system testbench; runs with `run.sh cache_top_tb`
 under Questa and also under ModelSim 18.1 (which ignores
@@ -227,11 +230,40 @@ procedurally). Plusargs, when invoking `vsim` directly: `+seed=<n>`
 
 ```bash
 vlib work
-vlog -sv rtl/axi_if.sv rtl/cache_controller.sv rtl/cache_data_sram.sv \
-     rtl/cache_tag_array.sv rtl/cache_valid_array.sv rtl/cache_top.sv rtl/mshr.sv \
-     tb/cache_top_tb.sv
+vlog -sv -svinputport=var rtl/axi_if.sv rtl/sram_sdp.sv rtl/cache_controller.sv \
+     rtl/cache_data_sram.sv rtl/cache_tag_array.sv rtl/cache_valid_array.sv \
+     rtl/cache_top.sv rtl/mshr.sv tb/cache_top_tb.sv
 vsim -c cache_top_tb +seed=7 +nreq=5000 -do "run -all; quit -f"
 ```
+
+## Synthesis
+
+The design is synthesized with Intel Quartus Prime Lite 24.1 for a
+Cyclone V (5CSEMA5F31C6), as a core-only build: every port except `clk`
+is a virtual pin, so the numbers measure the cache itself, not board
+I/O. `syn/cache_top_syn.sv` is a logic-free wrapper that flattens the
+`axi_if` interface into plain `m_axi_*` ports, because a device top
+level cannot expose an interface port.
+
+```bash
+quartus_sh -t syn/run_synth.tcl    # from the repo root; output in syn/build/ (git-ignored)
+```
+
+| Metric | Result |
+|---|---|
+| Fit | Successful |
+| Logic | 5,232 ALMs (16%) |
+| Registers | 5,923 |
+| Block RAM | 38,400 bits in 20 M10K blocks (16 data banks + 4 tag banks) |
+| Fmax (slow corner) | 64.2 MHz (`syn/cache_top.sdc` sets a 100 MHz reference constraint, not met) |
+
+The project targets architecture and verification, not FPGA timing
+closure; the build demonstrates that the RTL is synthesizable and that
+the arrays map onto memory. An earlier version wrote the tag and data
+arrays in a form the tool could not recognize as RAM and built them from
+~38K flip-flops, so the design did not fit; the arrays were restructured
+into `sram_sdp` banks, with the tag compare moved after the RAM's read
+register (see [`docs/CACHE_TAG_ARRAY_README.md`](docs/CACHE_TAG_ARRAY_README.md)).
 
 ## Repo layout
 
@@ -239,6 +271,7 @@ vsim -c cache_top_tb +seed=7 +nreq=5000 -do "run -all; quit -f"
 rtl/          Synthesizable SystemVerilog modules (top level: cache_top.sv)
 tb/           Testbenches
 docs/         Per-module design docs (architecture, interface, rationale)
-visual_flow/  Conceptual diagrams / interactive teaching aid
-tools/sim/    Simulation runner
+syn/          Quartus synthesis flow (wrapper, Tcl script, timing constraints)
+visual_flow/  Conceptual dataflow diagrams (static)
+tools/sim/    Simulation runner (run.sh, run.bat)
 ```

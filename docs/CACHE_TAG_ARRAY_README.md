@@ -8,14 +8,17 @@ separate `cache_data_sram`; valid bits live in the separate
 `cache_valid_array`.
 
 ```
-tag_mem[NUM_WAYS][NUM_SETS]     -- one TAG_WIDTH-bit tag per (way, set)
-dirty_mem[NUM_WAYS][NUM_SETS]   -- one dirty bit per (way, set)
+g_way[w].u_tag_bank             -- 4 sram_sdp banks, each NUM_SETS x TAG_WIDTH (64 x 22)
+dirty_mem[NUM_WAYS][NUM_SETS]   -- one dirty bit per (way, set), in flip-flops
 ```
 
-Modeled as two separate arrays, both banked by way, rather than one
-combined struct-like array -- mirroring `cache_data_sram`'s per-way
-bank layout so both arrays are indexed identically and read together
-with matching latency.
+- **Tags** live in one `rtl/sram_sdp.sv` bank per way, all sharing the
+  read address -- the same per-way layout as `cache_data_sram`, so both
+  arrays are indexed identically and read together with matching
+  latency. After synthesis each bank is one M10K block.
+- **Dirty bits** stay in flip-flops: 256 bits in total, not worth four
+  block RAMs. They are also written on their own (by every store hit),
+  without the tag.
 
 ## Who it talks to
 
@@ -46,7 +49,7 @@ It is responsible for:
 | `clk` | 1 | in | Clock. No reset pin -- see rationale below. |
 | `rd_set_idx` | `SET_IDX_WIDTH` (6) | in | Set to look up, presented every lookup cycle (load or store). |
 | `lookup_tag` | `TAG_WIDTH` (22) | in | Tag to compare against all `NUM_WAYS` ways of the addressed set. |
-| `tag_match` | `NUM_WAYS` (4), one bit per way | out | Raw, valid-agnostic per-way compare result, registered -- valid one cycle after `rd_set_idx`/`lookup_tag`. |
+| `tag_match` | `NUM_WAYS` (4), one bit per way | out | Raw, valid-agnostic per-way compare result -- valid one cycle after `rd_set_idx`/`lookup_tag` (compare of the registered stored tags against a registered `lookup_tag`). |
 | `dirty_out` | `NUM_WAYS` (4), one bit per way | out | Each way's dirty bit, registered alongside `tag_match`. |
 | `tag_out` | `TAG_WIDTH` (22) x `NUM_WAYS` (4), unpacked | out | Each way's stored tag, registered alongside `tag_match`. Used to form a dirty victim's writeback address. |
 | `wr_en` | 1 | in | Master write enable. With this low, nothing changes regardless of the other write signals. |
@@ -68,13 +71,22 @@ replayed afterwards through the hit path, which sets the dirty bit.
 | Hit write | 0 | 1 | A store hits an already-resident line; only its dirty bit changes. |
 | Fill write | 1 | 1 | The MSHR returns a line after a miss; the victim way gets the new tag, with dirty = 0. |
 
-## Timing: registered compare, read-old-data on collision
+## Timing: compare after the read register, read-old-data on collision
 
-Both the compare and write ports are synchronous (`always_ff`):
-- **Compare:** `rd_set_idx`/`lookup_tag` are sampled on the clock edge;
-  `tag_match`/`dirty_out`/`tag_out` are valid the *following* edge -- matching
-  `cache_data_sram`'s `rd_line` latency, so the controller can combine
-  both arrays' results in the same cycle.
+- **Read:** `rd_set_idx` is sampled on the clock edge; `tag_out` (each
+  tag bank's registered output) and `dirty_out` are valid the
+  *following* edge -- matching `cache_data_sram`'s `rd_line` latency,
+  so the controller can combine both arrays' results in the same cycle.
+- **Compare:** `lookup_tag` is registered on the same edge, and
+  `tag_match[w] = (tag_out[w] == lookup_tag_q)` is computed
+  combinationally *after* the registers. So `tag_match` is still valid
+  one cycle after `rd_set_idx`/`lookup_tag` are presented.
+- **Why the compare is after the register:** a block RAM can only give
+  back registered read data. An earlier version compared first and
+  registered the 1-bit result (`tag_match <= (mem[set] == lookup_tag)`);
+  that put logic between the array and its register, so synthesis could
+  not use block RAM and built the tags from flip-flops. The cost of the
+  fix is one 22-bit compare moved into the cycle that uses `tag_match`.
 - **Collision:** a write to the same (way, set) on the same edge as a
   lookup is **not forwarded** -- the compare uses the pre-write
   (old) tag/dirty, matching typical single-port synchronous SRAM
@@ -100,6 +112,8 @@ written -- correctness after reset is that array's job, not this one's.
 | `NUM_SETS` | 64 | 4 KB total / 4 ways / 16 B line |
 | `SET_IDX_WIDTH` | `$clog2(NUM_SETS)` = 6 | Bits needed to index a set |
 | `WAY_WIDTH` | `$clog2(NUM_WAYS)` = 2 | Bits needed to select a way |
+| `WORD_OFF_WIDTH` | `$clog2(WORDS_PER_LINE)` = 2 | Word-within-line offset bits |
+| `BYTE_OFF_WIDTH` | `$clog2(DATA_WIDTH / 8)` = 2 | Byte-within-word offset bits |
 | `TAG_WIDTH` | `ADDR_WIDTH - SET_IDX_WIDTH - WORD_OFF_WIDTH - BYTE_OFF_WIDTH` = 22 | Bits of address stored as the tag |
 
 ## Verification
@@ -138,7 +152,3 @@ See `tb/cache_tag_array_tb.sv` -- 9 directed tests:
    must return each way's own tag for whichever set was addressed.
    Catches way-ordering, off-by-one set index and truncation errors,
    any of which would send an evicted dirty line to the wrong address.
-
-See `private_notes/VERIFICATION_PROBLEMS.txt` for a same-edge
-`wr_en`-deassertion race hit while bringing test 1 up, and how it was
-diagnosed and fixed.

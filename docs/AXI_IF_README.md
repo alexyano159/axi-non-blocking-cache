@@ -4,10 +4,10 @@
 
 `axi_if` is a SystemVerilog `interface` — a bundle of wires shared between
 the cache side (Master) and main memory (Slave), so a module doesn't need
-to declare and connect 20+ individual signals by hand. It implements the
-full AXI4 protocol: separate address/data/response channels, burst
-transfers, and transaction IDs so multiple requests can be in flight at
-once.
+to declare and connect 20+ individual signals by hand. It carries the
+subset of AXI4 that line bursts need: separate address/data/response
+channels, burst transfers, and transaction IDs so multiple requests can
+be in flight at once.
 
 ## Parameters
 
@@ -87,7 +87,16 @@ until both agree.
 
 - **`master`** — used by anything that *initiates* a transaction (the
   MSHR). Drives requests, samples the `ready`/response signals.
-- **`slave`** — used by main memory. Samples requests, drives the
+- **`slave`** — for a memory-side module. Samples requests, drives the
   `ready`/response signals.
-- **`monitor`** — every signal is an input. Used by testbenches/scoreboards
-  to observe the bus without ever driving it.
+- **`monitor`** — every signal is an input, for a passive observer
+  that watches the bus without driving it.
+
+`slave` and `monitor` are provided for completeness but are not used:
+both testbenches drive the memory side of the bare interface directly.
+
+## Not included
+
+The optional AXI4 signals `AxLOCK`, `AxCACHE`, `AxPROT`, `AxQOS`,
+`AxREGION` and the `USER` signals are omitted; the cache does not need
+them. `bresp`/`rresp` are carried but not checked by the MSHR.

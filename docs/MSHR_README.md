@@ -40,14 +40,14 @@ miss. From there:
    into this entry is now satisfied by simply re-checking the cache.
 
 **Write miss:** identical flow, except `alloc_is_write = 1`. The MSHR
-doesn't do anything differently for a store — it just remembers the flag
-and hands it back as `fill_is_write`. The controller itself keeps the
-store (its data and word) in its waiting table and replays it through
-the normal hit path once the line is installed, which writes the word
-and marks the line dirty.
-(If a read and a write both merge into the same entry, `fill_is_write`
-ends up `1` — a store anywhere in the merge chain means the line must
-come back dirty.)
+doesn't do anything differently for a store — it just ORs the flag of
+every access merged into the entry and reports it as `fill_is_write`.
+The controller does **not** use that flag: it installs every fill
+clean, keeps the store (its data and word) in its waiting table, and
+replays it through the normal hit path once the line is installed,
+which writes the word and marks the line dirty. (`fill_is_write` is
+kept as a port so a controller that merges stores at fill time could
+use it; `cache_controller` takes it as an input and ignores it.)
 
 **Eviction (happens at fill time, not at miss time):** the victim way is
 only chosen when the fetched line comes back, so the old line keeps
@@ -102,7 +102,8 @@ and return the **old** data.
 
 **The fix (hold the read):**
 - When a new entry is opened, its line address is compared against
-  every busy writeback-queue slot (4 compares). The matching slots are
+  every busy writeback-queue slot, and against a victim being pushed
+  into the queue in that same cycle (4 compares). The matching slots are
   stored in the entry's wait mask (`fe_wb_wait`, one bit per slot).
 - An entry with any bit set stays in `FE_REQ` but is **not offered to
   the AR arbiter**.
@@ -161,6 +162,41 @@ controller this cycle) still uses plain fixed-priority — that choice
 doesn't gate access to memory bandwidth, it only decides who waits one
 extra cycle to be handed off, so starvation isn't a real risk there.
 
+## Interface
+
+| Signal | Width | Direction | Meaning |
+|---|---|---|---|
+| `clk` | 1 | in | Clock |
+| `rst_n` | 1 | in | Active-low synchronous reset |
+| `alloc_valid` | 1 | in | Controller is reporting a miss |
+| `alloc_addr` | `ADDR_WIDTH` (32) | in | Line-aligned address that missed |
+| `alloc_is_write` | 1 | in | 1 = the access that missed was a store |
+| `alloc_ready` | 1 | out | 0 = no free entry and no in-flight entry to merge with |
+| `alloc_id` | `ID_WIDTH` (4) | out | Entry index / AXI ID given to this miss (the existing entry on a merge) |
+| `wb_valid` | 1 | in | Controller is handing off a dirty victim |
+| `wb_addr` | `ADDR_WIDTH` (32) | in | Victim line address |
+| `wb_data` | `LINE_WIDTH` (128) | in | Victim line data |
+| `wb_ready` | 1 | out | 0 = writeback queue full |
+| `wb_done` | 1 | out | One-cycle pulse when a writeback's `B` response arrives |
+| `fill_valid` | 1 | out | A completed line is presented |
+| `fill_id` | `ID_WIDTH` (4) | out | Entry that completed |
+| `fill_addr` | `ADDR_WIDTH` (32) | out | Address of the completed line |
+| `fill_data` | `LINE_WIDTH` (128) | out | Reassembled line, all 4 beats |
+| `fill_is_write` | 1 | out | OR of `alloc_is_write` over every merged access (unused by `cache_controller`) |
+| `fill_ready` | 1 | in | Controller accepts the fill this cycle; the entry frees on that edge |
+| `axi` | `axi_if.master` | — | AXI4 master port: `AR`/`R` for fills, `AW`/`W`/`B` for writebacks |
+
+**Caller contract.** A miss must not merge into an entry on the same edge
+that entry's fill is accepted (`alloc_valid` matching the entry while
+`fill_valid && fill_ready` for it). The entry is freed on that edge, so
+the merged access would be lost. The MSHR does not guard against this;
+the controller guarantees it, because it accepts a fill only in its F1
+cycle, when its lookup stage is empty and no miss can be reported
+(asserted in `cache_controller.sv`).
+
+**Error responses.** `rresp` and `bresp` are not checked: an AXI error
+response (`SLVERR`/`DECERR`) is treated as success.
+
 ## Parameters
 
 | Parameter | Default | Meaning |
@@ -172,3 +208,23 @@ extra cycle to be handed off, so starvation isn't a real risk there.
 | `LINE_WIDTH` | `DATA_WIDTH * LINE_WORDS` = 128 | Full cache line width, in bits |
 | `NUM_ENTRIES` | `2**ID_WIDTH` = 16 | Number of misses that can be in flight at once |
 | `WB_QUEUE_DEPTH` | 4 | Victims that can be queued awaiting the write channel |
+
+## Verification
+
+See `tb/mshr_tb.sv` — 14 directed tests, run against an AXI4 memory
+model on the same `axi_if`:
+
+1. **Reset sanity** — no entry busy, queue empty, nothing asserted.
+2. **Single read miss → fill** — one `AR` burst, 4 beats reassembled, line handed back.
+3. **Single write miss → fill** — same flow, `fill_is_write = 1`.
+4. **Secondary-miss merge** — a second miss to an in-flight line joins its entry; no second `AR`.
+5. **Single victim writeback** — `AW`/`W`/`B` sequence with the right address and data; `wb_done` pulse.
+6. **MSHR full** — all 16 entries busy → `alloc_ready = 0` → recovery once one frees.
+7. **Round-robin AR arbitration** — piled-up requests granted in round-robin order, with the grant lock held while `arready` is low.
+8. **Writeback queue full** — `wb_ready = 0` at 4 queued victims → recovery.
+9. **Fill-completion mux order** — several finished entries handed back in fixed-priority order.
+10. **Concurrent fill + writeback** — read and write engines progress independently on their own channels.
+11. **Multi-way merge** — four accesses (load/store/load/load) share one entry; the dirty flag set mid-sequence survives.
+12. **Entry reuse** — a freed entry's new, unrelated miss does not inherit the old dirty flag.
+13. **Reset mid-fetch** — no stale merge target remains; a fresh miss issues a real burst.
+14. **Re-miss behind its own writeback** — the read waits for the write's `B` response and returns the written-back data; an unrelated miss is not held.

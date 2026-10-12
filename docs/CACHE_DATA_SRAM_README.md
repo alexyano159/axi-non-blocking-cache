@@ -8,15 +8,24 @@ separate `cache_tag_array`, and valid bits in the separate
 `cache_valid_array`; both are read in parallel with matching latency.
 
 ```
-mem[NUM_WAYS][NUM_SETS]   -- one 128-bit line per (way, set) pair
+g_way[w].g_word[i].u_bank   -- 16 sram_sdp banks, each NUM_SETS x DATA_WIDTH (64 x 32)
+                               bank (w, i) holds word i of every line in way w
 ```
 
-Modeled as `NUM_WAYS` independent banks rather than one flat array,
-reflecting that a real 4-way SRAM is four parallel memories sharing an
-address bus -- not one wide memory with an extra address bit. This lets
-all four ways of a set come back in the same cycle, in parallel with
-the tag/valid lookup, so the controller can select the hitting way's
-line the moment the hit is resolved -- without a second SRAM access.
+Built from `NUM_WAYS x WORDS_PER_LINE` instances of the generic RAM
+`rtl/sram_sdp.sv`, all sharing the read address. Two reasons:
+- **Parallel ways.** A real 4-way data array is several memories side
+  by side, not one wide memory with an extra address bit. All four ways
+  of a set come back in the same cycle, in parallel with the tag/valid
+  lookup, so the controller selects the hitting way's line the moment
+  the hit is resolved -- without a second access.
+- **Block-RAM inference.** One bank per word turns the per-word write
+  mask into a plain write enable per bank: bank (w, i) is written when
+  `wr_en`, `wr_way_sel == w` and `wr_word_en[i]` are all set. A single
+  2-D array written through a variable way index with a per-word mask
+  does not match the RAM template, and synthesis builds it from
+  flip-flops instead (32 Kbit of registers; the design then did not fit
+  the FPGA). With banks, each maps onto one M10K block.
 
 ## Who it talks to
 
@@ -48,7 +57,7 @@ group. It is responsible for:
 | `wr_set_idx` | `SET_IDX_WIDTH` (6) | in | Set to write. |
 | `wr_way_sel` | `WAY_WIDTH` (2) | in | Way to write. |
 | `wr_word_en` | `WORDS_PER_LINE` (4), one bit per word | in | Per-word write mask: one-hot for a hit-write, all-ones for a fill-write. |
-| `wr_data` | `LINE_WIDTH` (128) | in | Full line; only the words selected by `wr_word_en` are actually written. |
+| `wr_data` | `LINE_WIDTH` (128) | in | Full line; only the words selected by `wr_word_en` are actually written. (For a hit-write the controller copies the store word into all four lanes.) |
 
 ## Two write sources, one port
 
@@ -63,14 +72,15 @@ while a fill is installed):
 
 ## Timing: registered read, read-old-data on collision
 
-Both the read and write ports are synchronous (`always_ff`):
+Both ports are synchronous (inside each `sram_sdp` bank):
 - **Read:** `rd_set_idx` is sampled on the clock edge; `rd_line` is
-  valid the *following* edge -- matching the latency of a real
-  single-port SRAM macro.
+  valid the *following* edge -- matching the latency of a real SRAM
+  macro. `rd_line` is only the banks' outputs wired together; there is
+  no logic after the read register.
 - **Collision:** a write to the same (way, set) on the same edge as a
   read is **not forwarded** -- the read returns the pre-write value,
-  matching typical single-port synchronous SRAM behavior. The write
-  itself is never lost, only not visible until the next read.
+  matching typical synchronous SRAM behavior. The write itself is
+  never lost, only not visible until the next read.
 
 ## No reset
 
