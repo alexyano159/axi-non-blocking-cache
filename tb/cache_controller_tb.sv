@@ -141,7 +141,8 @@ module cache_controller_tb;
     // MSHR port. Controller outputs are observed (they must stay idle on
     // the hit path); the remaining inputs are tied to the values an idle
     // MSHR drives just after reset (free entries, empty writeback queue).
-    // The fill inputs are TB-driven variables, idle (no fill) by default.
+    // The fill inputs and mshr_wb_ready are TB-driven variables, idle (no
+    // fill, queue not full) by default.
     // With mshr_fill_valid = 0, mshr_fill_addr carries no fill, but it
     // still selects the set whose LRU victim the controller computes,
     // which test 10 probes. mshr_alloc_id is driven by the allocation
@@ -157,7 +158,7 @@ module cache_controller_tb;
 
     wire logic                     mshr_alloc_ready  = 1'b1;
     logic      [MSHR_ID_WIDTH-1:0] mshr_alloc_id;            // driven by the allocation stub
-    wire logic                     mshr_wb_ready     = 1'b1;
+    logic                          mshr_wb_ready     = 1'b1;   // TB-driven: test 16 models a full writeback queue
     wire logic                     mshr_wb_done      = 1'b0;
     logic                          mshr_fill_valid   = 1'b0;   // TB-driven (mshr_fill, test 15)
     logic      [MSHR_ID_WIDTH-1:0] mshr_fill_id      = '0;
@@ -378,6 +379,13 @@ module cache_controller_tb;
     //   - mshr_fill_ready is never raised without a presented fill;
     //   - no CPU request is accepted while a fill is presented (fills
     //     own the array ports and take priority over the CPU).
+    //
+    // The writeback monitor logs every victim handed to the MSHR
+    // (mshr_wb_valid && mshr_wb_ready) and enforces the hold rule: a
+    // writeback presented but not accepted must be presented again on
+    // the next edge with unchanged address and data. The one permitted
+    // exception is a fill restart -- the presented fill id changed, so
+    // the victim belongs to a fill that is no longer being installed.
     // -------------------------------------------------------------------
     typedef struct {
         logic [TXN_ID_WIDTH-1:0] id;
@@ -392,13 +400,38 @@ module cache_controller_tb;
         int unsigned              cycle;
     } fill_rec_t;
 
+    typedef struct {
+        logic [ADDR_WIDTH-1:0] addr;
+        logic [LINE_WIDTH-1:0] data;
+        int unsigned           cycle;
+    } wb_rec_t;
+
     int unsigned cycle_cnt     = 0;
     resp_rec_t   resp_log [$];
     fill_rec_t   fill_log [$];
     int unsigned fill_rule_err = 0;
+    wb_rec_t     wb_log   [$];
+    int unsigned wb_hold_err   = 0;
+
+    logic                     wb_held = 1'b0;   // a writeback was presented, not accepted, on the last edge
+    logic [ADDR_WIDTH-1:0]    wb_held_addr;
+    logic [LINE_WIDTH-1:0]    wb_held_data;
+    logic [MSHR_ID_WIDTH-1:0] wb_held_fill_id;
 
     always @(posedge clk) begin
         cycle_cnt++;
+        if (rst_n && mshr_wb_valid && mshr_wb_ready)
+            wb_log.push_back('{addr: mshr_wb_addr, data: mshr_wb_data, cycle: cycle_cnt});
+        if (rst_n && wb_held && mshr_fill_id === wb_held_fill_id &&
+            !(mshr_wb_valid === 1'b1 && mshr_wb_addr === wb_held_addr && mshr_wb_data === wb_held_data)) begin
+            $error("writeback monitor: held writeback changed or withdrawn at cycle %0d (valid %b addr 0x%08h, held addr 0x%08h)",
+                   cycle_cnt, mshr_wb_valid, mshr_wb_addr, wb_held_addr);
+            wb_hold_err++;
+        end
+        wb_held         = rst_n && mshr_wb_valid && !mshr_wb_ready;
+        wb_held_addr    = mshr_wb_addr;
+        wb_held_data    = mshr_wb_data;
+        wb_held_fill_id = mshr_fill_id;
         if (rst_n && resp_valid && resp_ready)
             resp_log.push_back('{id: resp_id, data: resp_data, we: resp_we, cycle: cycle_cnt});
         if (rst_n && mshr_fill_valid && mshr_fill_ready)
@@ -566,10 +599,10 @@ module cache_controller_tb;
     // -------------------------------------------------------------------
     // MSHR allocation logger.
     // Records every miss the controller reports to the MSHR (one per
-    // cycle at most), together with the writeback count, which must stay
-    // zero until evictions exist. sb_access queues the allocation it
-    // predicts for each miss in exp_alloc_log; check_allocs compares the
-    // two in order.
+    // cycle at most), together with the number of writebacks handed off
+    // (accepted handshakes, so a writeback held against a full queue
+    // counts once). sb_access queues the allocation it predicts for each
+    // miss in exp_alloc_log; check_allocs compares the two in order.
     // -------------------------------------------------------------------
     typedef struct {
         logic [ADDR_WIDTH-1:0] addr;
@@ -583,7 +616,7 @@ module cache_controller_tb;
     always @(posedge clk) begin
         if (rst_n && mshr_alloc_valid)
             alloc_log.push_back('{addr: mshr_alloc_addr, is_write: mshr_alloc_is_write});
-        if (rst_n && mshr_wb_valid)
+        if (rst_n && mshr_wb_valid && mshr_wb_ready)
             wb_req_cnt++;
     end
 
@@ -865,10 +898,30 @@ module cache_controller_tb;
         end
     endtask
 
-    // Scoreboard prediction of a fill: the lowest-indexed invalid way of
-    // the line's set, else its least recently used way (age NUM_WAYS-1).
-    // The model installs the line there -- clean, valid -- and makes the
-    // way the most recently used, as the controller does. Returns the way.
+    // Scoreboard prediction of a fill's victim: the lowest-indexed invalid
+    // way of the line's set, else its least recently used way (age
+    // NUM_WAYS-1). No side effects, so a test can inspect the victim's
+    // model contents (valid, dirty, tag, line) before the fill.
+    function automatic logic [WAY_WIDTH-1:0] model_victim_way(input logic [ADDR_WIDTH-1:0] addr);
+        logic [SET_IDX_WIDTH-1:0]  s;
+        logic [TAG_WIDTH-1:0]      t;
+        logic [WORD_OFF_WIDTH-1:0] d;
+        logic [WAY_WIDTH-1:0]      way;
+
+        {t, s, d} = addr[ADDR_WIDTH-1:BYTE_OFF_WIDTH];
+
+        for (int w = 0; w < NUM_WAYS; w++)
+            if (model_age[s][w] == WAY_WIDTH'(NUM_WAYS - 1))
+                way = WAY_WIDTH'(w);
+        for (int w = NUM_WAYS - 1; w >= 0; w--)
+            if (!model_valid[s][w])
+                way = WAY_WIDTH'(w);
+        return way;
+    endfunction
+
+    // Scoreboard update for a fill: installs the line in the predicted
+    // victim way -- clean, valid -- and makes that way the most recently
+    // used, as the controller does. Returns the way.
     function automatic logic [WAY_WIDTH-1:0] model_fill(
         input logic [ADDR_WIDTH-1:0] addr,
         input logic [LINE_WIDTH-1:0] line
@@ -878,22 +931,9 @@ module cache_controller_tb;
         logic [WORD_OFF_WIDTH-1:0] d;
         logic [WAY_WIDTH-1:0]      way;
         logic [WAY_WIDTH-1:0]      way_age;
-        logic                      found;
 
         {t, s, d} = addr[ADDR_WIDTH-1:BYTE_OFF_WIDTH];
-
-        found = 1'b0;
-        for (int w = 0; w < NUM_WAYS; w++) begin
-            if (!found && !model_valid[s][w]) begin
-                way   = WAY_WIDTH'(w);
-                found = 1'b1;
-            end
-        end
-        if (!found) begin
-            for (int w = 0; w < NUM_WAYS; w++)
-                if (model_age[s][w] == WAY_WIDTH'(NUM_WAYS - 1))
-                    way = WAY_WIDTH'(w);
-        end
+        way = model_victim_way(addr);
 
         model_line [s][way] = line;
         model_tag  [s][way] = t;
@@ -989,10 +1029,12 @@ module cache_controller_tb;
     endtask
 
     // Compares the logged MSHR allocations against the ones sb_access
-    // predicted, in order, and requires that no writeback was requested.
+    // predicted, in order, and requires exactly exp_wbs writebacks to
+    // have been handed off -- none, unless the test evicts dirty lines.
     task automatic check_allocs(
         input  string       what,
-        inout  int unsigned errors
+        inout  int unsigned errors,
+        input  int unsigned exp_wbs = 0
     );
         if (alloc_log.size() != exp_alloc_log.size()) begin
             $error("[FAIL] %s: %0d MSHR allocations, expected %0d (one per miss)",
@@ -1009,8 +1051,8 @@ module cache_controller_tb;
                 end
             end
         end
-        if (wb_req_cnt != 0) begin
-            $error("[FAIL] %s: %0d writeback requests, expected none", what, wb_req_cnt);
+        if (wb_req_cnt != exp_wbs) begin
+            $error("[FAIL] %s: %0d writebacks handed off, expected %0d", what, wb_req_cnt, exp_wbs);
             errors++;
         end
     endtask
@@ -3052,6 +3094,245 @@ module cache_controller_tb;
 
             if (errors == 0)
                 $display("[PASS] test 15: fill displaced between F0 and F1 -- nothing written in the stale cycle, displacing fill (id 3) written next cycle, displaced fill (id 7) re-read and written after; both lines hit");
+        end
+
+        // ---------------------------------------------------------------
+        // Test 16: dirty-victim writeback.
+        // A full set is refilled three times, each time replacing its LRU
+        // way:
+        //   A. the victim is clean        -- nothing may be written back;
+        //   B. the victim is dirty        -- it is handed to the MSHR with
+        //      its own address and its modified contents, on the same
+        //      edge as the new line is written;
+        //   C. the victim is dirty and the writeback queue is full for
+        //      T16_HOLD cycles -- the fill must wait in F1 with nothing
+        //      written, the CPU held off and the presented writeback
+        //      stable, then complete on the edge the queue accepts it.
+        // Each dirty victim is made LRU by a store followed by loads to
+        // the other three ways, so its data differs from what was filled
+        // (the stored word); a writeback that sent the filled data, or the
+        // new line, is detected. Finally every resident line hits and
+        // every evicted line misses.
+        // ---------------------------------------------------------------
+        begin
+            localparam logic [SET_IDX_WIDTH-1:0] T16_SET  = 6'd24;
+            localparam int unsigned              T16_HOLD = 5;   // F1 cycles with the writeback queue full
+
+            logic [TAG_WIDTH-1:0]  l_tag  [7];
+            logic [ADDR_WIDTH-1:0] l_addr [7];
+            logic [LINE_WIDTH-1:0] l_line [7];
+            logic [WAY_WIDTH-1:0]  exp_way, v_way;
+            logic [ADDR_WIDTH-1:0] exp_wb_addr;
+            logic [LINE_WIDTH-1:0] exp_wb_data;
+            int unsigned           present_c, done_c, acc;
+            int unsigned           wr_base, wb_base, miss_base, hold_bad;
+            int unsigned           errors;
+
+            reset_dut_and_model();
+            errors = 0;
+
+            for (int i = 0; i < 7; i++) begin
+                l_tag[i]  = 22'h16_0000 + TAG_WIDTH'(i);
+                l_addr[i] = make_addr(l_tag[i], T16_SET, 2'd0);
+                for (int w = 0; w < WORDS_PER_LINE; w++)
+                    l_line[i][w * DATA_WIDTH +: DATA_WIDTH] = 32'h1600_0000 | (i << 8) | w;
+            end
+
+            resp_log.delete();
+            exp_log.delete();
+            wr_log.delete();
+            alloc_log.delete();
+            exp_alloc_log.delete();
+            fill_log.delete();
+            wb_log.delete();
+            wb_req_cnt    = 0;
+            fill_rule_err = 0;
+            wb_hold_err   = 0;
+            miss_base     = miss_cnt;
+            resp_ready    = 1'b1;
+            mshr_wb_ready = 1'b1;
+
+            // Phase A: four fills populate ways 0-3 (all clean); the fifth
+            // replaces the LRU way 0, which is clean -- no writeback.
+            for (int i = 0; i < 4; i++)
+                mshr_fill(MSHR_ID_WIDTH'(i), l_addr[i], l_line[i], present_c, done_c, exp_way);
+            wr_base = wr_log.size();
+            mshr_fill(4'd4, l_addr[4], l_line[4], present_c, done_c, exp_way);
+            if (exp_way !== 2'd0) begin
+                $error("[FAIL] test 16: scoreboard predicts way %0d for the clean-victim fill, expected 0 (TB model error)", exp_way);
+                errors++;
+            end
+            if (wb_log.size() != 0) begin
+                $error("[FAIL] test 16: clean victim written back (%0d writebacks)", wb_log.size());
+                errors++;
+            end
+            if (done_c - present_c != FILL_LATENCY) begin
+                $error("[FAIL] test 16: clean-victim fill took %0d edges, expected %0d",
+                       done_c - present_c, FILL_LATENCY);
+                errors++;
+            end
+            if (wr_log.size() != wr_base + 1) begin
+                $error("[FAIL] test 16: clean-victim fill produced %0d array-write cycles, expected 1",
+                       wr_log.size() - wr_base);
+                errors++;
+            end else begin
+                check_fill_write("test 16 clean-victim fill", wr_log[wr_base],
+                                 T16_SET, 2'd0, l_tag[4], l_line[4], errors);
+            end
+
+            // Phase B: way 1 (L1) is now the LRU. A store makes it dirty;
+            // loads to the other three ways make it the LRU again.
+            sb_access(make_addr(l_tag[1], T16_SET, 2'd2), 1'b1, 32'hD1D1_D1D1, 4'd1, acc);
+            sb_access(make_addr(l_tag[2], T16_SET, 2'd0), 1'b0, '0,           4'd2, acc);
+            sb_access(make_addr(l_tag[3], T16_SET, 2'd1), 1'b0, '0,           4'd3, acc);
+            sb_access(make_addr(l_tag[4], T16_SET, 2'd3), 1'b0, '0,           4'd4, acc);
+            @(posedge clk);
+            #1;
+
+            v_way       = model_victim_way(l_addr[5]);
+            exp_wb_addr = make_addr(model_tag[T16_SET][v_way], T16_SET, 2'd0);
+            exp_wb_data = model_line[T16_SET][v_way];
+            if (v_way !== 2'd1 || !model_dirty[T16_SET][v_way] ||
+                exp_wb_data[2 * DATA_WIDTH +: DATA_WIDTH] !== 32'hD1D1_D1D1) begin
+                $error("[FAIL] test 16: scoreboard victim for phase B is way %0d (dirty %b), expected dirty way 1 holding the stored word (TB model error)",
+                       v_way, model_dirty[T16_SET][v_way]);
+                errors++;
+            end
+
+            wr_base = wr_log.size();
+            wb_base = wb_log.size();
+            mshr_fill(4'd5, l_addr[5], l_line[5], present_c, done_c, exp_way);
+            if (done_c - present_c != FILL_LATENCY) begin
+                $error("[FAIL] test 16: dirty-victim fill took %0d edges, expected %0d",
+                       done_c - present_c, FILL_LATENCY);
+                errors++;
+            end
+            if (wb_log.size() != wb_base + 1) begin
+                $error("[FAIL] test 16: dirty-victim fill produced %0d writebacks, expected 1",
+                       wb_log.size() - wb_base);
+                errors++;
+            end else if (wb_log[wb_base].addr !== exp_wb_addr || wb_log[wb_base].data !== exp_wb_data ||
+                         wb_log[wb_base].cycle != done_c) begin
+                $error("[FAIL] test 16: writeback (0x%08h, 0x%032h, cycle %0d), expected (0x%08h, 0x%032h, cycle %0d)",
+                       wb_log[wb_base].addr, wb_log[wb_base].data, wb_log[wb_base].cycle,
+                       exp_wb_addr, exp_wb_data, done_c);
+                errors++;
+            end
+            if (wr_log.size() != wr_base + 1) begin
+                $error("[FAIL] test 16: dirty-victim fill produced %0d array-write cycles, expected 1",
+                       wr_log.size() - wr_base);
+                errors++;
+            end else begin
+                check_fill_write("test 16 dirty-victim fill", wr_log[wr_base],
+                                 T16_SET, 2'd1, l_tag[5], l_line[5], errors);
+            end
+
+            // Phase C: way 2 (L2) is now the LRU. Made dirty and LRU again
+            // as in phase B, then filled with the writeback queue full.
+            sb_access(make_addr(l_tag[2], T16_SET, 2'd3), 1'b1, 32'hD2D2_D2D2, 4'd5, acc);
+            sb_access(make_addr(l_tag[3], T16_SET, 2'd0), 1'b0, '0,           4'd6, acc);
+            sb_access(make_addr(l_tag[4], T16_SET, 2'd1), 1'b0, '0,           4'd7, acc);
+            sb_access(make_addr(l_tag[5], T16_SET, 2'd2), 1'b0, '0,           4'd8, acc);
+            @(posedge clk);
+            #1;
+
+            v_way       = model_victim_way(l_addr[6]);
+            exp_wb_addr = make_addr(model_tag[T16_SET][v_way], T16_SET, 2'd0);
+            exp_wb_data = model_line[T16_SET][v_way];
+            if (v_way !== 2'd2 || !model_dirty[T16_SET][v_way] ||
+                exp_wb_data[3 * DATA_WIDTH +: DATA_WIDTH] !== 32'hD2D2_D2D2) begin
+                $error("[FAIL] test 16: scoreboard victim for phase C is way %0d (dirty %b), expected dirty way 2 holding the stored word (TB model error)",
+                       v_way, model_dirty[T16_SET][v_way]);
+                errors++;
+            end
+
+            // The queue is full from the fill's presentation; after F0,
+            // every F1 cycle of the hold is checked on its edge: nothing
+            // written, nothing accepted, the writeback presented and
+            // unchanged. The queue then frees up.
+            wr_base       = wr_log.size();
+            wb_base       = wb_log.size();
+            hold_bad      = 0;
+            mshr_wb_ready = 1'b0;
+            fork
+                mshr_fill(4'd6, l_addr[6], l_line[6], present_c, done_c, exp_way);
+                begin
+                    @(posedge clk);   // F0
+                    #1;
+                    for (int h = 0; h < T16_HOLD; h++) begin
+                        @(posedge clk);
+                        if (ctrl_tag_wr_en || ctrl_valid_wr_en || ctrl_data_wr_en || mshr_fill_ready ||
+                            mshr_wb_valid !== 1'b1 || mshr_wb_addr !== exp_wb_addr ||
+                            mshr_wb_data !== exp_wb_data) begin
+                            $error("[FAIL] test 16: hold cycle %0d: write %b%b%b, fill_ready %b, wb_valid %b, wb_addr 0x%08h (expected 0x%08h)",
+                                   h, ctrl_tag_wr_en, ctrl_valid_wr_en, ctrl_data_wr_en, mshr_fill_ready,
+                                   mshr_wb_valid, mshr_wb_addr, exp_wb_addr);
+                            hold_bad++;
+                        end
+                        #1;
+                    end
+                    mshr_wb_ready = 1'b1;
+                end
+            join
+            if (hold_bad != 0)
+                errors++;
+            if (done_c - present_c != FILL_LATENCY + T16_HOLD) begin
+                $error("[FAIL] test 16: fill behind a full queue took %0d edges, expected %0d",
+                       done_c - present_c, FILL_LATENCY + T16_HOLD);
+                errors++;
+            end
+            if (wb_log.size() != wb_base + 1) begin
+                $error("[FAIL] test 16: fill behind a full queue produced %0d writebacks, expected 1",
+                       wb_log.size() - wb_base);
+                errors++;
+            end else if (wb_log[wb_base].addr !== exp_wb_addr || wb_log[wb_base].data !== exp_wb_data ||
+                         wb_log[wb_base].cycle != done_c) begin
+                $error("[FAIL] test 16: writeback (0x%08h, 0x%032h, cycle %0d), expected (0x%08h, 0x%032h, cycle %0d)",
+                       wb_log[wb_base].addr, wb_log[wb_base].data, wb_log[wb_base].cycle,
+                       exp_wb_addr, exp_wb_data, done_c);
+                errors++;
+            end
+            if (wr_log.size() != wr_base + 1) begin
+                $error("[FAIL] test 16: fill behind a full queue produced %0d array-write cycles, expected 1",
+                       wr_log.size() - wr_base);
+                errors++;
+            end else begin
+                check_fill_write("test 16 fill behind a full queue", wr_log[wr_base],
+                                 T16_SET, 2'd2, l_tag[6], l_line[6], errors);
+            end
+
+            // Final state: L3-L6 resident and hitting with their data;
+            // L0-L2 evicted and missing (one allocation each).
+            sb_access(make_addr(l_tag[3], T16_SET, 2'd3), 1'b0, '0, 4'd9,  acc);
+            sb_access(make_addr(l_tag[4], T16_SET, 2'd2), 1'b0, '0, 4'd10, acc);
+            sb_access(make_addr(l_tag[5], T16_SET, 2'd1), 1'b0, '0, 4'd11, acc);
+            sb_access(make_addr(l_tag[6], T16_SET, 2'd0), 1'b0, '0, 4'd12, acc);
+            sb_access(make_addr(l_tag[0], T16_SET, 2'd0), 1'b0, '0, 4'd13, acc);
+            sb_access(make_addr(l_tag[1], T16_SET, 2'd2), 1'b0, '0, 4'd14, acc);
+            sb_access(make_addr(l_tag[2], T16_SET, 2'd3), 1'b0, '0, 4'd15, acc);
+            repeat (HIT_LATENCY + 1) @(posedge clk);
+            #1;
+
+            check_responses("test 16", errors);
+            if (miss_cnt - miss_base != 3) begin
+                $error("[FAIL] test 16: %0d lookups classified as miss, expected 3 (the evicted lines)",
+                       miss_cnt - miss_base);
+                errors++;
+            end
+            check_allocs("test 16", errors, 2);
+            if (fill_log.size() != 7) begin
+                $error("[FAIL] test 16: %0d fills accepted, expected 7", fill_log.size());
+                errors++;
+            end
+            if (fill_rule_err != 0 || wb_hold_err != 0) begin
+                $error("[FAIL] test 16: %0d fill-handshake and %0d writeback-hold rule violations",
+                       fill_rule_err, wb_hold_err);
+                errors++;
+            end
+
+            if (errors == 0)
+                $display("[PASS] test 16: clean victim not written back; dirty victim written back with its address and modified data on the fill edge; full queue holds F1 for %0d cycles (no write, stable writeback, CPU held), then completes; evicted lines miss",
+                         T16_HOLD);
         end
 
         // ---------------------------------------------------------------
