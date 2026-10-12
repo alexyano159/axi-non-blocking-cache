@@ -40,7 +40,7 @@ CPU  <--req/resp--> cache_controller ---> cache_valid_array (valid_*)
 
 The controller does **not** instantiate any of these. It exposes four
 port groups that mirror each collaborator's interface one-for-one, and a
-separate top-level module (not yet written) wires the five blocks
+separate top-level module, `rtl/cache_top.sv`, wires the five blocks
 together. The groups are prefixed (`tag_`, `valid_`, `data_`, `mshr_`)
 because the collaborators share generic port names (`wr_en`,
 `rd_set_idx`, ...) that would otherwise collide.
@@ -518,9 +518,11 @@ replay is pending during F1.
 
 ## Verification
 
-See `tb/cache_controller_tb.sv` — 18 tests (17 directed + 1
+See `tb/cache_controller_tb.sv` — 19 tests (17 directed + 2
 constrained-random), run under Questa (`./tools/sim/run.sh
-cache_controller_tb`).
+cache_controller_tb`) or ModelSim ASE 18.1. The controller is also
+verified together with the real MSHR by the system testbench
+(`tb/cache_top_tb.sv`, see `docs/CACHE_TOP_README.md`).
 
 ### Methodology
 
@@ -534,7 +536,11 @@ cache_controller_tb`).
   so an MSHR id cannot coincide with a slot index by accident). Fills are
   driven by an `mshr_fill` task or cycle by cycle, modelling the MSHR's
   lowest-index-first selection; `mshr_wb_ready` is TB-driven to model a
-  full writeback queue.
+  full writeback queue. For test 19, an **automatic MSHR fill model**
+  completes every new entry after a random delay from a golden memory
+  image, presents the lowest-numbered completed entry (so restarts
+  occur), writes handed-off dirty victims back to that memory, and drops
+  `mshr_wb_ready` at random.
 - **Scoreboard.** A reference model of every (set, way) — line, tag,
   valid, dirty and LRU ages — predicts each access, fill victim and
   replay; expected responses are compared against the logged ones.
@@ -543,8 +549,17 @@ cache_controller_tb`).
   acceptance during a fill, a held writeback stays stable); a white-box
   miss counter cross-checked against the logged MSHR allocations; FIFO
   peak and held-response stability checks.
-- **Coverage and reproducibility.** The random test must hit a minimum
-  number of read-after-write stalls and prints its seed (`+seed=<n>`).
+- **Out-of-order checker (test 19).** Each request's expected result is
+  computed at acceptance from a flat reference memory, in acceptance
+  order, and responses are matched by id, each exactly once. This is the
+  CPU-visible contract: requests to a missing line all park and replay
+  oldest-first, and nothing can overtake or evict the line before its
+  replays.
+- **Coverage and reproducibility.** The random tests enforce minimum
+  counts of the events they exist for (read-after-write stalls; for
+  test 19 also fills, restarts, clean and dirty evictions, writeback
+  stalls, re-misses, merges, replays and replay holds) and print their
+  seed (`+seed=<n>`).
 - **Mutation testing.** Each group of tests was also run against
   deliberately broken RTL (for example: no read-after-write stall, fill
   and fill-restart mutants, four writeback mutants, six replay mutants)
@@ -563,7 +578,7 @@ cache_controller_tb`).
 | 6 | Read-after-write stall | Same-set request behind a store waits exactly 1 cycle and sees the new data; no stall for other sets or load->load |
 | 7 | Full throughput | 16 back-to-back hits accepted and answered one per cycle, all 16 ids |
 | 8 | Response back-pressure | FIFO fills to 3 (incl. the request accepted in the drop cycle), held response stable, drains one per cycle |
-| 9 | Constrained random | 500 loads/stores with random back-pressure and misses, scoreboard-checked, RAW coverage floor, reproducible seed (misses temporarily capped at 14) |
+| 9 | Constrained random, hits only | 500 loads/stores to resident lines with random back-pressure, in-order exact checks, RAW coverage floor, reproducible seed |
 | 10 | LRU recency order | Hand-computed ages after each hit kind, back-to-back burst without stall, unchanged by a miss, victim = oldest way |
 | 11 | Waiting-table contents | Every slot's fields (incl. merged MSHR ids) and the age matrix match issue order |
 | 12 | Hit-under-miss | Eight hits served at full rate and exact latency among four pending misses, incl. same-set hits behind a store miss |
@@ -573,11 +588,11 @@ cache_controller_tb`).
 | 16 | Dirty-victim writeback | Clean victim not written back; dirty victim sent with own address and modified data on the fill edge; full queue holds F1 stable |
 | 17 | Replay of one line's waiters | Arrival order (store, then load seeing it), 1-cycle bubble after a replayed store, own ids, only that line's waiters released, fills and CPU held |
 | 18 | Slot reuse / age matrix | A reused lower slot replays after an older higher slot; the newer load returns the stored data |
+| 19 | End-to-end random with automatic fills | ~3000 requests over 12 lines competing for 4 ways: hits, misses, merges, fills with restarts, clean and dirty evictions, writeback stalls, replays, back-pressure; results checked by id against a flat reference memory, every event above a coverage floor, readback of the whole footprint at the end; 30 seeds, 10 mutants |
 
-### Not yet covered
+### Not covered here
 
-- Test 9 still caps its misses, since the TB has no automatic fill model
-  yet; an end-to-end random run with fills, evictions and replays is the
-  next step.
-- The controller has not yet been integrated with the real `mshr.sv`
-  (top level not written).
+- Interaction with the real MSHR and AXI timing (out-of-order read
+  data, a re-miss held behind its own writeback, AXI request stability)
+  is verified at system level by `tb/cache_top_tb.sv`.
+- Only the default parameter set is simulated.

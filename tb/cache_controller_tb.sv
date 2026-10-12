@@ -4423,56 +4423,28 @@ module cache_controller_tb;
         end
 
         // ---------------------------------------------------------------
-        // PROGRESS MARKER -- tests 1-10 implemented and passing (2026-10-04);
-        // tests 4, 9, 10 updated for MSHR allocation on miss (2026-10-06).
-        // Test infrastructure now available: make_addr, preload_line,
-        // set_valid, cpu_send, sb_access + check_responses (scoreboard),
-        // check_gap, response monitor (resp_log), array write logger (wr_log),
-        // miss counter, side-effect watcher (+ chk_allow_alloc), response-FIFO
-        // peak monitor (resp_peak), stalled-response hold checker
-        // (resp_hold_err), LRU checker (check_lru + model_age), MSHR
-        // allocation logger + check_allocs, reset_dut_and_model, model_hit.
-        //
-        // Test 11 (waiting-table contents + age matrix) added 2026-10-08,
-        // with the MSHR allocation stub (per-line ids, merges).
-        //
-        // Test 12 (hit-under-miss) and test 13 (waiting table full /
-        // back-pressure) added 2026-10-08. The miss side is fully covered.
-        //
-        // Tests 14 (fill into free / LRU way) and 15 (fill_id restart)
-        // added 2026-10-12, with TB-driven fill inputs: mshr_fill task,
-        // model_fill, fill monitor (fill_log, fill_rule_err),
-        // check_fill_write.
-        //
-        // Test 16 (dirty-victim writeback, full writeback queue) added
-        // 2026-10-12, with TB-driven mshr_wb_ready, writeback monitor
-        // (wb_log, wb_hold_err), model_victim_way and check_allocs'
-        // exp_wbs argument.
-        //
-        // Tests 17 (replay order, priorities, exact timing) and 18 (slot
-        // reuse / age matrix) added 2026-10-12, with model_access shared
-        // by sb_access and the replay predictions, and stub release on
-        // fill.
-        //
-        // R2 (branch tb_auto_fill, 2026-10-12): automatic MSHR fill model
-        // (afm_en: random completion delays, lowest-id-first presentation
-        // held until accepted, writebacks into golden_mem, random
-        // mshr_wb_ready), allocation stub with id recycling, flat reference
-        // memory (ref_mem) applied in acceptance order, out-of-order
-        // response checker matched by id (ooo_issue, ooo_issue_free_id),
-        // eviction / writeback data checker, cpu_send_bounded, end-to-end
-        // coverage counters. Test 9 is now hit-only (miss cap removed);
-        // test 19 runs hits, misses, merges, fills, restarts, clean and
-        // dirty evictions, writebacks, replays and back-pressure together
-        // (30 seeds clean; 9 of 10 RTL mutants fail it. The tenth, which
-        // removes the F0 deferral behind a same-set store hit, is
-        // functionally equivalent: the stale read affects only the stored
-        // way, which the store has just made most recently used, so it is
-        // never the victim and its stale copy is never consumed).
-        //
-        // Next: the controller README, then the top level (controller +
-        // arrays + real MSHR), where test 19's traffic can be reused
-        // against the real fill engine and an AXI memory model.
+        // Testbench summary
+        //   Tests 1-8   hit path: reset, load/store hits, read-after-write
+        //               stall, throughput, response back-pressure.
+        //   Test  9     constrained-random hits, exact in-order checks.
+        //   Test  10    true-LRU recency order and victim.
+        //   Tests 11-13 miss side: waiting table, age matrix, hit-under-miss,
+        //               waiting-table back-pressure.
+        //   Tests 14-16 fill: free/LRU way, fill_id restart, dirty-victim
+        //               writeback and a full writeback queue.
+        //   Tests 17-18 replay: arrival order, priorities, slot reuse.
+        //   Test  19    end-to-end random with the automatic MSHR fill model,
+        //               checked by id against a flat reference memory.
+        // Infrastructure: preload mux, allocation stub, mshr_fill task and
+        // automatic fill model (afm_en), reference model (model_access,
+        // model_fill, model_victim_way) and flat memories (ref_mem,
+        // golden_mem), response / fill / writeback / allocation monitors,
+        // in-order (check_responses) and by-id (ooo_*) checkers.
+        // Mutation testing: every test group was run against deliberately
+        // broken RTL copies to confirm it fails (not passes or hangs). One
+        // mutant -- no F0 deferral behind a same-set store hit -- is
+        // functionally equivalent under true LRU (the stored way has just
+        // become most recently used, so it is never the victim).
         // ---------------------------------------------------------------
 
         $finish;

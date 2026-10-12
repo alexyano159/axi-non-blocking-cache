@@ -64,11 +64,11 @@ and the data SRAM — conceptual, not cycle-accurate).
 | Module | RTL | Testbench |
 |---|---|---|
 | `axi_if.sv` — AXI4 interface | Done | — (exercised via `mshr_tb`) |
-| `mshr.sv` — miss handling + writeback | Done | 14 directed tests, all passing |
-| `cache_tag_array.sv` — tag + dirty bit, 4-way | Done | 8 directed tests, all passing |
+| `mshr.sv` — miss handling + writeback, read-after-write ordering, AXI request stability | Done | 14 directed tests, all passing |
+| `cache_tag_array.sv` — tag + dirty bit + stored-tag read-out, 4-way | Done | 9 directed tests, all passing |
 | `cache_valid_array.sv` — valid bit, 4-way, sync reset | Done | 8 directed tests, all passing |
 | `cache_data_sram.sv` — line data, 4-way | Done | 6 directed tests, all passing |
-| `cache_controller.sv` — lookup, hit path, true-LRU state, miss allocation + waiting table | Hit path + LRU done; miss side (MSHR allocation, waiting table, back-pressure) done; fill/eviction + replay in progress | 13 tests (12 directed + 1 constrained-random), all passing |
+| `cache_controller.sv` — lookup, hit path, true-LRU, miss allocation + waiting table, fill/eviction, replay | Done | 19 tests (17 directed + 2 constrained-random, one end-to-end with an automatic MSHR fill model), all passing over 30 seeds |
 | `cache_top.sv` — top-level integration (controller + 3 arrays + MSHR) | Done (structural; compiles and elaborates warning-free) | System TB (`cache_top_tb`): 10 directed + 1 constrained-random (5000 requests) + 1 consistency test, all passing over 30 seeds; 12/12 mutants caught |
 
 `mshr.sv` currently covers: single read/write miss fill, secondary-miss
@@ -208,10 +208,16 @@ iverilog -g2012 -o valid_tb.vvp rtl/cache_valid_array.sv tb/cache_valid_array_tb
 ports aren't supported by Icarus Verilog's current SystemVerilog
 elaboration.
 
-**`cache_controller_tb`** — requires Questa (concurrent assertions,
-queues, `process::self().srandom`). The random test's seed can be set
-with `+seed=<n>` when invoking `vsim` directly (`run.sh` does not forward
-plusargs).
+**`cache_controller_tb`** — runs under Questa, and also under ModelSim
+ASE 18.1, which does not evaluate the concurrent assertions (`assert
+property`); the testbench's own checks still run. The random tests'
+seed can be set with `+seed=<n>` when invoking `vsim` directly (`run.sh`
+does not forward plusargs).
+
+All testbenches have also been run under ModelSim ASE 18.1 (Intel FPGA
+Starter Edition) with the same commands as below. Use a bounded `run`
+(e.g. `run 500ms`) rather than `run -all` when experimenting with a
+modified design, so a hang ends instead of stalling.
 
 **`cache_top_tb`** — system testbench; runs with `run.sh cache_top_tb`
 under Questa and also under ModelSim 18.1 (which ignores

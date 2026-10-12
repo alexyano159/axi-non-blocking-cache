@@ -336,8 +336,8 @@ module mshr_tb;
         @(posedge clk);
         // alloc_ready deasserting here is genuine DUT behavior (no free or
         // matching entry) -- this loop is not simulating the stall itself,
-        // only standing in for the cache controller's (whose MSHR path is
-        // not yet implemented) reaction to it: hold alloc_valid and keep waiting.
+        // only standing in for a controller's reaction to it: hold alloc_valid
+        // and keep waiting.
         while (!alloc_ready) @(posedge clk);
 
         id          = alloc_id;
@@ -361,8 +361,7 @@ module mshr_tb;
     // Hands a dirty victim line to the MSHR's writeback queue and blocks
     // until it's accepted. Mirrors send_miss's shape: if the queue is
     // full, wb_ready simply stays low and the while loop waits, standing
-    // in for the cache controller's (whose MSHR path is not yet
-    // implemented) reaction to that stall.
+    // in for a controller's reaction to that stall.
     task automatic push_writeback(input logic [ADDR_WIDTH-1:0] addr,
                                    input logic [LINE_WIDTH-1:0] data);
         wb_addr  = addr;

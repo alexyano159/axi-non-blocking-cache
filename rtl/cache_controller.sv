@@ -8,11 +8,11 @@
 // miss/fill/eviction sequencing against the MSHR.
 //
 // This module does not instantiate its four collaborators -- it exposes
-// ports that mirror each of their existing interfaces one-for-one, so a
-// separate top-level module (not yet written) will wire the five
-// together. Port groups are
-// prefixed (tag_/valid_/data_/mshr_) since each collaborator's generic
-// port names (wr_en, rd_set_idx, ...) would otherwise collide here.
+// ports that mirror each of their existing interfaces one-for-one, and
+// the top-level module (cache_top) wires the five together. Port groups
+// are prefixed (tag_/valid_/data_/mshr_) since each collaborator's
+// generic port names (wr_en, rd_set_idx, ...) would otherwise collide
+// here.
 //
 // CPU-facing interface: tagged, multi-outstanding. req_id/resp_id let
 // several CPU requests be in flight at once and be answered out of
@@ -22,14 +22,14 @@
 // unused, since the CPU would stall on every miss regardless of how
 // many MSHR entries exist.
 //
-// Work in progress: address decomposition, the lookup shadow register,
-// hit/miss detection and the hit completion path (load-hit response,
-// store-hit write, read-after-write stall, response FIFO), the true-LRU
-// replacement state (updated on hits and fills), the miss side of miss
-// handling (MSHR allocation, waiting table with age-ordered slots,
-// waiting-table back-pressure), fill installation into an invalid or
-// LRU way with dirty-victim writeback, and replay of waiting requests
-// through the hit path are implemented.
+// Request flow: issue (CPU or replay) -> registered array read -> lookup
+// stage. A hit answers a load or writes a store word (setting dirty); a
+// miss is reported to the MSHR and parked in the waiting table. When the
+// MSHR returns the line, it is installed in two cycles (F0 read, F1
+// write) into an invalid way or the true-LRU way, a dirty victim being
+// handed to the MSHR for writeback; the parked requests are then
+// replayed through the hit path, oldest first. Priority on the shared
+// array ports is replay > fill > CPU. See docs/CACHE_CONTROLLER_README.md.
 // -----------------------------------------------------------------------
 `default_nettype none
 
@@ -115,6 +115,16 @@ module cache_controller #(
 
     // -----------------------------------------------------------------
     // MSHR port (cache_controller -> mshr)
+    // Two inputs mirror the MSHR interface but are intentionally not
+    // read by this controller:
+    //   mshr_wb_done       -- no writeback-completion event is needed: a
+    //                         victim leaves the cache when it is handed
+    //                         to the queue, and a re-miss to it is held
+    //                         inside the MSHR until its write completes.
+    //   mshr_fill_is_write -- a filled line is always installed clean;
+    //                         each parked store is replayed through the
+    //                         hit path, which writes its word and sets
+    //                         the dirty bit.
     // -----------------------------------------------------------------
     output      logic                     mshr_alloc_valid,
     output      logic [ADDR_WIDTH-1:0]    mshr_alloc_addr,
@@ -714,7 +724,10 @@ module cache_controller #(
     // in that cycle, since the arrays do not forward a same-edge write and
     // the read would return stale contents. The CPU is already held off,
     // so the lookup stage is empty in the following cycle and the deferral
-    // cannot repeat.
+    // cannot repeat. With true LRU the stale contents are in fact never
+    // used -- the store's way has just become the most recently used, so
+    // it cannot be the victim -- but the deferral is kept as a cheap
+    // safeguard that remains correct under any replacement policy.
     //
     // Fill selection may change between F0 and F1: the MSHR presents its
     // lowest-indexed completed entry, so an entry completing during F0
@@ -978,36 +991,16 @@ module cache_controller #(
 `endif
 
     // -------------------------------------------------------------------
-    // PROGRESS MARKER -- steps 1-4 implemented and verified (tests 1-9);
-    // true-LRU replacement state implemented and verified (test 10),
-    // 2026-10-04. Miss side implemented (MSHR allocation, waiting table +
-    // age matrix, waiting-table back-pressure); tests 4, 9, 10 updated to
-    // check allocations, 2026-10-06. Waiting table verified by tests
-    // 11-13 (2026-10-08).
-    //
-    // Fill, sub-step 1 (branch cache_fill, 2026-10-12): two-cycle fill
-    // into an invalid or LRU way, LRU update from the fill, fill_id
-    // restart (see Fill sequencing). Verified by tests 14-15.
-    // Sub-step 2: dirty-victim writeback, F1 repeated while the
-    // writeback queue is full (see Victim writeback). Verified by test 16.
-    //
-    // Next:
-    //   - Resolved in mshr.sv (2026-10-12, mshr_tb test 14): a miss to a
-    //     line still queued for writeback holds its AR until that write's
-    //     B response (see "Read-after-write ordering" there).
-    //
-    // Replay R1 (branch cache_replay, 2026-10-12): ready marking at fill,
-    // oldest-first selection via the age matrix, issue into the lookup
-    // stage, slot release at issue, priority replay > fill > CPU (see
-    // Replay). Verified by tests 17-18.
-    //
-    // Replay R2 (branch tb_auto_fill, 2026-10-12): verified end to end by
-    // test 19 -- constrained-random traffic against an automatic MSHR
-    // fill model, checked against a flat reference memory in acceptance
-    // order, with every eviction and writeback checked; 30 seeds clean.
-    // No RTL change was required.
-    //
-    // Next: the controller README, then the top level.
+    // Verification status
+    //   tb/cache_controller_tb.sv -- 19 tests against the real arrays and a
+    //     TB model of the MSHR: hit path, LRU, miss side, fill and restart,
+    //     dirty-victim writeback, replay order, slot reuse, and an
+    //     end-to-end random test with automatic fills (test 19).
+    //   tb/cache_top_tb.sv -- the controller integrated with the real MSHR
+    //     and arrays, against a randomized AXI4 memory model.
+    // The system testbench also re-checks the assertions above
+    // procedurally, so they remain effective on simulators that do not
+    // evaluate SVA.
     // -------------------------------------------------------------------
 
 endmodule : cache_controller
